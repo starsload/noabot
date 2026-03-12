@@ -274,14 +274,14 @@ class HeartbeatConfig(Base):
     """Heartbeat service configuration."""
 
     enabled: bool = True
-    interval_s: int = 30 * 60  # 30 minutes
+    interval_s: int = 20 * 60  # 30 minutes
 
 
 class GatewayConfig(Base):
     """Gateway/server configuration."""
 
-    host: str = "0.0.0.0"
-    port: int = 18790
+    host: str = "127.0.0.1"
+    port: int = 59281
     heartbeat: HeartbeatConfig = Field(default_factory=HeartbeatConfig)
 
 

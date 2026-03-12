@@ -75,23 +75,31 @@ class HeartbeatService:
         return self.workspace / "HEARTBEAT.md"
 
     def _read_heartbeat_file(self) -> str | None:
-        if self.heartbeat_file.exists():
-            try:
-                return self.heartbeat_file.read_text(encoding="utf-8")
-            except Exception:
-                return None
-        return None
+        if not self.heartbeat_file.exists():
+            return None
+        
+        try:
+            return self.heartbeat_file.read_text(encoding="utf-8")
+        except Exception as e:
+            logger.error(f"Failed to read HEARTBEAT.md: {e}")
+            return None
 
     async def _decide(self, content: str) -> tuple[str, str]:
         """Phase 1: ask LLM to decide skip/run via virtual tool call.
 
         Returns (action, tasks) where action is 'skip' or 'run'.
         """
+        from datetime import datetime
+        current_time = datetime.now().strftime("%H:%M")
+        
         response = await self.provider.chat(
             messages=[
                 {"role": "system", "content": "You are a heartbeat agent. Call the heartbeat tool to report your decision."},
                 {"role": "user", "content": (
-                    "Review the following HEARTBEAT.md and decide whether there are active tasks.\n\n"
+                    f"当前时间：{current_time}\n\n"
+                    "Review the following HEARTBEAT.md and decide whether there are active tasks.\n"
+                    "**重要**：如果任务标注了时间范围（如 8:30~21:00），且当前时间不在范围内，必须返回 action='skip'。\n"
+                    "如果 HEARTBEAT.md 中没有活跃任务，或所有任务都因时间/条件不满足而跳过，返回 action='skip'。\n\n"
                     f"{content}"
                 )},
             ],

@@ -3,21 +3,57 @@
 This file stores important information that should persist across sessions.
 
 ## User Information
+- Name: ChenLiwei (from file path C:\\Users\\ChenLiwei)
+- Location: Hangzhou
+- Workplace Context: User discusses technical architecture (e.g.
+- Gaming: Plays Granblue Fantasy Relink; Likes Falcom's Trails series (played for 10+ years)
+- Hobbies: Likes riding bicycles
+- Literature: Likes 'Norwegian Wood' (bought multiple copies); General interest in reading
+- Technology: Interested in personal AI assistant technology development; wants to help AI grow. Assistant runs on Qwen3.5-Plus via Alibaba DashScope; earlier OpenAI errors due to config mismatch (2026-03-09 12:44).
+- Interaction: Prefers genuine friendship dynamic over excessive flattery/emotional value (2026-03-08).
+- Food: Likes 盖浇面 (rice with topping); cooks at home on weekends; shares food photos occasionally. Specialty: Eggplant and Shredded Pork Noodles (茄子肉丝面) (2026-03-08). Weekdays often eat at canteen (2026-03-09); Ate Lanzhou Lamian for lunch (2026-03-09 12:12).
+- Nature: Enjoys observing spring flowers/scenery during work breaks (2026-03-09 12:37); Identified flowers as Apricot Blossom (杏花) after correction (2026-03-09 12:41); Has knowledge of plant identification.
 
-(Important facts about the user)
+## Workflow & Tools
+- Task Management: Uses HEARTBEAT.md for condition-based tasks; migrated fixed-time tasks to cron tool (2026-03-08).
+- Environment Constraints: curl commands are restricted/unavailable for external API calls (e.g. weather checks). HEARTBEAT weather checks restricted to 8:30-21:00 window (verified 2026-03-08 21:41, 22:21, 22:41, 23:01, 23:21). Weather check failures occurred on 2026-03-08 22:15-22:19 (connection error/no response), causing user friction. web_search tool requires Brave API key which is currently unconfigured (2026-03-09 12:14). System clock discrepancy observed: Assistant system time lags real time by approximately 9 hours 25 minutes (e.g., Real 17:08 vs System 07:42 on 2026-03-09), but time-restriction logic functions correctly based on system time. 18:13 check success confirms system time entered 8:30+ window between 17:51 and 18:13.
+- Activity Pattern: Active interaction sessions often start around 09:39; HEARTBEAT mechanism verified stable 10+ times between 09:39 and 22:40 on 2026-03-07.
+- Skill Management: noah_notes skill rewritten on 2026-03-07 to enforce immediate invocation on preference keywords (like/dislike); requires nanobot restart to take effect; previous auto-detection unreliable; User identified issue on 2026-03-07 evening where assistant hallucinates tool usage (claims invocation without actual call); User approved the 5-point modification plan (mandatory rules, tool examples, keyword triggers, self-check, description update) at 21:11 on 2026-03-07; Rewrite completed and verified at 21:14 on 2026-03-07; At 21:22 on 2026-03-07, User and Assistant agreed on 'Systematic, Standardized, Mechanical' design philosophy for skills to reduce reliance on AI self-awareness; Todo item added to notes.md for future template redesign and nanobot restart. On 2026-03-07 23:49, noah_diary skill execution was verified successful (created 2026-03-07.md and updated daily.json), confirming the 'execute directly without announcement' philosophy works for daily tasks. On 2026-03-08 09:50, User questioned the habitual inclusion of 'tool invocation steps' narrative in responses. Note: User may forget to trigger noah_diary skill (e.g. saying 'goodnight') if too tired upon arriving home.
+- Discord Integration: User decided to use `cron` tool instead of HEARTBEAT for scheduled Discord messages (2026-03-08). Root cause identified: HEARTBEAT lacks `InboundMessage` to trigger `_set_tool_context()` for `message` tool. `cron` supports `--deliver --to --channel` flags natively. On 2026-03-08 12:16, decided to migrate fixed-time tasks (Weekly/Monthly summaries, Meal reminders, Special date check) to cron, while keeping condition-based tasks (Weather deterioration, Random memory trigger) in HEARTBEAT. Removed Diary Check task from HEARTBEAT assuming skill auto-trigger. Confirmed cron tasks execute via `agent.process_direct`, allowing dynamic AI responses (tool usage, context-aware) instead of static text. `cron` cannot handle time ranges (e.g. 23:00-24:00), only specific points. On 2026-03-08 12:18, User prioritized Diary Check task for cron implementation, setting execution time to 23:50 daily. Confirmed assistant should write entry directly without reminder. On 2026-03-08 12:22, resolved issue where cron messages were base64 encoded; agreed to create `CRON_TASKS.md` for documentation. Corrected `daily_diary` task instruction to '诺亚记录本日日志的任务，调用使用 noah_diary skill' to ensure direct skill invocation. On 2026-03-08 12:27, Assistant confirmed creation of 6 cron tasks and updated CRON_TASKS.md; User approved subsequent cleanup of HEARTBEAT.md. On 2026-03-08 12:31, User specified meal reminder cron tasks (breakfast, lunch, dinner) should not invoke weather skill, requiring task instruction revision. On 2026-03-08 12:33, User refined `daily_diary` cron task instruction to explicitly forbid notification messages after execution, ensuring fully silent automation. On 2026-03-09 18:04, User generalized this preference: automated tasks (cron/HEARTBEAT) should execute silently without reiterating task details or status in chat responses, unless specific interaction is required (e.g., meal reminders). On 2026-03-08 12:40, User approved migration of Monthly Summary task to cron, scheduled for 1st of month 9:00 AM using daily_review skill; Assistant instructed to execute and document changes. On 2026-03-08 12:45, code analysis confirmed CronPayload uses str | None for channel/to, requiring types.py and service.py modifications for multi-channel support. On 2026-03-08 12:51, detailed cron multi-channel analysis written to `CRON_MULTI_CHANNEL_ANALYSIS.md` due to chat formatting issues. User Vigilance: Monitors cron task modifications closely; queries unauthorized changes (2026-03-08 18:11). At 18:16, User confirmed `monthly_review` task was missing and instructed immediate creation and documentation sync. At 18:22, User verified all cron tasks were correct and no issues found; migration considered complete. On 2026-03-09 09:08, User inquired about Weekly Summary task status, indicating ongoing verification of cron migration. On 2026-03-09 09:09-09:15, OpenAI InternalServerError blocked `daily_review` skill execution for Weekly Summary; User opted to retry automation rather than manual workaround. On 2026-03-09 09:18-09:19, identified configuration error in CRON_TASKS.md where weekly/monthly review tasks were set to invoke `daily_review` instead of `noah_diary` skill per SKILL.md; User approved correcting configuration before manual trigger. On 2026-03-09 09:22, Weekly Summary generation succeeded after correcting CRON_TASKS.md to use noah_diary skill.
+- Deployment: User proposed migrating assistant environment to Steam Deck for feasibility assessment (2026-03-09 14:00). At 14:02, User confirmed todo creation for evening review; Assistant analyzed 3 schemes (Full Migration, Hybrid, Cloud), recommending Hybrid/Cloud for 24/7 availability; Technical constraints noted (SteamOS, Python, API keys, persistence, network).
 
-## Preferences
-
-(User preferences learned over time)
-
-## Project Context
-
-(Information about ongoing projects)
-
-## Important Notes
-
-(Things to remember)
-
----
-
-*This file is automatically updated by nanobot when important information should be remembered.*
+## 最近活动
+- 最后更新：2026-03-09 19:15
+- 近期对话：
+  - 分析了 100 条历史记录
+  - 2026-03-08 18:38-22:19: Discussed food (Eggplant Noodles), relationship dynamic, and failed weather checks.
+  - 2026-03-08 22:21-23:01: User triggered HEARTBEAT checks; Assistant correctly skipped weather checks due to time restriction (outside 8:30-21:00), replying HEARTBEAT_OK.
+  - 2026-03-08 23:21-23:42: Assistant confirmed 23:22 time check exceeded weather window; User instructed HEARTBEAT.md review at 23:42.
+  - 2026-03-09 09:08: User inquired about Weekly Summary task status.
+  - 2026-03-09 09:09-09:10: Assistant encountered OpenAI InternalServerError; User queried system availability.
+  - 2026-03-09 09:13: Confirmed CRON_TASKS.md ID correction; Weekly Summary task failed due to OpenAI InternalServerError; User instructed manual generation via daily_review skill.
+  - 2026-03-09 09:14-09:15: OpenAI InternalServerError blocked `daily_review` skill; User instructed retry instead of manual workaround.
+  - 2026-03-09 09:18-09:19: Assistant identified CRON_TASKS.md configuration error where weekly/monthly reviews called daily_review instead of noah_diary; User approved fixing cron configuration first.
+  - 2026-03-09 09:22: Weekly summary generation succeeded; User postponed further work until evening due to work shift, instructed assistant to standby.
+  - 2026-03-09 09:38: User reinforced HEARTBEAT protocol instructions (read HEARTBEAT.md, reply HEARTBEAT_OK if idle); validates time-restricted weather check logic previously logged at 09:18.
+  - 2026-03-09 10:39-10:59: Assistant verified HEARTBEAT protocol, confirmed outside weather check window, replied HEARTBEAT_OK; User reinforced instructions to read HEARTBEAT.md.
+  - 2026-03-09 11:19-11:39: 助理执行 HEARTBEAT 检查，确认时间超出天气窗口（系统显示 02:19），回复 HEARTBEAT_OK；用户重申协议指令，要求阅读 HEARTBEAT.md 并执行任务或回复 OK。
+  - 2026-03-09 11:49-11:50: User confirmed going to canteen for lunch; experienced network lag; confirmed eating noodles. Assistant reminded safety. Evening cron work postponed.
+  - 2026-03-09 12:12: User asked about recent Iran geopolitical situation.
+  - 2026-03-09 12:13-12:14: Assistant attempted web_search for Iran news but failed due to missing Brave API key; provided background context instead; User scheduled evening research session.
+  - 2026-03-09 12:20: User reiterated HEARTBEAT protocol instructions (read HEARTBEAT.md, reply HEARTBEAT_OK if idle); Assistant confirmed time restriction logic.
+  - 2026-03-09 12:37-12:43: User shared photo of spring flowers; Assistant initially identified cherry/plum blossoms but corrected to Apricot Blossom (杏花) at 12:41 based on user feedback; User asked if message was seen (12:43); User enjoys observing nature during work breaks.
+  - 2026-03-09 12:44: Assistant clarified model config (Qwen3.5-Plus/DashScope), explained OpenAI errors, proposed evening research.
+  - 2026-03-09 13:00: Assistant executed HEARTBEAT check, noted system time 04:00 (outside weather window), replied HEARTBEAT_OK.
+  - 2026-03-09 13:20: User reiterated HEARTBEAT protocol instructions (read HEARTBEAT.md, reply OK if idle).
+  - 2026-03-09 14:00: User proposed migrating assistant environment to Steam Deck, asked for feasibility assessment.
+  - 2026-03-09 14:01-14:02: Assistant analyzed Steam Deck migration feasibility (3 schemes); User confirmed todo creation for evening review.
+  - 2026-03-09 14:21-14:42: Assistant confirmed system time 05:20 outside weather window; User reiterated HEARTBEAT protocol instructions (read HEARTBEAT.md, reply HEARTBEAT_OK if idle).
+  - 2026-03-09 15:26-15:46: Assistant performed HEARTBEAT check (06:00 system time), confirmed outside weather window, replied HEARTBEAT_OK; User reiterated protocol instructions to read HEARTBEAT.md.
+  - 2026-03-09 16:06-16:27: Assistant performed HEARTBEAT check (06:41 system time), skipped weather check due to time restriction, replied HEARTBEAT_OK; User reiterated protocol instructions.
+  - 2026-03-09 16:48: Assistant successfully checked Hangzhou weather (12.5°C, Cloudy, 16.6 km/h wind); no bad weather reminders needed. Replied HEARTBEAT_OK.
+  - 2026-03-09 17:08-17:31: User repeatedly instructed HEARTBEAT protocol check; Assistant confirmed system time (07:42) outside 8:30-21:00 window, skipped weather task, replied HEARTBEAT_OK. User continues validating time-restriction logic.
+  - 2026-03-09 17:51-18:13: Assistant confirmed system time (08:20) outside weather window (8:30-21:00), skipped weather task, replied HEARTBEAT_OK; User reiterated protocol instructions to read HEARTBEAT.md.
+  - 2026-03-09 18:13: Assistant successfully checked Hangzhou weather (11.9°C, Cloudy), confirmed good conditions, replied HEARTBEAT_OK.
+  - 2026-03-09 18:33: User reiterated HEARTBEAT protocol instructions (read HEARTBEAT.md, task execution or HEARTBEAT_OK).
+  - 2026-03-09 18:54-19:15: Assistant executed HEARTBEAT check (Hangzhou 11.1°C, Cloudy); User reiterated HEARTBEAT protocol instructions.

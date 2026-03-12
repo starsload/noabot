@@ -123,7 +123,8 @@ class AgentLoop:
             restrict_to_workspace=self.restrict_to_workspace,
             path_append=self.exec_config.path_append,
         ))
-        self.tools.register(WebSearchTool(api_key=self.brave_api_key, proxy=self.web_proxy))
+        # Disabled: WebSearchTool - replaced by user's custom search skill
+        # self.tools.register(WebSearchTool(api_key=self.brave_api_key, proxy=self.web_proxy))
         self.tools.register(WebFetchTool(proxy=self.web_proxy))
         self.tools.register(MessageTool(send_callback=self.bus.publish_outbound))
         self.tools.register(SpawnTool(manager=self.subagents))
@@ -191,6 +192,20 @@ class AgentLoop:
         while iteration < self.max_iterations:
             iteration += 1
 
+            # Validate messages can be serialized before calling LLM
+            try:
+                json.dumps(messages, ensure_ascii=False)
+            except (TypeError, ValueError) as e:
+                logger.error("Messages cannot be serialized, attempting recovery: {}", e)
+                # Try to recover by removing the last assistant message with tool calls
+                if len(messages) > 1:
+                    messages = messages[:-1]
+                    final_content = "抱歉，刚才的消息格式有点问题，诺亚重新整理了一下～"
+                    # Continue with cleaned messages
+                else:
+                    final_content = "抱歉，内部消息格式错误，能再跟诺亚说一次吗？"
+                    break
+
             response = await self.provider.chat(
                 messages=messages,
                 tools=self.tools.get_definitions(),
@@ -207,6 +222,20 @@ class AgentLoop:
                         await on_progress(thought)
                     await on_progress(self._tool_hint(response.tool_calls), tool_hint=True)
 
+                # Validate tool call arguments to prevent JSON serialization errors
+                valid_tool_calls = []
+                for tc in response.tool_calls:
+                    try:
+                        json.dumps(tc.arguments, ensure_ascii=False)
+                        valid_tool_calls.append(tc)
+                    except (TypeError, ValueError) as e:
+                        logger.error("Tool '{}' has invalid arguments (skipping): {}", tc.name, e)
+
+                if not valid_tool_calls:
+                    logger.error("All tool calls have invalid arguments, returning error message")
+                    final_content = "抱歉，工具调用参数格式错误，诺亚没法执行操作……能再跟诺亚说一次吗？"
+                    break
+
                 tool_call_dicts = [
                     {
                         "id": tc.id,
@@ -216,7 +245,7 @@ class AgentLoop:
                             "arguments": json.dumps(tc.arguments, ensure_ascii=False)
                         }
                     }
-                    for tc in response.tool_calls
+                    for tc in valid_tool_calls
                 ]
                 messages = self.context.add_assistant_message(
                     messages, response.content, tool_call_dicts,
@@ -224,7 +253,7 @@ class AgentLoop:
                     thinking_blocks=response.thinking_blocks,
                 )
 
-                for tool_call in response.tool_calls:
+                for tool_call in valid_tool_calls:
                     tools_used.append(tool_call.name)
                     args_str = json.dumps(tool_call.arguments, ensure_ascii=False)
                     logger.info("Tool call: {}({})", tool_call.name, args_str[:200])
