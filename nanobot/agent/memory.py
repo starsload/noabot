@@ -137,12 +137,19 @@ class MemoryStore:
 
         try:
             forced = {"type": "function", "function": {"name": "save_memory"}}
-            response = await provider.chat_with_retry(
-                messages=chat_messages,
-                tools=_SAVE_MEMORY_TOOL,
-                model=model,
-                tool_choice=forced,
-            )
+            if "qwen" in model:
+                response = await provider.chat_with_retry(
+                    messages=chat_messages,
+                    tools=_SAVE_MEMORY_TOOL,
+                    model=model,
+                )
+            else:
+                response = await provider.chat_with_retry(
+                    messages=chat_messages,
+                    tools=_SAVE_MEMORY_TOOL,
+                    model=model,
+                    tool_choice=forced,
+                )
 
             if response.finish_reason == "error" and _is_tool_choice_unsupported(
                 response.content
