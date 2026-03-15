@@ -117,13 +117,22 @@ class MemoryStore:
             {"role": "user", "content": prompt},
         ]
 
+        logger.info(f"model:{model}")
         try:
-            response = await provider.chat_with_retry(
-                messages=chat_messages,
-                tools=_SAVE_MEMORY_TOOL,
-                model=model,
-                tool_choice={"type": "function", "function": {"name": "save_memory"}},
-            )
+            if "qwen" in model:
+                response = await provider.chat_with_retry(
+                    messages=chat_messages,
+                    tools=_SAVE_MEMORY_TOOL,
+                    model=model,
+                )
+            else:
+                response = await provider.chat_with_retry(
+                    messages=chat_messages,
+                    tools=_SAVE_MEMORY_TOOL,
+                    model=model,
+                    tool_choice={"type": "function", "function": {"name": "save_memory"}},
+                )
+            
 
             if not response.has_tool_calls:
                 logger.warning("Memory consolidation: LLM did not call save_memory, skipping")
