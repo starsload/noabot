@@ -22,9 +22,13 @@ poetry.lock
 .pytest_cache/
 botpy.log
 nano.*.save
+<<<<<<< HEAD
 workspace/
 .DS_Store
 uv.lock
 docs/
 token.txt
 config_backup.json 
+=======
+workspace/
+>>>>>>> 227ab469 (noah:忽略workspcae，兼容qwen传参)
