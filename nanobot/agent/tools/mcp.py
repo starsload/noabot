@@ -11,6 +11,24 @@ from nanobot.agent.tools.base import Tool
 from nanobot.agent.tools.registry import ToolRegistry
 
 
+def _should_propagate_cancelled_error(exc: asyncio.CancelledError) -> bool:
+    """Return True when a cancellation should escape this MCP compatibility layer."""
+    if "Cancelled via cancel scope" in str(exc):
+        return False
+    task = asyncio.current_task()
+    return task is not None and task.cancelling() > 0
+
+
+def _clear_current_task_cancellation() -> None:
+    """Clear swallowed cancellation state so later awaits can proceed."""
+    task = asyncio.current_task()
+    uncancel = getattr(task, "uncancel", None)
+    if task is None or not callable(uncancel):
+        return
+    while task.cancelling() > 0:
+        uncancel()
+
+
 def _extract_nullable_branch(options: Any) -> tuple[dict[str, Any], bool] | None:
     """Return the single non-null branch for nullable unions."""
     if not isinstance(options, list):
@@ -109,12 +127,12 @@ class MCPToolWrapper(Tool):
         except asyncio.TimeoutError:
             logger.warning("MCP tool '{}' timed out after {}s", self._name, self._tool_timeout)
             return f"(MCP tool call timed out after {self._tool_timeout}s)"
-        except asyncio.CancelledError:
+        except asyncio.CancelledError as exc:
             # MCP SDK's anyio cancel scopes can leak CancelledError on timeout/failure.
             # Re-raise only if our task was externally cancelled (e.g. /stop).
-            task = asyncio.current_task()
-            if task is not None and task.cancelling() > 0:
+            if _should_propagate_cancelled_error(exc):
                 raise
+            _clear_current_task_cancellation()
             logger.warning("MCP tool '{}' was cancelled by server/SDK", self._name)
             return "(MCP tool call was cancelled)"
         except Exception as exc:
@@ -137,12 +155,15 @@ class MCPToolWrapper(Tool):
 
 async def connect_mcp_servers(
     mcp_servers: dict, registry: ToolRegistry, stack: AsyncExitStack
-) -> None:
+) -> tuple[int, int]:
     """Connect to configured MCP servers and register their tools."""
     from mcp import ClientSession, StdioServerParameters
     from mcp.client.sse import sse_client
     from mcp.client.stdio import stdio_client
     from mcp.client.streamable_http import streamable_http_client
+
+    connected_count = 0
+    cancelled_count = 0
 
     for name, cfg in mcp_servers.items():
         try:
@@ -244,5 +265,17 @@ async def connect_mcp_servers(
                     )
 
             logger.info("MCP server '{}': connected, {} tools registered", name, registered_count)
+            connected_count += 1
+        except asyncio.CancelledError as exc:
+            if _should_propagate_cancelled_error(exc):
+                raise
+            _clear_current_task_cancellation()
+            cancelled_count += 1
+            logger.warning(
+                "MCP server '{}': connection was cancelled by server/SDK: {}",
+                name,
+                exc,
+            )
         except Exception as e:
             logger.error("MCP server '{}': failed to connect: {}", name, e)
+    return connected_count, cancelled_count

@@ -258,6 +258,10 @@ class MemoryConsolidator:
         """Return the shared consolidation lock for one session."""
         return self._locks.setdefault(session_key, asyncio.Lock())
 
+    def request_budget(self) -> int:
+        """Return the safe prompt budget after reserving completion headroom."""
+        return self.context_window_tokens - self.max_completion_tokens - self._SAFETY_BUFFER
+
     async def consolidate_messages(self, messages: list[dict[str, object]]) -> bool:
         """Archive a selected message chunk into persistent memory."""
         return await self.store.consolidate(messages, self.provider, self.model)
@@ -301,6 +305,54 @@ class MemoryConsolidator:
             self._get_tool_definitions(),
         )
 
+    def fit_history_within_budget(
+        self,
+        history: list[dict[str, Any]],
+        *,
+        current_message: str,
+        media: list[str] | None = None,
+        channel: str | None = None,
+        chat_id: str | None = None,
+        current_role: str = "user",
+    ) -> tuple[list[dict[str, Any]], int, str]:
+        """Trim old turns from history until the next request fits the safe budget."""
+        budget = self.request_budget()
+        if budget <= 0:
+            return [], 0, "none"
+
+        tools = self._get_tool_definitions()
+
+        def _estimate(candidate_history: list[dict[str, Any]]) -> tuple[int, str]:
+            probe_messages = self._build_messages(
+                history=candidate_history,
+                current_message=current_message,
+                media=media,
+                channel=channel,
+                chat_id=chat_id,
+                current_role=current_role,
+            )
+            return estimate_prompt_tokens_chain(
+                self.provider,
+                self.model,
+                probe_messages,
+                tools,
+            )
+
+        estimated, source = _estimate(history)
+        if estimated <= budget or not history:
+            return history, estimated, source
+
+        for start in range(1, len(history)):
+            if history[start].get("role") != "user":
+                continue
+            candidate = history[start:]
+            estimated, source = _estimate(candidate)
+            if estimated <= budget:
+                return candidate, estimated, source
+
+        estimated, source = _estimate([])
+        return [], estimated, source
+
     async def archive_messages(self, messages: list[dict[str, object]]) -> bool:
         """Archive messages with guaranteed persistence (retries until raw-dump fallback)."""
         if not messages:
@@ -321,7 +373,7 @@ class MemoryConsolidator:
 
         lock = self.get_lock(session.key)
         async with lock:
-            budget = self.context_window_tokens - self.max_completion_tokens - self._SAFETY_BUFFER
+            budget = self.request_budget()
             target = budget // 2
             estimated, source = self.estimate_session_prompt_tokens(session)
             if estimated <= 0:

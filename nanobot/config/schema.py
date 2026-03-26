@@ -42,6 +42,7 @@ class AgentDefaults(Base):
     max_tool_iterations: int = 40
     reasoning_effort: str | None = None  # low / medium / high - enables LLM thinking mode
     timezone: str = "UTC"  # IANA timezone, e.g. "Asia/Shanghai", "America/New_York"
+    should_warn_deprecated_memory_window: bool = Field(default=False, exclude=True)
 
 
 class AgentsConfig(Base):

@@ -36,6 +36,24 @@ if TYPE_CHECKING:
     from nanobot.cron.service import CronService
 
 
+def _should_propagate_cancelled_error(exc: asyncio.CancelledError) -> bool:
+    """Return True when a cancellation should escape this MCP compatibility layer."""
+    if "Cancelled via cancel scope" in str(exc):
+        return False
+    task = asyncio.current_task()
+    return task is not None and task.cancelling() > 0
+
+
+def _clear_current_task_cancellation() -> None:
+    """Clear swallowed cancellation state so later awaits can proceed."""
+    task = asyncio.current_task()
+    uncancel = getattr(task, "uncancel", None)
+    if task is None or not callable(uncancel):
+        return
+    while task.cancelling() > 0:
+        uncancel()
+
+
 class AgentLoop:
     """
     The agent loop is the core processing engine.
@@ -105,6 +123,10 @@ class AgentLoop:
         self._active_tasks: dict[str, list[asyncio.Task]] = {}  # session_key -> tasks
         self._background_tasks: list[asyncio.Task] = []
         self._processing_lock = asyncio.Lock()
+        generation = getattr(provider, "generation", None)
+        max_completion_tokens = getattr(generation, "max_tokens", 4096)
+        if not isinstance(max_completion_tokens, int) or max_completion_tokens <= 0:
+            max_completion_tokens = 4096
         self.memory_consolidator = MemoryConsolidator(
             workspace=workspace,
             provider=provider,
@@ -113,6 +135,7 @@ class AgentLoop:
             context_window_tokens=context_window_tokens,
             build_messages=self.context.build_messages,
             get_tool_definitions=self.tools.get_definitions,
+            max_completion_tokens=max_completion_tokens,
         )
         self._register_default_tools()
 
@@ -148,18 +171,40 @@ class AgentLoop:
         try:
             self._mcp_stack = AsyncExitStack()
             await self._mcp_stack.__aenter__()
-            await connect_mcp_servers(self._mcp_servers, self.tools, self._mcp_stack)
-            self._mcp_connected = True
-        except BaseException as e:
+            connected_count, cancelled_count = await connect_mcp_servers(
+                self._mcp_servers, self.tools, self._mcp_stack
+            )
+            if connected_count > 0 or cancelled_count == 0:
+                self._mcp_connected = True
+            else:
+                logger.warning(
+                    "MCP connection setup was cancelled by server/SDK (will retry next message)"
+                )
+                await self._cleanup_mcp_stack()
+        except asyncio.CancelledError as e:
+            if _should_propagate_cancelled_error(e):
+                await self._cleanup_mcp_stack()
+                raise
+            _clear_current_task_cancellation()
+            logger.warning(
+                "MCP connection setup was cancelled by server/SDK (will retry next message): {}",
+                e,
+            )
+            await self._cleanup_mcp_stack()
+        except Exception as e:
             logger.error("Failed to connect MCP servers (will retry next message): {}", e)
-            if self._mcp_stack:
-                try:
-                    await self._mcp_stack.aclose()
-                except Exception:
-                    pass
-                self._mcp_stack = None
+            await self._cleanup_mcp_stack()
         finally:
             self._mcp_connecting = False
+
+    async def _cleanup_mcp_stack(self) -> None:
+        """Close and clear the active MCP stack after a failed connect attempt."""
+        if self._mcp_stack:
+            try:
+                await self._mcp_stack.aclose()
+            except (RuntimeError, BaseExceptionGroup):
+                pass
+            self._mcp_stack = None
 
     def _set_tool_context(self, channel: str, chat_id: str, message_id: str | None = None) -> None:
         """Update context for all tools that need routing info."""
@@ -380,13 +425,29 @@ class AgentLoop:
             history = session.get_history(max_messages=0)
             # Subagent results should be assistant role, other system messages use user role
             current_role = "assistant" if msg.sender_id in {"subagent", "codex_job"} else "user"
+            fitted_history, estimated, source = self.memory_consolidator.fit_history_within_budget(
+                history,
+                current_message=msg.content,
+                channel=channel,
+                chat_id=chat_id,
+                current_role=current_role,
+            )
+            if len(fitted_history) != len(history):
+                logger.warning(
+                    "Trimmed system-message history for {} from {} to {} messages to fit context budget ({} via {})",
+                    key,
+                    len(history),
+                    len(fitted_history),
+                    estimated,
+                    source,
+                )
             messages = self.context.build_messages(
-                history=history,
+                history=fitted_history,
                 current_message=msg.content, channel=channel, chat_id=chat_id,
                 current_role=current_role,
             )
             final_content, _, all_msgs = await self._run_agent_loop(messages)
-            self._save_turn(session, all_msgs, 1 + len(history))
+            self._save_turn(session, all_msgs, 1 + len(fitted_history))
             self.sessions.save(session)
             self._schedule_background(self.memory_consolidator.maybe_consolidate_by_tokens(session))
             return OutboundMessage(channel=channel, chat_id=chat_id,
@@ -430,8 +491,24 @@ class AgentLoop:
                 message_tool.start_turn()
 
         history = session.get_history(max_messages=0)
+        fitted_history, estimated, source = self.memory_consolidator.fit_history_within_budget(
+            history,
+            current_message=msg.content,
+            media=msg.media if msg.media else None,
+            channel=msg.channel,
+            chat_id=msg.chat_id,
+        )
+        if len(fitted_history) != len(history):
+            logger.warning(
+                "Trimmed history for {} from {} to {} messages to fit context budget ({} via {})",
+                key,
+                len(history),
+                len(fitted_history),
+                estimated,
+                source,
+            )
         initial_messages = self.context.build_messages(
-            history=history,
+            history=fitted_history,
             current_message=msg.content,
             media=msg.media if msg.media else None,
             channel=msg.channel, chat_id=msg.chat_id,
@@ -452,7 +529,7 @@ class AgentLoop:
         if final_content is None:
             final_content = "I've completed processing but have no response to give."
 
-        self._save_turn(session, all_msgs, 1 + len(history))
+        self._save_turn(session, all_msgs, 1 + len(fitted_history))
         self.sessions.save(session)
         self._schedule_background(self.memory_consolidator.maybe_consolidate_by_tokens(session))
 

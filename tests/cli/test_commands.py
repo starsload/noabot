@@ -625,13 +625,35 @@ def test_agent_workspace_override_wins_over_config_workspace(mock_agent_runtime,
     assert mock_agent_runtime["agent_loop_cls"].call_args.kwargs["workspace"] == workspace_path
 
 
-def test_agent_hints_about_deprecated_memory_window(mock_agent_runtime, tmp_path):
-    config_file = tmp_path / "config.json"
-    config_file.write_text(json.dumps({"agents": {"defaults": {"memoryWindow": 42}}}))
+def test_agent_hints_about_deprecated_memory_window(mock_agent_runtime):
+    mock_agent_runtime["config"].agents.defaults.should_warn_deprecated_memory_window = True
 
-    result = runner.invoke(app, ["agent", "-m", "hello", "-c", str(config_file)])
+    result = runner.invoke(app, ["agent", "-m", "hello"])
 
     assert result.exit_code == 0
+    assert "memoryWindow" in result.stdout
+    assert "no longer used" in result.stdout
+
+
+def test_gateway_hints_about_deprecated_memory_window(monkeypatch, tmp_path: Path) -> None:
+    config_file = tmp_path / "instance" / "config.json"
+    config_file.parent.mkdir(parents=True)
+    config_file.write_text("{}")
+
+    config = Config()
+    config.agents.defaults.should_warn_deprecated_memory_window = True
+
+    monkeypatch.setattr("nanobot.config.loader.set_config_path", lambda _path: None)
+    monkeypatch.setattr("nanobot.config.loader.load_config", lambda _path=None: config)
+    monkeypatch.setattr("nanobot.cli.commands.sync_workspace_templates", lambda _path: None)
+    monkeypatch.setattr(
+        "nanobot.cli.commands._make_provider",
+        lambda _config: (_ for _ in ()).throw(_StopGatewayError("stop")),
+    )
+
+    result = runner.invoke(app, ["gateway", "--config", str(config_file)])
+
+    assert isinstance(result.exception, _StopGatewayError)
     assert "memoryWindow" in result.stdout
     assert "no longer used" in result.stdout
 

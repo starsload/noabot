@@ -7,6 +7,7 @@ from types import ModuleType, SimpleNamespace
 
 import pytest
 
+from nanobot.agent.tools import mcp as mcp_module
 from nanobot.agent.tools.mcp import MCPToolWrapper, connect_mcp_servers
 from nanobot.agent.tools.registry import ToolRegistry
 from nanobot.config.schema import MCPServerConfig
@@ -186,6 +187,46 @@ async def test_execute_handles_server_cancelled_error() -> None:
 
 
 @pytest.mark.asyncio
+async def test_cancel_scope_error_is_not_treated_as_external_cancellation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class _FakeTask:
+        def cancelling(self) -> int:
+            return 1
+
+    monkeypatch.setattr(mcp_module.asyncio, "current_task", lambda: _FakeTask())
+
+    assert (
+        mcp_module._should_propagate_cancelled_error(
+            asyncio.CancelledError("Cancelled via cancel scope test")
+        )
+        is False
+    )
+    assert mcp_module._should_propagate_cancelled_error(asyncio.CancelledError()) is True
+
+
+def test_clear_current_task_cancellation_uncancels_until_clear(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class _FakeTask:
+        def __init__(self) -> None:
+            self._count = 2
+
+        def cancelling(self) -> int:
+            return self._count
+
+        def uncancel(self) -> None:
+            self._count -= 1
+
+    task = _FakeTask()
+    monkeypatch.setattr(mcp_module.asyncio, "current_task", lambda: task)
+
+    mcp_module._clear_current_task_cancellation()
+
+    assert task.cancelling() == 0
+
+
+@pytest.mark.asyncio
 async def test_execute_re_raises_external_cancellation() -> None:
     started = asyncio.Event()
 
@@ -343,3 +384,50 @@ async def test_connect_mcp_servers_enabled_tools_warns_on_unknown_entries(
     assert "enabledTools entries not found: unknown" in warnings[-1]
     assert "Available raw names: demo" in warnings[-1]
     assert "Available wrapped names: mcp_test_demo" in warnings[-1]
+
+
+@pytest.mark.asyncio
+async def test_connect_mcp_servers_continues_after_server_side_cancellation(
+    fake_mcp_runtime: dict[str, object | None], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    state = {"initialize_calls": 0}
+
+    async def initialize() -> None:
+        state["initialize_calls"] += 1
+        if state["initialize_calls"] == 1:
+            raise asyncio.CancelledError("Cancelled via cancel scope test")
+
+    async def list_tools() -> SimpleNamespace:
+        return SimpleNamespace(tools=[_make_tool_def("demo")])
+
+    fake_mcp_runtime["session"] = SimpleNamespace(
+        initialize=initialize,
+        list_tools=list_tools,
+    )
+    registry = ToolRegistry()
+    warnings: list[str] = []
+
+    def _warning(message: str, *args: object) -> None:
+        warnings.append(message.format(*args))
+
+    monkeypatch.setattr("nanobot.agent.tools.mcp.logger.warning", _warning)
+
+    stack = AsyncExitStack()
+    await stack.__aenter__()
+    try:
+        connected_count, cancelled_count = await connect_mcp_servers(
+            {
+                "cancelled": MCPServerConfig(command="fake"),
+                "healthy": MCPServerConfig(command="fake"),
+            },
+            registry,
+            stack,
+        )
+    finally:
+        await stack.aclose()
+
+    assert connected_count == 1
+    assert cancelled_count == 1
+    assert registry.tool_names == ["mcp_healthy_demo"]
+    assert warnings
+    assert "cancelled by server/SDK" in warnings[-1]

@@ -1,5 +1,6 @@
 """Configuration loading utilities."""
 
+import html
 import json
 from pathlib import Path
 
@@ -67,11 +68,46 @@ def save_config(config: Config, config_path: Path | None = None) -> None:
         json.dump(data, f, indent=2, ensure_ascii=False)
 
 
+def _normalize_mcp_arg(value: object) -> object:
+    """Normalize HTML-escaped or accidentally quoted MCP command arguments."""
+    if not isinstance(value, str):
+        return value
+
+    normalized = html.unescape(value).strip()
+    if normalized.startswith('"') and normalized.count('"') == 1:
+        normalized = normalized[1:]
+    elif normalized.endswith('"') and normalized.count('"') == 1:
+        normalized = normalized[:-1]
+    elif len(normalized) >= 2 and normalized[0] == normalized[-1] == '"':
+        normalized = normalized[1:-1]
+    return normalized
+
+
 def _migrate_config(data: dict) -> dict:
     """Migrate old config formats to current."""
-    # Move tools.exec.restrictToWorkspace → tools.restrictToWorkspace
+    agents = data.get("agents", {})
+    defaults = agents.get("defaults", {})
+
+    legacy_memory_window_present = (
+        "memoryWindow" in defaults or "memory_window" in defaults
+    )
+    context_window_present = (
+        "contextWindowTokens" in defaults or "context_window_tokens" in defaults
+    )
+    if legacy_memory_window_present and not context_window_present:
+        defaults["shouldWarnDeprecatedMemoryWindow"] = True
+
+    defaults.pop("memoryWindow", None)
+    defaults.pop("memory_window", None)
+
+    # Move tools.exec.restrictToWorkspace -> tools.restrictToWorkspace
     tools = data.get("tools", {})
     exec_cfg = tools.get("exec", {})
     if "restrictToWorkspace" in exec_cfg and "restrictToWorkspace" not in tools:
         tools["restrictToWorkspace"] = exec_cfg.pop("restrictToWorkspace")
+
+    mcp_servers = tools.get("mcpServers", {})
+    for server_cfg in mcp_servers.values():
+        if isinstance(server_cfg, dict) and isinstance(server_cfg.get("args"), list):
+            server_cfg["args"] = [_normalize_mcp_arg(arg) for arg in server_cfg["args"]]
     return data

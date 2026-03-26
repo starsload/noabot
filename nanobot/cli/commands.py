@@ -444,7 +444,7 @@ def _print_deprecated_memory_window_notice(config: Config) -> None:
     if config.agents.defaults.should_warn_deprecated_memory_window:
         console.print(
             "[yellow]Hint:[/yellow] Detected deprecated `memoryWindow` without "
-            "`contextWindowTokens`. `memoryWindow` is ignored; run "
+            "`contextWindowTokens`. `memoryWindow` is no longer used and is ignored; run "
             "[cyan]nanobot onboard[/cyan] to refresh your config template."
         )
 
