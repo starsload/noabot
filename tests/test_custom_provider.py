@@ -38,6 +38,46 @@ def _responses_response(
     )
 
 
+def test_custom_provider_prunes_unsigned_gemini_tool_history() -> None:
+    messages = [
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {
+                    "id": "unsigned_1",
+                    "type": "function",
+                    "function": {"name": "read_file", "arguments": '{"path":"a.md"}'},
+                }
+            ],
+        },
+        {"role": "tool", "tool_call_id": "unsigned_1", "name": "read_file", "content": "a"},
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {
+                    "id": "signed_1",
+                    "type": "function",
+                    "function": {"name": "read_file", "arguments": '{"path":"b.md"}'},
+                    "provider_specific_fields": {"thought_signature": "sig"},
+                }
+            ],
+        },
+        {"role": "tool", "tool_call_id": "signed_1", "name": "read_file", "content": "b"},
+        {"role": "user", "content": "continue"},
+    ]
+
+    repaired = CustomProvider._prune_gemini_unsigned_tool_history(messages)
+
+    assert len(repaired) == 3
+    assert repaired[0]["role"] == "assistant"
+    assert repaired[0]["tool_calls"][0]["id"] == "signed_1"
+    assert repaired[1]["role"] == "tool"
+    assert repaired[1]["tool_call_id"] == "signed_1"
+    assert repaired[2]["role"] == "user"
+
+
 @pytest.mark.asyncio
 async def test_custom_provider_chat_completions_mode_stays_unchanged() -> None:
     provider = CustomProvider(api_key="test-key", api_mode="chat_completions")
@@ -56,6 +96,129 @@ async def test_custom_provider_chat_completions_mode_stays_unchanged() -> None:
     }
     completions_create.assert_awaited_once()
     responses_create.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_custom_provider_chat_completions_prunes_unsigned_history_for_gemini() -> None:
+    provider = CustomProvider(
+        api_key="test-key",
+        api_mode="chat_completions",
+        default_model="gemini-3-flash-preview",
+    )
+    completions_create = AsyncMock(return_value=_chat_completion_response(content="ok"))
+    provider._client.chat.completions.create = completions_create
+
+    messages = [
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {
+                    "id": "unsigned_1",
+                    "type": "function",
+                    "function": {"name": "read_file", "arguments": "{}"},
+                }
+            ],
+        },
+        {"role": "tool", "tool_call_id": "unsigned_1", "name": "read_file", "content": "x"},
+        {"role": "user", "content": "hello"},
+    ]
+
+    await provider.chat(messages=messages)
+
+    sent_messages = completions_create.await_args.kwargs["messages"]
+    assert len(sent_messages) == 1
+    assert sent_messages[0]["role"] == "user"
+    assert sent_messages[0]["content"] == "hello"
+
+
+@pytest.mark.asyncio
+async def test_custom_provider_chat_completions_preserves_tool_call_provider_fields() -> None:
+    provider = CustomProvider(api_key="test-key", api_mode="chat_completions")
+    completions_create = AsyncMock(
+        return_value=_chat_completion_response(
+            content="",
+            finish_reason="tool_calls",
+            tool_calls=[
+                SimpleNamespace(
+                    id="call_123",
+                    function=SimpleNamespace(
+                        name="read_file",
+                        arguments='{"path":"todo.md"}',
+                        provider_specific_fields={"inner": "value"},
+                    ),
+                    provider_specific_fields={"thought_signature": "signed-token"},
+                )
+            ],
+        )
+    )
+    provider._client.chat.completions.create = completions_create
+
+    result = await provider.chat(messages=[{"role": "user", "content": "hello"}])
+
+    assert result.finish_reason == "tool_calls"
+    assert len(result.tool_calls) == 1
+    assert result.tool_calls[0].id == "call_123"
+    assert result.tool_calls[0].provider_specific_fields == {"thought_signature": "signed-token"}
+    assert result.tool_calls[0].function_provider_specific_fields == {"inner": "value"}
+
+
+@pytest.mark.asyncio
+async def test_custom_provider_chat_completions_accepts_legacy_thought_signature_location() -> None:
+    provider = CustomProvider(api_key="test-key", api_mode="chat_completions")
+    completions_create = AsyncMock(
+        return_value=_chat_completion_response(
+            content="",
+            finish_reason="tool_calls",
+            tool_calls=[
+                SimpleNamespace(
+                    id="legacy_call_1",
+                    function=SimpleNamespace(
+                        name="read_file",
+                        arguments='{"path":"todo.md"}',
+                        thought_signature="legacy-token",
+                    ),
+                )
+            ],
+        )
+    )
+    provider._client.chat.completions.create = completions_create
+
+    result = await provider.chat(messages=[{"role": "user", "content": "hello"}])
+
+    assert result.finish_reason == "tool_calls"
+    assert len(result.tool_calls) == 1
+    assert result.tool_calls[0].id == "legacy_call_1"
+    assert result.tool_calls[0].provider_specific_fields == {"thought_signature": "legacy-token"}
+
+
+@pytest.mark.asyncio
+async def test_custom_provider_chat_completions_accepts_camelcase_thought_signature() -> None:
+    provider = CustomProvider(api_key="test-key", api_mode="chat_completions")
+    completions_create = AsyncMock(
+        return_value=_chat_completion_response(
+            content="",
+            finish_reason="tool_calls",
+            tool_calls=[
+                SimpleNamespace(
+                    id="legacy_call_2",
+                    function=SimpleNamespace(
+                        name="read_file",
+                        arguments='{"path":"todo.md"}',
+                        thoughtSignature="legacy-token-camel",
+                    ),
+                )
+            ],
+        )
+    )
+    provider._client.chat.completions.create = completions_create
+
+    result = await provider.chat(messages=[{"role": "user", "content": "hello"}])
+
+    assert result.finish_reason == "tool_calls"
+    assert len(result.tool_calls) == 1
+    assert result.tool_calls[0].id == "legacy_call_2"
+    assert result.tool_calls[0].provider_specific_fields == {"thought_signature": "legacy-token-camel"}
 
 
 @pytest.mark.asyncio

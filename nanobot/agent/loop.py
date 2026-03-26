@@ -9,15 +9,17 @@ import re
 import sys
 from contextlib import AsyncExitStack
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Awaitable, Callable
+from typing import TYPE_CHECKING, Awaitable, Callable
 
 from loguru import logger
 
+from nanobot.agent.codex_jobs import CodexJobManager
 from nanobot.agent.context import ContextBuilder
 from nanobot.agent.memory import MemoryConsolidator
-from nanobot.agent.subagent import SubagentManager
-from nanobot.agent.tools.cron import CronTool
 from nanobot.agent.skills import BUILTIN_SKILLS_DIR
+from nanobot.agent.subagent import SubagentManager
+from nanobot.agent.tools.codex import CodexDelegateTool, CodexResumeTool, CodexStatusTool
+from nanobot.agent.tools.cron import CronTool
 from nanobot.agent.tools.filesystem import EditFileTool, ListDirTool, ReadFileTool, WriteFileTool
 from nanobot.agent.tools.message import MessageTool
 from nanobot.agent.tools.registry import ToolRegistry
@@ -83,6 +85,7 @@ class AgentLoop:
         self.context = ContextBuilder(workspace)
         self.sessions = session_manager or SessionManager(workspace)
         self.tools = ToolRegistry()
+        self.codex_jobs = CodexJobManager(workspace=workspace, bus=bus)
         self.subagents = SubagentManager(
             provider=provider,
             workspace=workspace,
@@ -130,6 +133,9 @@ class AgentLoop:
         self.tools.register(WebFetchTool(proxy=self.web_proxy))
         self.tools.register(MessageTool(send_callback=self.bus.publish_outbound))
         self.tools.register(SpawnTool(manager=self.subagents))
+        self.tools.register(CodexDelegateTool(manager=self.codex_jobs))
+        self.tools.register(CodexStatusTool(manager=self.codex_jobs))
+        self.tools.register(CodexResumeTool(manager=self.codex_jobs))
         if self.cron_service:
             self.tools.register(CronTool(self.cron_service))
 
@@ -157,7 +163,7 @@ class AgentLoop:
 
     def _set_tool_context(self, channel: str, chat_id: str, message_id: str | None = None) -> None:
         """Update context for all tools that need routing info."""
-        for name in ("message", "spawn", "cron"):
+        for name in ("message", "spawn", "cron", "codex_delegate", "codex_status", "codex_resume"):
             if tool := self.tools.get(name):
                 if hasattr(tool, "set_context"):
                     tool.set_context(channel, chat_id, *([message_id] if name == "message" else []))
@@ -256,6 +262,7 @@ class AgentLoop:
     async def run(self) -> None:
         """Run the agent loop, dispatching messages as tasks to stay responsive to /stop."""
         self._running = True
+        await self.codex_jobs.restore_pending_jobs()
         await self._connect_mcp()
         logger.info("Agent loop started")
 
@@ -335,6 +342,7 @@ class AgentLoop:
         if self._background_tasks:
             await asyncio.gather(*self._background_tasks, return_exceptions=True)
             self._background_tasks.clear()
+        await self.codex_jobs.close()
         if self._mcp_stack:
             try:
                 await self._mcp_stack.aclose()
@@ -371,7 +379,7 @@ class AgentLoop:
             self._set_tool_context(channel, chat_id, msg.metadata.get("message_id"))
             history = session.get_history(max_messages=0)
             # Subagent results should be assistant role, other system messages use user role
-            current_role = "assistant" if msg.sender_id == "subagent" else "user"
+            current_role = "assistant" if msg.sender_id in {"subagent", "codex_job"} else "user"
             messages = self.context.build_messages(
                 history=history,
                 current_message=msg.content, channel=channel, chat_id=chat_id,
@@ -504,6 +512,7 @@ class AgentLoop:
         on_progress: Callable[[str], Awaitable[None]] | None = None,
     ) -> str:
         """Process a message directly (for CLI or cron usage)."""
+        await self.codex_jobs.restore_pending_jobs()
         await self._connect_mcp()
         msg = InboundMessage(channel=channel, sender_id="user", chat_id=chat_id, content=content)
         response = await self._process_message(msg, session_key=session_key, on_progress=on_progress)

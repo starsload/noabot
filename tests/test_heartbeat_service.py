@@ -1,4 +1,5 @@
 import asyncio
+import textwrap
 
 import pytest
 
@@ -121,6 +122,131 @@ async def test_trigger_now_returns_none_when_decision_is_skip(tmp_path) -> None:
     )
 
     assert await service.trigger_now() is None
+
+
+@pytest.mark.asyncio
+async def test_tick_skips_model_when_heartbeat_has_no_active_tasks(tmp_path) -> None:
+    (tmp_path / "HEARTBEAT.md").write_text(
+        textwrap.dedent(
+            """\
+            # Heartbeat Tasks
+
+            ## Active Tasks
+            <!-- Add your periodic tasks below this line -->
+
+            ## Completed
+            - [x] already done
+            """
+        ),
+        encoding="utf-8",
+    )
+
+    provider = DummyProvider([
+        LLMResponse(
+            content="",
+            tool_calls=[
+                ToolCallRequest(
+                    id="hb_1",
+                    name="heartbeat",
+                    arguments={"action": "run", "tasks": "should not be used"},
+                )
+            ],
+        ),
+    ])
+
+    executed: list[str] = []
+
+    async def _on_execute(tasks: str) -> str:
+        executed.append(tasks)
+        return "done"
+
+    service = HeartbeatService(
+        workspace=tmp_path,
+        provider=provider,
+        model="openai/gpt-4o-mini",
+        on_execute=_on_execute,
+    )
+
+    await service._tick()
+    assert provider.calls == 0
+    assert executed == []
+
+
+@pytest.mark.asyncio
+async def test_trigger_now_skips_model_when_heartbeat_has_no_active_tasks(tmp_path) -> None:
+    (tmp_path / "HEARTBEAT.md").write_text(
+        textwrap.dedent(
+            """\
+            ## Active Tasks
+            <!-- no active tasks -->
+
+            ## Completed
+            - [x] completed task
+            """
+        ),
+        encoding="utf-8",
+    )
+
+    provider = DummyProvider([
+        LLMResponse(
+            content="",
+            tool_calls=[
+                ToolCallRequest(
+                    id="hb_1",
+                    name="heartbeat",
+                    arguments={"action": "run", "tasks": "should not be used"},
+                )
+            ],
+        ),
+    ])
+
+    async def _on_execute(tasks: str) -> str:
+        return tasks
+
+    service = HeartbeatService(
+        workspace=tmp_path,
+        provider=provider,
+        model="openai/gpt-4o-mini",
+        on_execute=_on_execute,
+    )
+
+    assert await service.trigger_now() is None
+    assert provider.calls == 0
+
+
+@pytest.mark.asyncio
+async def test_trigger_now_falls_back_to_parsed_tasks_when_summary_missing(tmp_path) -> None:
+    (tmp_path / "HEARTBEAT.md").write_text("- [ ] check deployments", encoding="utf-8")
+
+    provider = DummyProvider([
+        LLMResponse(
+            content="",
+            tool_calls=[
+                ToolCallRequest(
+                    id="hb_1",
+                    name="heartbeat",
+                    arguments={"action": "run", "tasks": "   "},
+                )
+            ],
+        ),
+    ])
+
+    called_with: list[str] = []
+
+    async def _on_execute(tasks: str) -> str:
+        called_with.append(tasks)
+        return "done"
+
+    service = HeartbeatService(
+        workspace=tmp_path,
+        provider=provider,
+        model="openai/gpt-4o-mini",
+        on_execute=_on_execute,
+    )
+
+    result = await service.trigger_now()
+    assert result == "done"
+    assert called_with == ["- check deployments"]
 
 
 @pytest.mark.asyncio

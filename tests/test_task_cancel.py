@@ -21,8 +21,11 @@ def _make_loop():
 
     with patch("nanobot.agent.loop.ContextBuilder"), \
          patch("nanobot.agent.loop.SessionManager"), \
-         patch("nanobot.agent.loop.SubagentManager") as MockSubMgr:
-        MockSubMgr.return_value.cancel_by_session = AsyncMock(return_value=0)
+         patch("nanobot.agent.loop.SubagentManager") as mock_sub_mgr_cls, \
+         patch("nanobot.agent.loop.CodexJobManager") as mock_codex_mgr_cls:
+        mock_sub_mgr_cls.return_value.cancel_by_session = AsyncMock(return_value=0)
+        mock_codex_mgr_cls.return_value.restore_pending_jobs = AsyncMock(return_value=None)
+        mock_codex_mgr_cls.return_value.close = AsyncMock(return_value=None)
         loop = AgentLoop(bus=bus, provider=provider, workspace=workspace)
     return loop, bus
 

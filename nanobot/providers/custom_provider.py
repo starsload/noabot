@@ -29,6 +29,71 @@ class CustomProvider(LLMProvider):
         "method not allowed",
     )
 
+    @staticmethod
+    def _tool_call_has_thought_signature(tool_call: Any) -> bool:
+        provider_fields = (
+            tool_call.get("provider_specific_fields")
+            if isinstance(tool_call, dict)
+            else getattr(tool_call, "provider_specific_fields", None)
+        )
+        if isinstance(provider_fields, dict) and (
+            provider_fields.get("thought_signature") or provider_fields.get("thoughtSignature")
+        ):
+            return True
+
+        fn = tool_call.get("function") if isinstance(tool_call, dict) else getattr(tool_call, "function", None)
+        if fn is None:
+            return False
+        return bool(
+            getattr(tool_call, "thought_signature", None)
+            or getattr(tool_call, "thoughtSignature", None)
+            or (fn.get("thought_signature") if isinstance(fn, dict) else getattr(fn, "thought_signature", None))
+            or (fn.get("thoughtSignature") if isinstance(fn, dict) else getattr(fn, "thoughtSignature", None))
+        )
+
+    @classmethod
+    def _prune_gemini_unsigned_tool_history(cls, messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Drop assistant/tool pairs that lack thought_signature for Gemini tool turns."""
+        dropped_ids: set[str] = set()
+        repaired: list[dict[str, Any]] = []
+        changed = False
+
+        for message in messages:
+            role = message.get("role")
+            if role == "assistant" and isinstance(message.get("tool_calls"), list):
+                tool_calls = message.get("tool_calls") or []
+                kept_tool_calls = []
+                for tc in tool_calls:
+                    if cls._tool_call_has_thought_signature(tc):
+                        kept_tool_calls.append(tc)
+                    else:
+                        tc_id = tc.get("id") if isinstance(tc, dict) else getattr(tc, "id", None)
+                        if isinstance(tc_id, str) and tc_id:
+                            dropped_ids.add(tc_id)
+                        changed = True
+                if kept_tool_calls:
+                    if len(kept_tool_calls) != len(tool_calls):
+                        repaired.append({**message, "tool_calls": kept_tool_calls})
+                    else:
+                        repaired.append(message)
+                else:
+                    content = message.get("content")
+                    if content:
+                        repaired.append({k: v for k, v in message.items() if k != "tool_calls"})
+                    else:
+                        changed = True
+                continue
+
+            if role == "tool":
+                call_id = message.get("tool_call_id")
+                if isinstance(call_id, str) and call_id in dropped_ids:
+                    changed = True
+                    continue
+
+            repaired.append(message)
+
+        return repaired if changed else messages
+
     def __init__(
         self,
         api_key: str = "no-key",
@@ -109,9 +174,14 @@ class CustomProvider(LLMProvider):
         reasoning_effort: str | None = None,
         tool_choice: str | dict[str, Any] | None = None,
     ) -> LLMResponse:
+        model_name = model or self.default_model
+        request_messages = self._sanitize_empty_content(messages)
+        if "gemini" in model_name.lower():
+            request_messages = self._prune_gemini_unsigned_tool_history(request_messages)
+
         kwargs: dict[str, Any] = {
-            "model": model or self.default_model,
-            "messages": self._sanitize_empty_content(messages),
+            "model": model_name,
+            "messages": request_messages,
             "max_tokens": max(1, max_tokens),
             "temperature": temperature,
         }
@@ -162,6 +232,11 @@ class CustomProvider(LLMProvider):
         return any(marker in text for marker in cls._RESPONSES_FALLBACK_MARKERS)
 
     def _parse_chat_completions(self, response: Any) -> LLMResponse:
+        def _get(obj: Any, key: str, default: Any = None) -> Any:
+            if isinstance(obj, dict):
+                return obj.get(key, default)
+            return getattr(obj, key, default)
+
         if not response.choices:
             return LLMResponse(
                 content=(
@@ -172,18 +247,35 @@ class CustomProvider(LLMProvider):
             )
         choice = response.choices[0]
         msg = choice.message
-        tool_calls = [
-            ToolCallRequest(
-                id=tc.id,
-                name=tc.function.name,
-                arguments=(
-                    json_repair.loads(tc.function.arguments)
-                    if isinstance(tc.function.arguments, str)
-                    else tc.function.arguments
-                ),
-            )
-            for tc in (msg.tool_calls or [])
-        ]
+        tool_calls: list[ToolCallRequest] = []
+        for tc in (msg.tool_calls or []):
+            fn = _get(tc, "function", {}) or {}
+            arguments = _get(fn, "arguments")
+            if isinstance(arguments, str):
+                arguments = json_repair.loads(arguments)
+
+            provider_specific_fields = _get(tc, "provider_specific_fields") or None
+            function_provider_specific_fields = _get(fn, "provider_specific_fields") or None
+
+            # Compatibility with adapters that expose thought_signature on the
+            # function/tool-call object instead of provider_specific_fields.
+            if not provider_specific_fields:
+                thought_signature = (
+                    _get(tc, "thought_signature")
+                    or _get(tc, "thoughtSignature")
+                    or _get(fn, "thought_signature")
+                    or _get(fn, "thoughtSignature")
+                )
+                if thought_signature:
+                    provider_specific_fields = {"thought_signature": thought_signature}
+
+            tool_calls.append(ToolCallRequest(
+                id=_get(tc, "id", ""),
+                name=_get(fn, "name", ""),
+                arguments=arguments,
+                provider_specific_fields=provider_specific_fields,
+                function_provider_specific_fields=function_provider_specific_fields,
+            ))
         usage = response.usage
         return LLMResponse(
             content=msg.content,

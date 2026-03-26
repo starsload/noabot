@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import re
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, Coroutine
 
@@ -35,6 +36,15 @@ _HEARTBEAT_TOOL = [
         },
     }
 ]
+
+_HEADING_RE = re.compile(r"^\s{0,3}#{1,6}\s+(?P<title>.+?)\s*$")
+_HTML_COMMENT_RE = re.compile(r"^\s*<!--.*?-->\s*$")
+_TRAILING_COMMENT_RE = re.compile(r"\s*<!--.*?-->\s*$")
+_CHECKBOX_ITEM_RE = re.compile(r"^\s*[-*+]\s+\[(?P<state>[ xX])\]\s*(?P<body>.+?)\s*$")
+_BULLET_ITEM_RE = re.compile(r"^\s*[-*+]\s+(?P<body>\S.*)$")
+_NUMBERED_ITEM_RE = re.compile(r"^\s*\d+\.\s+(?P<body>\S.*)$")
+_ACTIVE_TASK_HEADINGS = {"active tasks", "periodic tasks"}
+_COMPLETED_TASK_HEADINGS = {"completed", "completed tasks"}
 
 
 class HeartbeatService:
@@ -81,6 +91,75 @@ class HeartbeatService:
             except Exception:
                 return None
         return None
+
+    @staticmethod
+    def _normalize_heading(title: str) -> str:
+        return " ".join(title.strip().lower().split())
+
+    @staticmethod
+    def _clean_task_text(text: str) -> str | None:
+        cleaned = _TRAILING_COMMENT_RE.sub("", text).strip()
+        return cleaned or None
+
+    def _parse_task_line(self, line: str) -> str | None:
+        checkbox_match = _CHECKBOX_ITEM_RE.match(line)
+        if checkbox_match:
+            if checkbox_match.group("state").lower() == "x":
+                return None
+            return self._clean_task_text(checkbox_match.group("body"))
+
+        bullet_match = _BULLET_ITEM_RE.match(line)
+        if bullet_match:
+            return self._clean_task_text(bullet_match.group("body"))
+
+        numbered_match = _NUMBERED_ITEM_RE.match(line)
+        if numbered_match:
+            return self._clean_task_text(numbered_match.group("body"))
+
+        return None
+
+    def _extract_active_tasks(self, content: str) -> list[str]:
+        lines = content.splitlines()
+        has_active_section = False
+        for line in lines:
+            heading_match = _HEADING_RE.match(line)
+            if not heading_match:
+                continue
+            heading = self._normalize_heading(heading_match.group("title"))
+            if heading in _ACTIVE_TASK_HEADINGS:
+                has_active_section = True
+                break
+
+        # If no explicit Active section exists, treat the document as task input.
+        section = "active" if not has_active_section else "other"
+        tasks: list[str] = []
+
+        for raw_line in lines:
+            heading_match = _HEADING_RE.match(raw_line)
+            if heading_match:
+                heading = self._normalize_heading(heading_match.group("title"))
+                if heading in _ACTIVE_TASK_HEADINGS:
+                    section = "active"
+                elif heading in _COMPLETED_TASK_HEADINGS:
+                    section = "completed"
+                else:
+                    section = "other"
+                continue
+
+            if section == "completed":
+                continue
+            if has_active_section and section != "active":
+                continue
+
+            stripped = raw_line.strip()
+            if not stripped or _HTML_COMMENT_RE.match(stripped):
+                continue
+
+            task = self._parse_task_line(stripped)
+            if task:
+                tasks.append(task)
+
+        return tasks
 
     async def _decide(self, content: str) -> tuple[str, str]:
         """Phase 1: ask LLM to decide skip/run via virtual tool call.
@@ -149,22 +228,32 @@ class HeartbeatService:
             logger.debug("Heartbeat: HEARTBEAT.md missing or empty")
             return
 
+        active_tasks = self._extract_active_tasks(content)
+        if not active_tasks:
+            logger.info("Heartbeat: no active tasks, skipping model request")
+            return
+
         logger.info("Heartbeat: checking for tasks...")
 
         try:
             action, tasks = await self._decide(content)
+            task_summary = (tasks or "").strip()
 
             if action != "run":
                 logger.info("Heartbeat: OK (nothing to report)")
                 return
 
+            if not task_summary:
+                task_summary = "\n".join(f"- {task}" for task in active_tasks)
+                logger.warning("Heartbeat: run decision without task summary; falling back to parsed tasks")
+
             logger.info("Heartbeat: tasks found, executing...")
             if self.on_execute:
-                response = await self.on_execute(tasks)
+                response = await self.on_execute(task_summary)
 
                 if response:
                     should_notify = await evaluate_response(
-                        response, tasks, self.provider, self.model,
+                        response, task_summary, self.provider, self.model,
                     )
                     if should_notify and self.on_notify:
                         logger.info("Heartbeat: completed, delivering response")
@@ -179,7 +268,11 @@ class HeartbeatService:
         content = self._read_heartbeat_file()
         if not content:
             return None
+        active_tasks = self._extract_active_tasks(content)
+        if not active_tasks:
+            return None
         action, tasks = await self._decide(content)
         if action != "run" or not self.on_execute:
             return None
-        return await self.on_execute(tasks)
+        task_summary = (tasks or "").strip() or "\n".join(f"- {task}" for task in active_tasks)
+        return await self.on_execute(task_summary)

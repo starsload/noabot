@@ -65,6 +65,31 @@ async def test_chat_with_retry_does_not_retry_non_transient_error(monkeypatch) -
 
 
 @pytest.mark.asyncio
+async def test_chat_with_retry_does_not_retry_missing_thought_signature(monkeypatch) -> None:
+    provider = ScriptedProvider([
+        LLMResponse(
+            content=(
+                "Error: error code: 429 - {'error': {'message': "
+                "'function call is missing a thought_signature in functioncall parts'}}"
+            ),
+            finish_reason="error",
+        ),
+    ])
+    delays: list[int] = []
+
+    async def _fake_sleep(delay: int) -> None:
+        delays.append(delay)
+
+    monkeypatch.setattr("nanobot.providers.base.asyncio.sleep", _fake_sleep)
+
+    response = await provider.chat_with_retry(messages=[{"role": "user", "content": "hello"}])
+
+    assert "thought_signature" in (response.content or "")
+    assert provider.calls == 1
+    assert delays == []
+
+
+@pytest.mark.asyncio
 async def test_chat_with_retry_returns_final_error_after_retries(monkeypatch) -> None:
     provider = ScriptedProvider([
         LLMResponse(content="429 rate limit a", finish_reason="error"),

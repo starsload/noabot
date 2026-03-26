@@ -832,6 +832,58 @@ def agent(
 
 
 # ============================================================================
+# News Digest
+# ============================================================================
+
+
+@app.command("news-digest")
+def news_digest(
+    config: str = typer.Option(..., "--config", "-c", help="Path to news digest JSON config"),
+    dry_run: bool = typer.Option(False, "--dry-run", help="Collect news but do not push webhook messages"),
+):
+    """Collect news from RSS/Atom feeds and optionally push a digest."""
+    import sys
+    from pathlib import Path
+    
+    # Add workspace to path for utils import
+    workspace_root = Path(__file__).resolve().parents[2] / "workspace"
+    if str(workspace_root) not in sys.path:
+        sys.path.insert(0, str(workspace_root))
+    
+    from utils.news_digest import run_news_digest
+
+    config_path = Path(config).expanduser().resolve()
+    if not config_path.exists():
+        console.print(f"[red]Error: Config file not found: {config_path}[/red]")
+        raise typer.Exit(1)
+
+    try:
+        result = asyncio.run(run_news_digest(config_path, dry_run=dry_run))
+    except Exception as exc:
+        console.print(f"[red]Error: news digest failed: {exc}[/red]")
+        raise typer.Exit(1) from exc
+
+    if result.should_print:
+        console.print(Markdown(result.content))
+        console.print()
+
+    if result.item_count == 0:
+        console.print("[yellow]No new items matched the configured window.[/yellow]")
+    elif result.pushed:
+        console.print(
+            f"[green]✓[/green] Pushed {result.item_count} items "
+            f"in {result.sent_chunks} message(s)"
+        )
+    else:
+        console.print(f"[green]✓[/green] Built digest with {result.item_count} items")
+
+    if result.output_path:
+        console.print(f"[dim]Saved digest to {result.output_path}[/dim]")
+    if result.errors:
+        console.print(f"[yellow]Warning:[/yellow] {len(result.errors)} feed(s) failed during fetch")
+
+
+# ============================================================================
 # Channel Commands
 # ============================================================================
 

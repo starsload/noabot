@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import asyncio
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -23,7 +23,10 @@ def _make_loop():
 
     with patch("nanobot.agent.loop.ContextBuilder"), \
          patch("nanobot.agent.loop.SessionManager"), \
-         patch("nanobot.agent.loop.SubagentManager"):
+         patch("nanobot.agent.loop.SubagentManager"), \
+         patch("nanobot.agent.loop.CodexJobManager") as mock_codex_mgr_cls:
+        mock_codex_mgr_cls.return_value.restore_pending_jobs = AsyncMock(return_value=None)
+        mock_codex_mgr_cls.return_value.close = AsyncMock(return_value=None)
         loop = AgentLoop(bus=bus, provider=provider, workspace=workspace)
     return loop, bus
 

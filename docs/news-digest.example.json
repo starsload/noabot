@@ -1,0 +1,37 @@
+{
+  "title": "AI Daily News Digest",
+  "windowHours": 24,
+  "maxItems": 8,
+  "summaryLength": 120,
+  "requestTimeoutSeconds": 15,
+  "statePath": "./runtime/news-digest.state.json",
+  "outputPath": "./runtime/latest-news.md",
+  "includeKeywords": [
+    "ai",
+    "openai",
+    "anthropic",
+    "google"
+  ],
+  "excludeKeywords": [
+    "rumor"
+  ],
+  "push": {
+    "type": "dingtalk",
+    "webhookUrl": "${NEWS_DIGEST_WEBHOOK}",
+    "maxMessageLength": 3500
+  },
+  "sources": [
+    {
+      "name": "OpenAI News",
+      "url": "https://openai.com/news/rss.xml"
+    },
+    {
+      "name": "Anthropic News",
+      "url": "https://www.anthropic.com/news/rss.xml"
+    },
+    {
+      "name": "Hacker News",
+      "url": "https://hnrss.org/frontpage"
+    }
+  ]
+}

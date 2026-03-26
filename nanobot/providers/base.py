@@ -44,7 +44,7 @@ class LLMResponse:
     usage: dict[str, int] = field(default_factory=dict)
     reasoning_content: str | None = None  # Kimi, DeepSeek-R1 etc.
     thinking_blocks: list[dict] | None = None  # Anthropic extended thinking
-    
+
     @property
     def has_tool_calls(self) -> bool:
         """Check if response contains tool calls."""
@@ -69,7 +69,7 @@ class GenerationSettings:
 class LLMProvider(ABC):
     """
     Abstract base class for LLM providers.
-    
+
     Implementations should handle the specifics of each provider's API
     while maintaining a consistent interface.
     """
@@ -88,6 +88,9 @@ class LLMProvider(ABC):
         "connection",
         "server error",
         "temporarily unavailable",
+    )
+    _NON_TRANSIENT_ERROR_MARKERS = (
+        "missing a thought_signature",
     )
 
     _SENTINEL = object()
@@ -173,7 +176,7 @@ class LLMProvider(ABC):
     ) -> LLMResponse:
         """
         Send a chat completion request.
-        
+
         Args:
             messages: List of message dicts with 'role' and 'content'.
             tools: Optional list of tool definitions.
@@ -181,7 +184,7 @@ class LLMProvider(ABC):
             max_tokens: Maximum tokens in response.
             temperature: Sampling temperature.
             tool_choice: Tool selection strategy ("auto", "required", or specific tool dict).
-        
+
         Returns:
             LLMResponse with content and/or tool calls.
         """
@@ -190,6 +193,8 @@ class LLMProvider(ABC):
     @classmethod
     def _is_transient_error(cls, content: str | None) -> bool:
         err = (content or "").lower()
+        if any(marker in err for marker in cls._NON_TRANSIENT_ERROR_MARKERS):
+            return False
         return any(marker in err for marker in cls._TRANSIENT_ERROR_MARKERS)
 
     @staticmethod
