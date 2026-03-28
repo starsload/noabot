@@ -45,10 +45,17 @@ class AgentDefaults(Base):
     should_warn_deprecated_memory_window: bool = Field(default=False, exclude=True)
 
 
+class AgentIdentityConfig(Base):
+    """Agent identity / ownership hints used for prompt context."""
+
+    owner_ids: list[str] = Field(default_factory=list)
+
+
 class AgentsConfig(Base):
     """Agent configuration."""
 
     defaults: AgentDefaults = Field(default_factory=AgentDefaults)
+    identity: AgentIdentityConfig = Field(default_factory=AgentIdentityConfig)
 
 
 class ProviderConfig(Base):

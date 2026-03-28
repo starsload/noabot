@@ -72,3 +72,45 @@ def test_save_turn_keeps_tool_results_under_16k() -> None:
     )
 
     assert session.messages[0]["content"] == content
+
+
+def test_save_turn_keeps_group_speaker_prefix_after_runtime_strip() -> None:
+    loop = _mk_loop()
+    session = Session(key="test:group-speaker")
+    runtime = ContextBuilder._build_runtime_context(
+        channel="qq",
+        chat_id="group123",
+        sender_id="user1",
+        sender_name="Alice",
+        conversation_type="group",
+        is_owner=False,
+    )
+
+    loop._save_turn(
+        session,
+        [{"role": "user", "content": f"{runtime}\n\nhello group"}],
+        skip=0,
+    )
+
+    assert session.messages[0]["content"] == "[speaker: Alice (user1), owner=false] hello group"
+
+
+def test_save_turn_does_not_prefix_direct_message_history() -> None:
+    loop = _mk_loop()
+    session = Session(key="test:direct-speaker")
+    runtime = ContextBuilder._build_runtime_context(
+        channel="qq_personal",
+        chat_id="user1",
+        sender_id="user1",
+        sender_name="Alice",
+        conversation_type="direct",
+        is_owner=False,
+    )
+
+    loop._save_turn(
+        session,
+        [{"role": "user", "content": f"{runtime}\n\nhello direct"}],
+        skip=0,
+    )
+
+    assert session.messages[0]["content"] == "hello direct"

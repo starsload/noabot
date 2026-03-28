@@ -40,7 +40,7 @@ def load_config(config_path: Path | None = None) -> Config:
 
     if path.exists():
         try:
-            with open(path, encoding="utf-8") as f:
+            with open(path, encoding="utf-8-sig") as f:
                 data = json.load(f)
             data = _migrate_config(data)
             return Config.model_validate(data)
@@ -105,6 +105,10 @@ def _migrate_config(data: dict) -> dict:
     exec_cfg = tools.get("exec", {})
     if "restrictToWorkspace" in exec_cfg and "restrictToWorkspace" not in tools:
         tools["restrictToWorkspace"] = exec_cfg.pop("restrictToWorkspace")
+
+    channels = data.get("channels", {})
+    if "qqPersonal" in channels and "qq_personal" not in channels:
+        channels["qq_personal"] = channels.pop("qqPersonal")
 
     mcp_servers = tools.get("mcpServers", {})
     for server_cfg in mcp_servers.values():

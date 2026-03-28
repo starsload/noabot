@@ -176,3 +176,43 @@ def test_onboard_refresh_backfills_missing_channel_fields(tmp_path, monkeypatch)
     assert result.exit_code == 0
     saved = json.loads(config_path.read_text(encoding="utf-8"))
     assert saved["channels"]["qq"]["msgFormat"] == "plain"
+
+
+def test_save_and_load_config_preserves_owner_ids(tmp_path) -> None:
+    config_path = tmp_path / "config.json"
+
+    config = load_config(config_path)
+    config.agents.identity.owner_ids = ["telegram:123", "qq_personal:456"]
+    save_config(config, config_path)
+
+    reloaded = load_config(config_path)
+
+    assert reloaded.agents.identity.owner_ids == ["telegram:123", "qq_personal:456"]
+
+
+def test_load_config_migrates_q_personal_channel_key(tmp_path) -> None:
+    config_path = tmp_path / "config.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "channels": {
+                    "qqPersonal": {
+                        "enabled": True,
+                        "wsUrl": "ws://127.0.0.1:3001",
+                        "httpUrl": "http://127.0.0.1:3000",
+                        "accessToken": "token",
+                        "allowFrom": ["123"],
+                    }
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    config = load_config(config_path)
+
+    qq_personal = getattr(config.channels, "qq_personal", None)
+    assert qq_personal is not None
+    assert isinstance(qq_personal, dict)
+    assert qq_personal["enabled"] is True
+    assert qq_personal["wsUrl"] == "ws://127.0.0.1:3001"

@@ -84,6 +84,7 @@ class AgentLoop:
         session_manager: SessionManager | None = None,
         mcp_servers: dict | None = None,
         channels_config: ChannelsConfig | None = None,
+        owner_ids: list[str] | None = None,
     ):
         from nanobot.config.schema import ExecToolConfig, WebSearchConfig
 
@@ -99,8 +100,9 @@ class AgentLoop:
         self.exec_config = exec_config or ExecToolConfig()
         self.cron_service = cron_service
         self.restrict_to_workspace = restrict_to_workspace
+        self.owner_ids = {str(item).strip() for item in (owner_ids or []) if str(item).strip()}
 
-        self.context = ContextBuilder(workspace)
+        self.context = ContextBuilder(workspace, owner_ids=list(self.owner_ids))
         self.sessions = session_manager or SessionManager(workspace)
         self.tools = ToolRegistry()
         self.codex_jobs = CodexJobManager(workspace=workspace, bus=bus)
@@ -138,6 +140,68 @@ class AgentLoop:
             max_completion_tokens=max_completion_tokens,
         )
         self._register_default_tools()
+
+    def _resolve_conversation_type(self, msg: InboundMessage) -> str:
+        """Infer whether the current message is a direct, group, or thread conversation."""
+        metadata = msg.metadata or {}
+
+        if (
+            metadata.get("thread_id")
+            or metadata.get("message_thread_id")
+            or metadata.get("thread_root_event_id")
+        ):
+            return "thread"
+
+        chat_type = str(metadata.get("chat_type") or "").strip().lower()
+        if chat_type in {"private", "direct", "p2p", "single", "dm", "im"}:
+            return "direct"
+        if chat_type in {"group", "supergroup", "channel"}:
+            return "group"
+        if chat_type in {"thread", "forum"}:
+            return "thread"
+
+        channel_type = str(metadata.get("channel_type") or "").strip().lower()
+        if channel_type == "im":
+            return "direct"
+        if channel_type:
+            return "group"
+
+        conversation_type = str(metadata.get("conversation_type") or "").strip().lower()
+        if conversation_type in {"1", "single", "private", "direct"}:
+            return "direct"
+        if conversation_type in {"2", "group"}:
+            return "group"
+
+        if metadata.get("is_group") is True:
+            return "group"
+
+        chat_id = str(msg.chat_id)
+        sender_id = str(msg.sender_id)
+        if chat_id == sender_id:
+            return "direct"
+        if chat_id.startswith("group:"):
+            return "group"
+        return "shared"
+
+    def _is_owner(self, msg: InboundMessage) -> bool | None:
+        """Return whether the sender matches configured owner IDs."""
+        if not self.owner_ids:
+            return None
+
+        sender_id = str(msg.sender_id).strip()
+        candidates = {sender_id, f"{msg.channel}:{sender_id}"}
+        return any(candidate in self.owner_ids for candidate in candidates)
+
+    def _speaker_context_kwargs(self, msg: InboundMessage) -> dict[str, Any]:
+        """Build speaker metadata for prompt runtime context."""
+        metadata = msg.metadata or {}
+        return {
+            "sender_id": str(msg.sender_id),
+            "sender_name": str(metadata.get("sender_name") or "").strip() or None,
+            "sender_username": str(metadata.get("sender_username") or "").strip() or None,
+            "conversation_type": self._resolve_conversation_type(msg),
+            "is_owner": self._is_owner(msg),
+        }
 
     def _register_default_tools(self) -> None:
         """Register the default set of tools."""
@@ -443,7 +507,10 @@ class AgentLoop:
                 )
             messages = self.context.build_messages(
                 history=fitted_history,
-                current_message=msg.content, channel=channel, chat_id=chat_id,
+                current_message=msg.content,
+                channel=channel,
+                chat_id=chat_id,
+                sender_id=msg.sender_id,
                 current_role=current_role,
             )
             final_content, _, all_msgs = await self._run_agent_loop(messages)
@@ -511,7 +578,9 @@ class AgentLoop:
             history=fitted_history,
             current_message=msg.content,
             media=msg.media if msg.media else None,
-            channel=msg.channel, chat_id=msg.chat_id,
+            channel=msg.channel,
+            chat_id=msg.chat_id,
+            **self._speaker_context_kwargs(msg),
         )
 
         async def _bus_progress(content: str, *, tool_hint: bool = False) -> None:
@@ -555,16 +624,18 @@ class AgentLoop:
                 entry["content"] = content[:self._TOOL_RESULT_MAX_CHARS] + "\n... (truncated)"
             elif role == "user":
                 if isinstance(content, str) and content.startswith(ContextBuilder._RUNTIME_CONTEXT_TAG):
-                    # Strip the runtime-context prefix, keep only the user text.
-                    parts = content.split("\n\n", 1)
-                    if len(parts) > 1 and parts[1].strip():
-                        entry["content"] = parts[1]
+                    runtime_meta, user_text = ContextBuilder.extract_runtime_metadata(content)
+                    prefix = ContextBuilder.build_historical_speaker_prefix(runtime_meta)
+                    if user_text.strip():
+                        entry["content"] = f"{prefix or ''}{user_text}".strip()
                     else:
                         continue
                 if isinstance(content, list):
                     filtered = []
+                    runtime_meta: dict[str, str] = {}
                     for c in content:
                         if c.get("type") == "text" and isinstance(c.get("text"), str) and c["text"].startswith(ContextBuilder._RUNTIME_CONTEXT_TAG):
+                            runtime_meta, _ = ContextBuilder.extract_runtime_metadata(c["text"])
                             continue  # Strip runtime context from multimodal messages
                         if (c.get("type") == "image_url"
                                 and c.get("image_url", {}).get("url", "").startswith("data:image/")):
@@ -575,6 +646,12 @@ class AgentLoop:
                             filtered.append(c)
                     if not filtered:
                         continue
+                    prefix = ContextBuilder.build_historical_speaker_prefix(runtime_meta)
+                    if prefix:
+                        if filtered[0].get("type") == "text" and isinstance(filtered[0].get("text"), str):
+                            filtered[0]["text"] = prefix + filtered[0]["text"]
+                        else:
+                            filtered.insert(0, {"type": "text", "text": prefix.rstrip()})
                     entry["content"] = filtered
             entry.setdefault("timestamp", datetime.now().isoformat())
             session.messages.append(entry)

@@ -71,3 +71,41 @@ def test_runtime_context_is_separate_untrusted_user_message(tmp_path) -> None:
     assert "Channel: cli" in user_content
     assert "Chat ID: direct" in user_content
     assert "Return exactly: OK" in user_content
+
+
+def test_runtime_context_includes_speaker_identity_and_owner_status(tmp_path) -> None:
+    workspace = _make_workspace(tmp_path)
+    builder = ContextBuilder(workspace)
+
+    messages = builder.build_messages(
+        history=[],
+        current_message="hello",
+        channel="qq",
+        chat_id="group123",
+        sender_id="user1",
+        sender_name="Alice",
+        sender_username="alice",
+        conversation_type="group",
+        is_owner=False,
+    )
+
+    user_content = messages[-1]["content"]
+    assert isinstance(user_content, str)
+    assert "Conversation Type: group" in user_content
+    assert "Speaker ID: user1" in user_content
+    assert "Speaker Name: Alice" in user_content
+    assert "Speaker Username: alice" in user_content
+    assert "Is Owner: false" in user_content
+    assert "Current speaker may not be the workspace owner from USER.md." in user_content
+
+
+def test_system_prompt_clarifies_owner_vs_current_speaker(tmp_path) -> None:
+    workspace = _make_workspace(tmp_path)
+    builder = ContextBuilder(workspace)
+
+    prompt = builder.build_system_prompt()
+
+    assert "workspace owner" in prompt
+    assert "current speaker" in prompt
+    assert "Is Owner: false" in prompt
+    assert "Is Owner: true" in prompt

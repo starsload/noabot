@@ -239,6 +239,7 @@ That's it! You have a working AI assistant in 2 minutes.
 ## 💬 Chat Apps
 
 Connect nanobot to your favorite chat platform. Want to build your own? See the [Channel Plugin Guide](./docs/CHANNEL_PLUGIN_GUIDE.md).
+For current code-level group reply behavior across channels, see the [Channel Group Support Matrix](./docs/CHANNEL_GROUP_SUPPORT_MATRIX.md).
 
 | Channel | What you need |
 |---------|---------------|
@@ -552,9 +553,9 @@ nanobot gateway
 </details>
 
 <details>
-<summary><b>QQ (QQ单聊)</b></summary>
+<summary><b>QQ Bot (开放平台)</b></summary>
 
-Uses **botpy SDK** with WebSocket — no public IP required. Currently supports **private messages only**.
+Uses **botpy SDK** with WebSocket — no public IP required. The current code supports **private messages** and **group @ messages**.
 
 **1. Register & create bot**
 - Visit [QQ Open Platform](https://q.qq.com) → Register as a developer (personal or enterprise)
@@ -593,6 +594,66 @@ nanobot gateway
 ```
 
 Now send a message to the bot from QQ — it should respond!
+
+</details>
+
+<details>
+<summary><b>QQ Personal (个人QQ账号)</b></summary>
+
+Uses a **OneBot 11 compatible bridge** such as **NapCat** to connect a real personal QQ account.
+
+This channel is for:
+
+- receiving personal-account friend messages
+- receiving personal-account group messages
+- sending replies back to friends
+- sending replies back to groups
+- receiving files into nanobot media storage
+- sending files via `message(..., media=[...])`
+
+It is **not** based on the QQ Open Platform bot flow above.
+
+**1. Prepare a OneBot bridge**
+- Install and log in to a OneBot 11 compatible personal QQ bridge such as NapCat
+- Enable a **Forward WebSocket** endpoint for event delivery
+- Enable an **HTTP API** endpoint for actions
+- Set an access token if your bridge requires authentication
+
+**2. Configure**
+
+> - `wsUrl`: OneBot forward WebSocket endpoint, for example `ws://127.0.0.1:3001`
+> - `httpUrl`: OneBot HTTP API endpoint, for example `http://127.0.0.1:3000`
+> - `accessToken`: Optional bearer token for both WS and HTTP auth
+> - `allowFrom`: Friend QQ IDs allowed to talk to nanobot. Use `["*"]` to allow all contacts
+> - `groupPolicy`: `mention` (default), `open`, or `allowlist`
+> - `groupAllowFrom`: Group IDs allowed when `groupPolicy` is `allowlist`
+> - `mediaDir`: Optional download directory for inbound files
+
+```json
+{
+  "channels": {
+    "qq_personal": {
+      "enabled": true,
+      "wsUrl": "ws://127.0.0.1:3001",
+      "httpUrl": "http://127.0.0.1:3000",
+      "accessToken": "",
+      "allowFrom": ["123456789"],
+      "groupPolicy": "mention",
+      "groupAllowFrom": []
+    }
+  }
+}
+```
+
+**3. Run**
+
+```bash
+nanobot gateway
+```
+
+When your personal QQ account receives a friend message or group message, nanobot will process it through the `qq_personal` channel. File attachments are downloaded into the configured media directory and exposed to the agent as normal inbound media paths.
+
+For a step-by-step Windows setup and NapCat acquisition guide, see [docs/QQ_PERSONAL_SETUP_GUIDE.md](docs/QQ_PERSONAL_SETUP_GUIDE.md).
 
 </details>
 
