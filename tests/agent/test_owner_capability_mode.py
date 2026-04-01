@@ -9,19 +9,27 @@ from nanobot.agent.context import ContextBuilder
 from nanobot.agent.loop import AgentLoop
 from nanobot.bus.events import InboundMessage
 from nanobot.bus.queue import MessageBus
+from nanobot.cron.service import CronService
 from nanobot.providers.base import LLMResponse, ToolCallRequest
 
 
-def _make_loop(tmp_path: Path, owner_ids: list[str] | None = None) -> AgentLoop:
+def _make_loop(
+    tmp_path: Path,
+    owner_ids: list[str] | None = None,
+    *,
+    with_cron: bool = False,
+) -> AgentLoop:
     bus = MessageBus()
     provider = MagicMock()
     provider.get_default_model.return_value = "test-model"
+    cron_service = CronService(tmp_path / "cron" / "jobs.json") if with_cron else None
     return AgentLoop(
         bus=bus,
         provider=provider,
         workspace=tmp_path,
         model="test-model",
         owner_ids=owner_ids or [],
+        cron_service=cron_service,
     )
 
 
@@ -84,7 +92,7 @@ async def test_chat_only_allows_web_fetch(tmp_path: Path) -> None:
 
 @pytest.mark.asyncio
 async def test_chat_only_blocks_write_file(tmp_path: Path) -> None:
-    loop = _make_loop(tmp_path, owner_ids=["telegram:owner"])
+    loop = _make_loop(tmp_path, owner_ids=["telegram:owner"], with_cron=True)
     loop.provider.chat_with_retry = AsyncMock(return_value=LLMResponse(content="hello", tool_calls=[]))
 
     response = await loop._process_message(
@@ -95,6 +103,7 @@ async def test_chat_only_blocks_write_file(tmp_path: Path) -> None:
     tool_names = _tool_names_from_last_call(loop)
     assert "write_file" not in tool_names
     assert "exec" not in tool_names
+    assert "cron" not in tool_names
 
 
 @pytest.mark.asyncio
@@ -173,7 +182,7 @@ async def test_non_owner_remote_status_is_denied(tmp_path: Path) -> None:
 
 @pytest.mark.asyncio
 async def test_internal_automation_allows_task_tools_but_blocks_delegation(tmp_path: Path) -> None:
-    loop = _make_loop(tmp_path, owner_ids=["telegram:owner"])
+    loop = _make_loop(tmp_path, owner_ids=["telegram:owner"], with_cron=True)
     loop.provider.chat_with_retry = AsyncMock(return_value=LLMResponse(content="ok", tool_calls=[]))
 
     response = await loop._process_message(
@@ -195,6 +204,7 @@ async def test_internal_automation_allows_task_tools_but_blocks_delegation(tmp_p
     assert "list_dir" in tool_names
     assert "exec" in tool_names
     assert "message" in tool_names
+    assert "cron" in tool_names
     assert "spawn" not in tool_names
     assert "codex_delegate" not in tool_names
     assert "codex_status" not in tool_names

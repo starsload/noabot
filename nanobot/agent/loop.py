@@ -73,7 +73,6 @@ class AgentLoop:
         "codex_delegate",
         "codex_status",
         "codex_resume",
-        "cron",
     })
     _AUTOMATION_KINDS = frozenset({"cron", "heartbeat"})
 

@@ -2,6 +2,8 @@
 
 from datetime import datetime, timezone
 
+import pytest
+
 from nanobot.agent.tools.cron import CronTool
 from nanobot.cron.service import CronService
 from nanobot.cron.types import CronJobState, CronSchedule
@@ -297,3 +299,19 @@ def test_list_excludes_disabled_jobs(tmp_path) -> None:
     result = tool._list_jobs()
     assert "Paused job" not in result
     assert result == "No scheduled jobs."
+
+
+@pytest.mark.asyncio
+async def test_cron_context_can_still_add_job(tmp_path) -> None:
+    tool = _make_tool(tmp_path)
+    tool.set_context("telegram", "chat-1")
+    token = tool.set_cron_context(True)
+    try:
+        result = await tool.execute(action="add", message="follow-up", every_seconds=60)
+    finally:
+        tool.reset_cron_context(token)
+
+    assert result.startswith("Created job")
+    jobs = tool._cron.list_jobs()
+    assert len(jobs) == 1
+    assert jobs[0].payload.message == "follow-up"

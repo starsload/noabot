@@ -99,7 +99,8 @@ Skills with available="false" need dependencies installed first - you can try in
             capability_policy = """
 ## Capability Mode
 - This conversation is running in internal automation mode (`cron`/`heartbeat`).
-- A restricted tool subset is available for scheduled work; delegation and self-scheduling tools remain blocked.
+- Automation can use business tools needed to complete scheduled tasks.
+- Delegation tools remain blocked (`spawn`, `codex_delegate`, `codex_status`, `codex_resume`).
 - Focus on the requested automation task only; avoid unrelated high-impact actions.
 """
 
