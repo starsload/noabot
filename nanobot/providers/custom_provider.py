@@ -16,6 +16,7 @@ from nanobot.providers.openai_responses import (
     convert_tools_to_responses_tools,
     parse_responses_api_response,
 )
+from nanobot.utils.helpers import estimate_prompt_tokens as estimate_prompt_tokens_fallback
 
 
 class CustomProvider(LLMProvider):
@@ -27,6 +28,15 @@ class CustomProvider(LLMProvider):
         "unrecognized request url",
         "no route",
         "method not allowed",
+    )
+    _QWEN_REASONING_BUDGET_MAP = {
+        "low": 1024,
+        "medium": 4096,
+        "high": 10_240,
+    }
+    _QWEN_REASONING_UNSUPPORTED_MODELS = (
+        "qwen3-coder-plus",
+        "qwen3-coder-next",
     )
 
     @staticmethod
@@ -93,6 +103,68 @@ class CustomProvider(LLMProvider):
             repaired.append(message)
 
         return repaired if changed else messages
+
+    @staticmethod
+    def _is_qwen_model(model: str | None) -> bool:
+        return isinstance(model, str) and "qwen" in model.lower()
+
+    @classmethod
+    def _supports_qwen_reasoning(cls, model: str | None) -> bool:
+        if not cls._is_qwen_model(model):
+            return False
+        normalized = model.lower()
+        return not any(marker in normalized for marker in cls._QWEN_REASONING_UNSUPPORTED_MODELS)
+
+    @staticmethod
+    def _strip_reasoning_history(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        stripped: list[dict[str, Any]] = []
+        changed = False
+        for message in messages:
+            if "reasoning_content" not in message and "thinking_blocks" not in message:
+                stripped.append(message)
+                continue
+            stripped.append({
+                key: value for key, value in message.items()
+                if key not in {"reasoning_content", "thinking_blocks"}
+            })
+            changed = True
+        return stripped if changed else messages
+
+    def _resolve_qwen_thinking_budget(self, reasoning_effort: str | None) -> int | None:
+        configured = self.generation.thinking_budget_tokens
+        if isinstance(configured, int) and configured > 0:
+            return configured
+        if not reasoning_effort:
+            return None
+        return self._QWEN_REASONING_BUDGET_MAP.get(reasoning_effort.lower())
+
+    def _qwen_reasoning_extra_body(
+        self,
+        model: str | None,
+        reasoning_effort: str | None,
+    ) -> dict[str, Any] | None:
+        if not self._supports_qwen_reasoning(model):
+            return None
+        # DashScope enables Qwen deep-thinking via `enable_thinking`.
+        budget = self._resolve_qwen_thinking_budget(reasoning_effort)
+        if not reasoning_effort and budget is None:
+            return None
+        payload: dict[str, Any] = {"enable_thinking": True}
+        if budget is not None:
+            payload["thinking_budget"] = budget
+        return payload
+
+    def _prepare_request_messages(
+        self,
+        messages: list[dict[str, Any]],
+        model_name: str,
+    ) -> list[dict[str, Any]]:
+        request_messages = self._sanitize_empty_content(messages)
+        if self._supports_qwen_reasoning(model_name):
+            request_messages = self._strip_reasoning_history(request_messages)
+        if "gemini" in model_name.lower():
+            request_messages = self._prune_gemini_unsigned_tool_history(request_messages)
+        return request_messages
 
     def __init__(
         self,
@@ -175,9 +247,7 @@ class CustomProvider(LLMProvider):
         tool_choice: str | dict[str, Any] | None = None,
     ) -> LLMResponse:
         model_name = model or self.default_model
-        request_messages = self._sanitize_empty_content(messages)
-        if "gemini" in model_name.lower():
-            request_messages = self._prune_gemini_unsigned_tool_history(request_messages)
+        request_messages = self._prepare_request_messages(messages, model_name)
 
         kwargs: dict[str, Any] = {
             "model": model_name,
@@ -185,7 +255,10 @@ class CustomProvider(LLMProvider):
             "max_tokens": max(1, max_tokens),
             "temperature": temperature,
         }
-        if reasoning_effort:
+        qwen_extra_body = self._qwen_reasoning_extra_body(model_name, reasoning_effort)
+        if qwen_extra_body is not None:
+            kwargs["extra_body"] = qwen_extra_body
+        elif reasoning_effort:
             kwargs["reasoning_effort"] = reasoning_effort
         if tools:
             kwargs.update(tools=tools, tool_choice=tool_choice or "auto")
@@ -202,22 +275,26 @@ class CustomProvider(LLMProvider):
         reasoning_effort: str | None = None,
         tool_choice: str | dict[str, Any] | None = None,
     ) -> LLMResponse:
+        model_name = model or self.default_model
         instructions, input_items = convert_messages_to_responses_input(
-            self._sanitize_empty_content(messages)
+            self._prepare_request_messages(messages, model_name)
         )
         kwargs: dict[str, Any] = {
-            "model": model or self.default_model,
+            "model": model_name,
             "input": input_items,
             "max_output_tokens": max(1, max_tokens),
             "prompt_cache_key": build_prompt_cache_key(
                 messages,
-                model=model or self.default_model,
+                model=model_name,
             ),
             "temperature": temperature,
         }
         if instructions:
             kwargs["instructions"] = instructions
-        if reasoning_effort:
+        qwen_extra_body = self._qwen_reasoning_extra_body(model_name, reasoning_effort)
+        if qwen_extra_body is not None:
+            kwargs["extra_body"] = qwen_extra_body
+        elif reasoning_effort:
             kwargs["reasoning"] = {"effort": reasoning_effort}
         if tools:
             kwargs["tools"] = convert_tools_to_responses_tools(tools)
@@ -225,6 +302,16 @@ class CustomProvider(LLMProvider):
             kwargs["parallel_tool_calls"] = True
         response = await self._client.responses.create(**kwargs)
         return parse_responses_api_response(response)
+
+    def estimate_prompt_tokens(
+        self,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]] | None = None,
+        model: str | None = None,
+    ) -> tuple[int, str]:
+        model_name = model or self.default_model
+        request_messages = self._prepare_request_messages(messages, model_name)
+        return estimate_prompt_tokens_fallback(request_messages, tools), "custom_provider"
 
     @classmethod
     def _should_fallback_to_chat_completions(cls, exc: Exception) -> bool:

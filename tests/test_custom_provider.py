@@ -3,6 +3,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 
+from nanobot.providers.base import GenerationSettings
 from nanobot.providers.custom_provider import CustomProvider
 
 
@@ -96,6 +97,73 @@ async def test_custom_provider_chat_completions_mode_stays_unchanged() -> None:
     }
     completions_create.assert_awaited_once()
     responses_create.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_custom_provider_chat_completions_uses_qwen_enable_thinking() -> None:
+    provider = CustomProvider(
+        api_key="test-key",
+        api_mode="chat_completions",
+        default_model="qwen3.5-plus",
+    )
+    completions_create = AsyncMock(return_value=_chat_completion_response())
+    provider._client.chat.completions.create = completions_create
+
+    await provider.chat(
+        messages=[{"role": "user", "content": "hello"}],
+        reasoning_effort="high",
+    )
+
+    kwargs = completions_create.await_args.kwargs
+    assert kwargs["extra_body"] == {"enable_thinking": True, "thinking_budget": 10_240}
+    assert "reasoning_effort" not in kwargs
+
+
+@pytest.mark.asyncio
+async def test_custom_provider_chat_completions_uses_configured_qwen_thinking_budget() -> None:
+    provider = CustomProvider(
+        api_key="test-key",
+        api_mode="chat_completions",
+        default_model="qwen3.5-plus",
+    )
+    provider.generation = GenerationSettings(thinking_budget_tokens=12_288)
+    completions_create = AsyncMock(return_value=_chat_completion_response())
+    provider._client.chat.completions.create = completions_create
+
+    await provider.chat(messages=[{"role": "user", "content": "hello"}])
+
+    kwargs = completions_create.await_args.kwargs
+    assert kwargs["extra_body"] == {"enable_thinking": True, "thinking_budget": 12_288}
+
+
+@pytest.mark.asyncio
+async def test_custom_provider_chat_completions_strips_qwen_reasoning_history() -> None:
+    provider = CustomProvider(
+        api_key="test-key",
+        api_mode="chat_completions",
+        default_model="qwen3.5-plus",
+    )
+    completions_create = AsyncMock(return_value=_chat_completion_response(content="ok"))
+    provider._client.chat.completions.create = completions_create
+
+    messages = [
+        {"role": "system", "content": "You are helpful."},
+        {
+            "role": "assistant",
+            "content": "prior answer",
+            "reasoning_content": "hidden chain-of-thought",
+            "thinking_blocks": [{"type": "thinking", "thinking": "secret"}],
+        },
+        {"role": "user", "content": "hello"},
+    ]
+
+    await provider.chat(messages=messages, reasoning_effort="high")
+
+    sent_messages = completions_create.await_args.kwargs["messages"]
+    assert len(sent_messages) == 3
+    assert sent_messages[1]["content"] == "prior answer"
+    assert "reasoning_content" not in sent_messages[1]
+    assert "thinking_blocks" not in sent_messages[1]
 
 
 @pytest.mark.asyncio
@@ -277,6 +345,26 @@ async def test_custom_provider_responses_mode_converts_forced_tool_choice() -> N
         "history_entry": "h",
         "memory_update": "m",
     }
+
+
+@pytest.mark.asyncio
+async def test_custom_provider_responses_mode_uses_qwen_enable_thinking() -> None:
+    provider = CustomProvider(
+        api_key="test-key",
+        api_mode="responses",
+        default_model="qwen3.5-plus",
+    )
+    responses_create = AsyncMock(return_value=_responses_response())
+    provider._client.responses.create = responses_create
+
+    await provider.chat(
+        messages=[{"role": "user", "content": "hello"}],
+        reasoning_effort="high",
+    )
+
+    kwargs = responses_create.await_args.kwargs
+    assert kwargs["extra_body"] == {"enable_thinking": True, "thinking_budget": 10_240}
+    assert "reasoning" not in kwargs
 
 
 @pytest.mark.asyncio

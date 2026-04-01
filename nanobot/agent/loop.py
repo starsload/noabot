@@ -9,7 +9,7 @@ import re
 import sys
 from contextlib import AsyncExitStack
 from pathlib import Path
-from typing import TYPE_CHECKING, Awaitable, Callable
+from typing import TYPE_CHECKING, Any, Awaitable, Callable
 
 from loguru import logger
 
@@ -67,6 +67,15 @@ class AgentLoop:
     """
 
     _TOOL_RESULT_MAX_CHARS = 16_000
+    _CHAT_ONLY_ALLOWED_TOOLS = frozenset({"web_search", "web_fetch"})
+    _AUTOMATION_BLOCKED_TOOLS = frozenset({
+        "spawn",
+        "codex_delegate",
+        "codex_status",
+        "codex_resume",
+        "cron",
+    })
+    _AUTOMATION_KINDS = frozenset({"cron", "heartbeat"})
 
     def __init__(
         self,
@@ -192,6 +201,58 @@ class AgentLoop:
         candidates = {sender_id, f"{msg.channel}:{sender_id}"}
         return any(candidate in self.owner_ids for candidate in candidates)
 
+    @staticmethod
+    def _is_trusted_local_message(msg: InboundMessage) -> bool:
+        """Return True for trusted local/internal control-plane messages."""
+        return msg.channel in {"cli", "system"}
+
+    def _has_full_capabilities(self, msg: InboundMessage) -> bool:
+        """Return whether the message may use tools, skills, and admin commands."""
+        if self._is_trusted_local_message(msg):
+            return True
+        return self._is_owner(msg) is True
+
+    def _capability_mode(self, msg: InboundMessage) -> str:
+        """Return the capability mode for the current message."""
+        if self._has_full_capabilities(msg):
+            return "full"
+        if self._is_internal_automation_message(msg):
+            return "automation"
+        return "chat_only"
+
+    def _automation_kind(self, msg: InboundMessage) -> str | None:
+        """Return trusted internal automation kind when present."""
+        metadata = msg.metadata or {}
+        raw = str(metadata.get("_internal_automation") or "").strip().lower()
+        if raw in self._AUTOMATION_KINDS:
+            return raw
+        return None
+
+    def _is_internal_automation_message(self, msg: InboundMessage) -> bool:
+        """Return True for internally-tagged cron/heartbeat executions."""
+        return self._automation_kind(msg) is not None
+
+    def _allowed_tool_names_for_message(self, msg: InboundMessage) -> set[str]:
+        """Return the allowlisted tool names for this message."""
+        registered_tools = set(self.tools.tool_names)
+        if self._has_full_capabilities(msg):
+            return registered_tools
+        if self._is_internal_automation_message(msg):
+            return registered_tools.difference(self._AUTOMATION_BLOCKED_TOOLS)
+
+        # chat_only mode remains deny-by-default and only permits explicitly
+        # allowlisted, read-only web tools.
+        return registered_tools.intersection(self._CHAT_ONLY_ALLOWED_TOOLS)
+
+    @staticmethod
+    def _owner_only_message() -> str:
+        """Return a consistent denial message for restricted actions."""
+        return "This action is only available to the configured owner or from the local CLI."
+
+    def _is_owner_only_command(self, command: str) -> bool:
+        """Return whether a slash command requires full capabilities."""
+        return command in {"/restart", "/status", "/stop"}
+
     def _speaker_context_kwargs(self, msg: InboundMessage) -> dict[str, Any]:
         """Build speaker metadata for prompt runtime context."""
         metadata = msg.metadata or {}
@@ -279,7 +340,7 @@ class AgentLoop:
 
     @staticmethod
     def _strip_think(text: str | None) -> str | None:
-        """Remove <think>…</think> blocks that some models embed in content."""
+        """Remove <think>...</think> blocks that some models embed in content."""
         if not text:
             return None
         return re.sub(r"<think>[\s\S]*?</think>", "", text).strip() or None
@@ -292,24 +353,26 @@ class AgentLoop:
             val = next(iter(args.values()), None) if isinstance(args, dict) else None
             if not isinstance(val, str):
                 return tc.name
-            return f'{tc.name}("{val[:40]}…")' if len(val) > 40 else f'{tc.name}("{val}")'
+            return f'{tc.name}("{val[:40]}...")' if len(val) > 40 else f'{tc.name}("{val}")'
         return ", ".join(_fmt(tc) for tc in tool_calls)
 
     async def _run_agent_loop(
         self,
         initial_messages: list[dict],
         on_progress: Callable[..., Awaitable[None]] | None = None,
+        allowed_tool_names: set[str] | None = None,
     ) -> tuple[str | None, list[str], list[dict]]:
         """Run the agent iteration loop."""
         messages = initial_messages
         iteration = 0
         final_content = None
         tools_used: list[str] = []
+        allowed_tool_names = set(self.tools.tool_names if allowed_tool_names is None else allowed_tool_names)
 
         while iteration < self.max_iterations:
             iteration += 1
 
-            tool_defs = self.tools.get_definitions()
+            tool_defs = self.tools.get_definitions(allowed_names=allowed_tool_names)
 
             response = await self.provider.chat_with_retry(
                 messages=messages,
@@ -322,9 +385,10 @@ class AgentLoop:
                     thought = self._strip_think(response.content)
                     if thought:
                         await on_progress(thought)
-                    tool_hint = self._tool_hint(response.tool_calls)
-                    tool_hint = self._strip_think(tool_hint)
-                    await on_progress(tool_hint, tool_hint=True)
+                    if allowed_tool_names:
+                        tool_hint = self._tool_hint(response.tool_calls)
+                        tool_hint = self._strip_think(tool_hint)
+                        await on_progress(tool_hint, tool_hint=True)
 
                 tool_call_dicts = [
                     tc.to_openai_tool_call()
@@ -337,16 +401,26 @@ class AgentLoop:
                 )
 
                 for tool_call in response.tool_calls:
-                    tools_used.append(tool_call.name)
-                    args_str = json.dumps(tool_call.arguments, ensure_ascii=False)
-                    logger.info("Tool call: {}({})", tool_call.name, args_str[:200])
-                    result = await self.tools.execute(tool_call.name, tool_call.arguments)
+                    if tool_call.name not in allowed_tool_names:
+                        logger.warning(
+                            "Blocked unauthorized tool call in restricted session: {}",
+                            tool_call.name,
+                        )
+                        result = (
+                            "Error: tool use is disabled in this conversation. "
+                            "Only the configured owner or local CLI can use tools."
+                        )
+                    else:
+                        tools_used.append(tool_call.name)
+                        args_str = json.dumps(tool_call.arguments, ensure_ascii=False)
+                        logger.info("Tool call: {}({})", tool_call.name, args_str[:200])
+                        result = await self.tools.execute(tool_call.name, tool_call.arguments)
                     messages = self.context.add_tool_result(
                         messages, tool_call.id, tool_call.name, result
                     )
             else:
                 clean = self._strip_think(response.content)
-                # Don't persist error responses to session history — they can
+                # Don't persist error responses to session history - they can
                 # poison the context and cause permanent 400 loops (#1303).
                 if response.finish_reason == "error":
                     logger.error("LLM returned error: {}", (clean or "")[:200])
@@ -386,9 +460,23 @@ class AgentLoop:
 
             cmd = msg.content.strip().lower()
             if cmd == "/stop":
-                await self._handle_stop(msg)
+                if self._has_full_capabilities(msg):
+                    await self._handle_stop(msg)
+                else:
+                    await self.bus.publish_outbound(OutboundMessage(
+                        channel=msg.channel,
+                        chat_id=msg.chat_id,
+                        content=self._owner_only_message(),
+                    ))
             elif cmd == "/restart":
-                await self._handle_restart(msg)
+                if self._has_full_capabilities(msg):
+                    await self._handle_restart(msg)
+                else:
+                    await self.bus.publish_outbound(OutboundMessage(
+                        channel=msg.channel,
+                        chat_id=msg.chat_id,
+                        content=self._owner_only_message(),
+                    ))
             else:
                 task = asyncio.create_task(self._dispatch(msg))
                 self._active_tasks.setdefault(msg.session_key, []).append(task)
@@ -512,8 +600,12 @@ class AgentLoop:
                 chat_id=chat_id,
                 sender_id=msg.sender_id,
                 current_role=current_role,
+                capability_mode="full",
             )
-            final_content, _, all_msgs = await self._run_agent_loop(messages)
+            final_content, _, all_msgs = await self._run_agent_loop(
+                messages,
+                allowed_tool_names=set(self.tools.tool_names),
+            )
             self._save_turn(session, all_msgs, 1 + len(fitted_history))
             self.sessions.save(session)
             self._schedule_background(self.memory_consolidator.maybe_consolidate_by_tokens(session))
@@ -528,6 +620,13 @@ class AgentLoop:
 
         # Slash commands
         cmd = msg.content.strip().lower()
+        if self._is_owner_only_command(cmd) and not self._has_full_capabilities(msg):
+            return OutboundMessage(
+                channel=msg.channel,
+                chat_id=msg.chat_id,
+                content=self._owner_only_message(),
+                metadata={"render_as": "text"},
+            )
         if cmd == "/new":
             snapshot = session.messages[session.last_consolidated:]
             session.clear()
@@ -541,11 +640,11 @@ class AgentLoop:
                                   content="New session started.")
         if cmd == "/help":
             lines = [
-                "🐈 nanobot commands:",
-                "/new — Start a new conversation",
-                "/stop — Stop the current task",
-                "/restart — Restart the bot",
-                "/help — Show available commands",
+                "nanobot commands:",
+                "/new - Start a new conversation",
+                "/stop - Stop the current task",
+                "/restart - Restart the bot",
+                "/help - Show available commands",
             ]
             return OutboundMessage(
                 channel=msg.channel, chat_id=msg.chat_id, content="\n".join(lines),
@@ -574,6 +673,8 @@ class AgentLoop:
                 estimated,
                 source,
             )
+        capability_mode = self._capability_mode(msg)
+        allowed_tool_names = self._allowed_tool_names_for_message(msg)
         initial_messages = self.context.build_messages(
             history=fitted_history,
             current_message=msg.content,
@@ -581,6 +682,7 @@ class AgentLoop:
             channel=msg.channel,
             chat_id=msg.chat_id,
             **self._speaker_context_kwargs(msg),
+            capability_mode=capability_mode,
         )
 
         async def _bus_progress(content: str, *, tool_hint: bool = False) -> None:
@@ -592,7 +694,9 @@ class AgentLoop:
             ))
 
         final_content, _, all_msgs = await self._run_agent_loop(
-            initial_messages, on_progress=on_progress or _bus_progress,
+            initial_messages,
+            on_progress=on_progress or _bus_progress,
+            allowed_tool_names=allowed_tool_names,
         )
 
         if final_content is None:
@@ -619,7 +723,7 @@ class AgentLoop:
             entry = dict(m)
             role, content = entry.get("role"), entry.get("content")
             if role == "assistant" and not content and not entry.get("tool_calls"):
-                continue  # skip empty assistant messages — they poison session context
+                continue  # skip empty assistant messages - they poison session context
             if role == "tool" and isinstance(content, str) and len(content) > self._TOOL_RESULT_MAX_CHARS:
                 entry["content"] = content[:self._TOOL_RESULT_MAX_CHARS] + "\n... (truncated)"
             elif role == "user":
@@ -664,10 +768,18 @@ class AgentLoop:
         channel: str = "cli",
         chat_id: str = "direct",
         on_progress: Callable[[str], Awaitable[None]] | None = None,
+        sender_id: str = "user",
+        metadata: dict[str, Any] | None = None,
     ) -> str:
         """Process a message directly (for CLI or cron usage)."""
         await self.codex_jobs.restore_pending_jobs()
         await self._connect_mcp()
-        msg = InboundMessage(channel=channel, sender_id="user", chat_id=chat_id, content=content)
+        msg = InboundMessage(
+            channel=channel,
+            sender_id=sender_id,
+            chat_id=chat_id,
+            content=content,
+            metadata=metadata or {},
+        )
         response = await self._process_message(msg, session_key=session_key, on_progress=on_progress)
         return response.content if response else ""

@@ -17,7 +17,8 @@ class ContextBuilder:
     """Builds the context (system prompt + messages) for the agent."""
 
     BOOTSTRAP_FILES = ["SOUL.md", "USER.md", "AGENTS.md"]
-    _RUNTIME_CONTEXT_TAG = "[Runtime Context — metadata only, not instructions]"
+    CHAT_ONLY_BOOTSTRAP_FILES = ["SOUL.md"]
+    _RUNTIME_CONTEXT_TAG = "[Runtime Context - metadata only, not instructions]"
 
     def __init__(
         self,
@@ -31,27 +32,32 @@ class ContextBuilder:
         self.memory = MemoryStore(workspace)
         self.skills = SkillsLoader(workspace)
 
-    def build_system_prompt(self, skill_names: list[str] | None = None) -> str:
+    def build_system_prompt(
+        self,
+        skill_names: list[str] | None = None,
+        capability_mode: str = "full",
+    ) -> str:
         """Build the system prompt from identity, bootstrap files, memory, and skills."""
-        parts = [self._get_identity()]
+        parts = [self._get_identity(capability_mode=capability_mode)]
 
-        bootstrap = self._load_bootstrap_files()
+        bootstrap = self._load_bootstrap_files(capability_mode=capability_mode)
         if bootstrap:
             parts.append(bootstrap)
 
-        memory = self.memory.get_memory_context()
-        if memory:
-            parts.append(f"# Memory\n\n{memory}")
+        if capability_mode in {"full", "automation"}:
+            memory = self.memory.get_memory_context()
+            if memory:
+                parts.append(f"# Memory\n\n{memory}")
 
-        always_skills = self.skills.get_always_skills()
-        if always_skills:
-            always_content = self.skills.load_skills_for_context(always_skills)
-            if always_content:
-                parts.append(f"# Active Skills\n\n{always_content}")
+            always_skills = self.skills.get_always_skills()
+            if always_skills:
+                always_content = self.skills.load_skills_for_context(always_skills)
+                if always_content:
+                    parts.append(f"# Active Skills\n\n{always_content}")
 
-        skills_summary = self.skills.build_skills_summary()
-        if skills_summary:
-            parts.append(f"""# Skills
+            skills_summary = self.skills.build_skills_summary()
+            if skills_summary:
+                parts.append(f"""# Skills
 
 The following skills extend your capabilities. To use a skill, read its SKILL.md file using the read_file tool.
 Skills with available="false" need dependencies installed first - you can try installing them with apt/brew.
@@ -60,7 +66,7 @@ Skills with available="false" need dependencies installed first - you can try in
 
         return "\n\n---\n\n".join(parts)
 
-    def _get_identity(self) -> str:
+    def _get_identity(self, capability_mode: str = "full") -> str:
         """Get the core identity section."""
         workspace_path = str(self.workspace.expanduser().resolve())
         system = platform.system()
@@ -79,8 +85,41 @@ Skills with available="false" need dependencies installed first - you can try in
 - Use file tools when they are simpler or more reliable than shell commands.
 """
 
-        return f"""# nanobot 🐈
+        capability_policy = ""
+        if capability_mode == "chat_only":
+            capability_policy = """
+## Capability Mode
+- This conversation is running in chat-only mode.
+- Only low-risk read-only tools are available: `web_search` and `web_fetch`.
+- Filesystem access, shell commands, cron, MCP, subagents, background jobs, and skills are unavailable.
+- If asked to modify files, run commands, schedule tasks, or use integrations, explain that only the configured owner or local CLI can do that.
+- Do not reveal private owner profile details or long-term memory to a non-owner speaker.
+"""
+        elif capability_mode == "automation":
+            capability_policy = """
+## Capability Mode
+- This conversation is running in internal automation mode (`cron`/`heartbeat`).
+- A restricted tool subset is available for scheduled work; delegation and self-scheduling tools remain blocked.
+- Focus on the requested automation task only; avoid unrelated high-impact actions.
+"""
 
+        if capability_mode == "chat_only":
+            delivery_policy = (
+                "Reply directly with text. In chat-only mode you may use only `web_search` and `web_fetch` when needed."
+            )
+        elif capability_mode == "automation":
+            delivery_policy = (
+                "For scheduled automation tasks, reply with concise text summaries. "
+                "Use the 'message' tool only when the task explicitly requires pushing a message to a channel."
+            )
+        else:
+            delivery_policy = (
+                "Reply directly with text for conversations. Only use the 'message' tool to send to a specific chat channel.\n"
+                "IMPORTANT: To send files (images, documents, audio, video) to the user, you MUST call the 'message' tool with the 'media' parameter. "
+                "Do NOT use read_file to \"send\" a file - reading a file only shows its content to you, it does NOT deliver the file to the user. "
+                "Example: message(content=\"Here is the file\", media=[\"/path/to/file.png\"])"
+            )
+        return f"""# nanobot
 You are nanobot, a helpful AI assistant.
 
 ## Runtime
@@ -93,6 +132,7 @@ Your workspace is at: {workspace_path}
 - Custom skills: {workspace_path}/skills/{{skill-name}}/SKILL.md
 
 {platform_policy}
+{capability_policy}
 
 ## nanobot Guidelines
 - State intent before tool calls, but NEVER predict or claim results before receiving them.
@@ -108,8 +148,7 @@ Your workspace is at: {workspace_path}
 - If runtime context says `Is Owner: true`, you may treat the current speaker as the workspace owner.
 - If runtime context does not establish ownership, stay neutral and avoid claiming the current speaker is the owner.
 
-Reply directly with text for conversations. Only use the 'message' tool to send to a specific chat channel.
-IMPORTANT: To send files (images, documents, audio, video) to the user, you MUST call the 'message' tool with the 'media' parameter. Do NOT use read_file to "send" a file — reading a file only shows its content to you, it does NOT deliver the file to the user. Example: message(content="Here is the file", media=["/path/to/file.png"])"""
+{delivery_policy}"""
 
     @staticmethod
     def _build_runtime_context(
@@ -181,11 +220,16 @@ IMPORTANT: To send files (images, documents, audio, video) to the user, you MUST
         owner_suffix = f", owner={owner}" if owner in {"true", "false"} else ""
         return f"[speaker: {label}{owner_suffix}] "
 
-    def _load_bootstrap_files(self) -> str:
+    def _load_bootstrap_files(self, capability_mode: str = "full") -> str:
         """Load all bootstrap files from workspace."""
         parts = []
+        allowed_files = (
+            self.BOOTSTRAP_FILES
+            if capability_mode in {"full", "automation"}
+            else self.CHAT_ONLY_BOOTSTRAP_FILES
+        )
 
-        for filename in self.BOOTSTRAP_FILES:
+        for filename in allowed_files:
             file_path = self.workspace / filename
             if file_path.exists():
                 content = file_path.read_text(encoding="utf-8")
@@ -207,6 +251,7 @@ IMPORTANT: To send files (images, documents, audio, video) to the user, you MUST
         conversation_type: str | None = None,
         is_owner: bool | None = None,
         current_role: str = "user",
+        capability_mode: str = "full",
     ) -> list[dict[str, Any]]:
         """Build the complete message list for an LLM call."""
         runtime_ctx = self._build_runtime_context(
@@ -229,7 +274,7 @@ IMPORTANT: To send files (images, documents, audio, video) to the user, you MUST
             merged = [{"type": "text", "text": runtime_ctx}] + user_content
 
         return [
-            {"role": "system", "content": self.build_system_prompt(skill_names)},
+            {"role": "system", "content": self.build_system_prompt(skill_names, capability_mode=capability_mode)},
             *history,
             {"role": current_role, "content": merged},
         ]

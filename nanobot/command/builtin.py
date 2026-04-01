@@ -16,6 +16,8 @@ async def cmd_stop(ctx: CommandContext) -> OutboundMessage:
     """Cancel all active tasks and subagents for the session."""
     loop = ctx.loop
     msg = ctx.msg
+    if not loop._has_full_capabilities(msg):
+        return OutboundMessage(channel=msg.channel, chat_id=msg.chat_id, content=loop._owner_only_message())
     tasks = loop._active_tasks.pop(msg.session_key, [])
     cancelled = sum(1 for t in tasks if not t.done() and t.cancel())
     for t in tasks:
@@ -32,6 +34,8 @@ async def cmd_stop(ctx: CommandContext) -> OutboundMessage:
 async def cmd_restart(ctx: CommandContext) -> OutboundMessage:
     """Restart the process in-place via os.execv."""
     msg = ctx.msg
+    if not ctx.loop._has_full_capabilities(msg):
+        return OutboundMessage(channel=msg.channel, chat_id=msg.chat_id, content=ctx.loop._owner_only_message())
 
     async def _do_restart():
         await asyncio.sleep(1)
@@ -44,6 +48,13 @@ async def cmd_restart(ctx: CommandContext) -> OutboundMessage:
 async def cmd_status(ctx: CommandContext) -> OutboundMessage:
     """Build an outbound status message for a session."""
     loop = ctx.loop
+    if not loop._has_full_capabilities(ctx.msg):
+        return OutboundMessage(
+            channel=ctx.msg.channel,
+            chat_id=ctx.msg.chat_id,
+            content=loop._owner_only_message(),
+            metadata={"render_as": "text"},
+        )
     session = ctx.session or loop.sessions.get_or_create(ctx.key)
     ctx_est = 0
     try:

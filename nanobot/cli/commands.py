@@ -416,6 +416,7 @@ def _make_provider(config: Config):
         temperature=defaults.temperature,
         max_tokens=defaults.max_tokens,
         reasoning_effort=defaults.reasoning_effort,
+        thinking_budget_tokens=defaults.thinking_budget_tokens,
     )
     return provider
 
@@ -531,6 +532,8 @@ def gateway(
                 session_key=f"cron:{job.id}",
                 channel=job.payload.channel or "cli",
                 chat_id=job.payload.to or "direct",
+                sender_id="cron",
+                metadata={"_internal_automation": "cron"},
             )
         finally:
             if isinstance(cron_tool, CronTool) and cron_token is not None:
@@ -587,6 +590,8 @@ def gateway(
             channel=channel,
             chat_id=chat_id,
             on_progress=_silent,
+            sender_id="heartbeat",
+            metadata={"_internal_automation": "heartbeat"},
         )
 
     async def on_heartbeat_notify(response: str) -> None:

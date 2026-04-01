@@ -1,0 +1,4 @@
+interface:
+  display_name: "Spec Delivery"
+  short_description: "Plan and implement PRD-driven repo changes"
+  default_prompt: "Use $spec-delivery to plan and deliver this PRD against the current codebase."

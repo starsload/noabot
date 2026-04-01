@@ -70,7 +70,7 @@ nanobot news-digest --config .\news-digest.json --dry-run
 Windows 计划任务可直接执行：
 
 ```bash
-uv run nanobot news-digest --config D:\Projects\AI\yuukaChan\news-digest.json
+uv run nanobot news-digest --config D:\Projects\AI\noabot\news-digest.json
 ```
 
 Linux cron 示例：

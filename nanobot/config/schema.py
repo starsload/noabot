@@ -41,6 +41,10 @@ class AgentDefaults(Base):
     temperature: float = 0.1
     max_tool_iterations: int = 40
     reasoning_effort: str | None = None  # low / medium / high - enables LLM thinking mode
+    thinking_budget_tokens: int | None = Field(
+        default=None,
+        ge=1,
+    )  # Provider-specific reasoning budget; Qwen maps this to thinking_budget
     timezone: str = "UTC"  # IANA timezone, e.g. "Asia/Shanghai", "America/New_York"
     should_warn_deprecated_memory_window: bool = Field(default=False, exclude=True)
 

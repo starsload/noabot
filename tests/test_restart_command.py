@@ -27,7 +27,12 @@ def _make_loop():
          patch("nanobot.agent.loop.CodexJobManager") as mock_codex_mgr_cls:
         mock_codex_mgr_cls.return_value.restore_pending_jobs = AsyncMock(return_value=None)
         mock_codex_mgr_cls.return_value.close = AsyncMock(return_value=None)
-        loop = AgentLoop(bus=bus, provider=provider, workspace=workspace)
+        loop = AgentLoop(
+            bus=bus,
+            provider=provider,
+            workspace=workspace,
+            owner_ids=["telegram:u1"],
+        )
     return loop, bus
 
 
