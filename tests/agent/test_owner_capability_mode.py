@@ -38,6 +38,35 @@ def _tool_names_from_last_call(loop: AgentLoop) -> set[str]:
     return {tool["function"]["name"] for tool in tools}
 
 
+def _install_fake_painter_workspace(workspace: Path) -> None:
+    libs_dir = workspace / "libs" / "noah_local_painter"
+    libs_dir.mkdir(parents=True)
+    (libs_dir / "__init__.py").write_text(
+        """
+class _Result:
+    ok = True
+    mode = "generate"
+    message = "mock-ok"
+    current_model = "mock-model"
+    run_dir = "runtime/mock"
+    metadata_path = "runtime/mock/meta.json"
+    image_paths = [r"C:\\mock\\image.png"]
+    payload = {"preset": "presets/noah_halfbody.json"}
+
+class NoahLocalPainter:
+    def health_check(self, **kwargs):
+        return _Result()
+
+    def generate(self, **kwargs):
+        return _Result()
+""".strip(),
+        encoding="utf-8",
+    )
+    skill_dir = workspace / "skills" / "noah-local-painter"
+    skill_dir.mkdir(parents=True, exist_ok=True)
+    (skill_dir / "SKILL.md").write_text("# noah-local-painter\n\nUse the dedicated painter tool.", encoding="utf-8")
+
+
 def test_chat_only_prompt_excludes_private_context(tmp_path: Path) -> None:
     workspace = tmp_path / "workspace"
     workspace.mkdir()
@@ -61,6 +90,28 @@ def test_chat_only_prompt_excludes_private_context(tmp_path: Path) -> None:
     assert "chat-only mode" in prompt
     assert "web_search" in prompt
     assert "web_fetch" in prompt
+
+
+def test_chat_only_prompt_can_surface_selected_safe_skill(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    (workspace / "SOUL.md").write_text("Friendly public persona", encoding="utf-8")
+    (workspace / "USER.md").write_text("Owner private profile", encoding="utf-8")
+    skill_dir = workspace / "skills" / "noah-local-painter"
+    skill_dir.mkdir(parents=True)
+    (skill_dir / "SKILL.md").write_text("# noah-local-painter\n\nUse the dedicated painter tool.", encoding="utf-8")
+
+    builder = ContextBuilder(workspace)
+    prompt = builder.build_system_prompt(
+        skill_names=["noah-local-painter"],
+        capability_mode="chat_only",
+        allowed_tool_names=["web_search", "web_fetch", "noah_local_painter"],
+    )
+
+    assert "Friendly public persona" in prompt
+    assert "Owner private profile" not in prompt
+    assert "Skill: noah-local-painter" in prompt
+    assert "noah_local_painter" in prompt
 
 
 @pytest.mark.asyncio
@@ -104,6 +155,43 @@ async def test_chat_only_blocks_write_file(tmp_path: Path) -> None:
     assert "write_file" not in tool_names
     assert "exec" not in tool_names
     assert "cron" not in tool_names
+
+
+@pytest.mark.asyncio
+async def test_chat_only_allows_workspace_painter_without_exec(tmp_path: Path) -> None:
+    _install_fake_painter_workspace(tmp_path)
+    loop = _make_loop(tmp_path, owner_ids=["telegram:owner"])
+    loop.provider.chat_with_retry = AsyncMock(return_value=LLMResponse(content="hello", tool_calls=[]))
+
+    response = await loop._process_message(
+        InboundMessage(channel="telegram", sender_id="guest", chat_id="room1", content="draw me"),
+    )
+
+    assert response is not None
+    tool_names = _tool_names_from_last_call(loop)
+    assert "noah_local_painter" in tool_names
+    assert "web_search" in tool_names
+    assert "web_fetch" in tool_names
+    assert "write_file" not in tool_names
+    assert "exec" not in tool_names
+
+
+@pytest.mark.asyncio
+async def test_chat_only_injects_painter_skill_when_available(tmp_path: Path) -> None:
+    _install_fake_painter_workspace(tmp_path)
+    loop = _make_loop(tmp_path, owner_ids=["telegram:owner"])
+    loop.provider.chat_with_retry = AsyncMock(return_value=LLMResponse(content="ok", tool_calls=[]))
+
+    response = await loop._process_message(
+        InboundMessage(channel="telegram", sender_id="guest", chat_id="room1", content="draw me"),
+    )
+
+    assert response is not None
+    messages = loop.provider.chat_with_retry.call_args.kwargs["messages"]
+    system_prompt = messages[0]["content"]
+    assert "Skill: noah-local-painter" in system_prompt
+    assert "Use the dedicated painter tool." in system_prompt
+    assert "Owner private profile" not in system_prompt
 
 
 @pytest.mark.asyncio

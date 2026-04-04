@@ -9,6 +9,8 @@ from typing import Any
 
 from loguru import logger
 
+from nanobot.utils.helpers import normalize_message_image_blocks_for_llm
+
 
 @dataclass
 class ToolCallRequest:
@@ -96,6 +98,16 @@ class LLMProvider(ABC):
     )
     _NON_TRANSIENT_ERROR_MARKERS = (
         "missing a thought_signature",
+    )
+    _IMAGE_LIMIT_ERROR_MARKERS = (
+        "max bytes per data-uri item",
+        "image length and width",
+        "image size",
+        "image too large",
+        "image exceeds",
+        "image restriction",
+        "invalid_parameter",
+        "invalid parameter",
     )
 
     _SENTINEL = object()
@@ -224,6 +236,11 @@ class LLMProvider(ABC):
                 result.append(msg)
         return result if found else None
 
+    @classmethod
+    def _is_image_payload_error(cls, content: str | None) -> bool:
+        err = (content or "").lower()
+        return any(marker in err for marker in cls._IMAGE_LIMIT_ERROR_MARKERS)
+
     async def _safe_chat(self, **kwargs: Any) -> LLMResponse:
         """Call chat() and convert unexpected exceptions to error responses."""
         try:
@@ -302,6 +319,13 @@ class LLMProvider(ABC):
                 return response
 
             if not self._is_transient_error(response.content):
+                if self._is_image_payload_error(response.content):
+                    normalized = normalize_message_image_blocks_for_llm(messages)
+                    if normalized is not messages:
+                        logger.warning(
+                            "LLM image payload error, retrying with normalized inline images"
+                        )
+                        return await self._safe_chat_stream(**{**kw, "messages": normalized})
                 stripped = self._strip_image_content(messages)
                 if stripped is not None:
                     logger.warning("Non-transient LLM error with image content, retrying without images")
@@ -353,6 +377,13 @@ class LLMProvider(ABC):
                 return response
 
             if not self._is_transient_error(response.content):
+                if self._is_image_payload_error(response.content):
+                    normalized = normalize_message_image_blocks_for_llm(messages)
+                    if normalized is not messages:
+                        logger.warning(
+                            "LLM image payload error, retrying with normalized inline images"
+                        )
+                        return await self._safe_chat(**{**kw, "messages": normalized})
                 stripped = self._strip_image_content(messages)
                 if stripped is not None:
                     logger.warning("Non-transient LLM error with image content, retrying without images")

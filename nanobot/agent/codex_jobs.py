@@ -58,7 +58,7 @@ class CodexJob:
 class CodexJobManager:
     """Manage long-running Codex CLI jobs outside the main agent loop."""
 
-    _STALL_SECONDS = 300
+    _STALL_SECONDS = 600
     _MONITOR_POLL_SECONDS = 2.0
     _MAX_RESULT_CHARS = 12_000
 

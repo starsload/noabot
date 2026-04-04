@@ -17,6 +17,7 @@ from nanobot.agent.codex_jobs import CodexJobManager
 from nanobot.agent.context import ContextBuilder
 from nanobot.agent.memory import MemoryConsolidator
 from nanobot.agent.skills import BUILTIN_SKILLS_DIR
+from nanobot.agent.tools.noah_local_painter import NoahLocalPainterTool
 from nanobot.agent.subagent import SubagentManager
 from nanobot.agent.tools.codex import CodexDelegateTool, CodexResumeTool, CodexStatusTool
 from nanobot.agent.tools.cron import CronTool
@@ -68,6 +69,7 @@ class AgentLoop:
 
     _TOOL_RESULT_MAX_CHARS = 16_000
     _CHAT_ONLY_ALLOWED_TOOLS = frozenset({"web_search", "web_fetch"})
+    _CHAT_ONLY_OPTIONAL_TOOLS = frozenset({"noah_local_painter"})
     _AUTOMATION_BLOCKED_TOOLS = frozenset({
         "spawn",
         "codex_delegate",
@@ -239,9 +241,27 @@ class AgentLoop:
         if self._is_internal_automation_message(msg):
             return registered_tools.difference(self._AUTOMATION_BLOCKED_TOOLS)
 
-        # chat_only mode remains deny-by-default and only permits explicitly
-        # allowlisted, read-only web tools.
-        return registered_tools.intersection(self._CHAT_ONLY_ALLOWED_TOOLS)
+        allowed = set(self._CHAT_ONLY_ALLOWED_TOOLS)
+        allowed.update(registered_tools.intersection(self._CHAT_ONLY_OPTIONAL_TOOLS))
+        return registered_tools.intersection(allowed)
+
+    def _skill_names_for_message(
+        self,
+        msg: InboundMessage,
+        allowed_tool_names: set[str] | None = None,
+    ) -> list[str] | None:
+        """Return explicitly surfaced skills for the current message."""
+        if self._capability_mode(msg) != "chat_only":
+            return None
+
+        allowed = allowed_tool_names or self._allowed_tool_names_for_message(msg)
+        if "noah_local_painter" not in allowed:
+            return None
+
+        skill_path = self.workspace / "skills" / "noah-local-painter" / "SKILL.md"
+        if skill_path.exists():
+            return ["noah-local-painter"]
+        return None
 
     @staticmethod
     def _owner_only_message() -> str:
@@ -279,6 +299,8 @@ class AgentLoop:
         self.tools.register(WebSearchTool(config=self.web_search_config, proxy=self.web_proxy))
         self.tools.register(WebFetchTool(proxy=self.web_proxy))
         self.tools.register(MessageTool(send_callback=self.bus.publish_outbound))
+        if NoahLocalPainterTool.is_available(self.workspace):
+            self.tools.register(NoahLocalPainterTool(workspace=self.workspace, send_callback=self.bus.publish_outbound))
         self.tools.register(SpawnTool(manager=self.subagents))
         self.tools.register(CodexDelegateTool(manager=self.codex_jobs))
         self.tools.register(CodexStatusTool(manager=self.codex_jobs))
@@ -332,10 +354,11 @@ class AgentLoop:
 
     def _set_tool_context(self, channel: str, chat_id: str, message_id: str | None = None) -> None:
         """Update context for all tools that need routing info."""
-        for name in ("message", "spawn", "cron", "codex_delegate", "codex_status", "codex_resume"):
+        for name in ("message", "noah_local_painter", "spawn", "cron", "codex_delegate", "codex_status", "codex_resume"):
             if tool := self.tools.get(name):
                 if hasattr(tool, "set_context"):
-                    tool.set_context(channel, chat_id, *([message_id] if name == "message" else []))
+                    extra = [message_id] if name in {"message", "noah_local_painter"} else []
+                    tool.set_context(channel, chat_id, *extra)
 
     @staticmethod
     def _strip_think(text: str | None) -> str | None:
@@ -600,6 +623,7 @@ class AgentLoop:
                 sender_id=msg.sender_id,
                 current_role=current_role,
                 capability_mode="full",
+                allowed_tool_names=list(self.tools.tool_names),
             )
             final_content, _, all_msgs = await self._run_agent_loop(
                 messages,
@@ -651,9 +675,9 @@ class AgentLoop:
         await self.memory_consolidator.maybe_consolidate_by_tokens(session)
 
         self._set_tool_context(msg.channel, msg.chat_id, msg.metadata.get("message_id"))
-        if message_tool := self.tools.get("message"):
-            if isinstance(message_tool, MessageTool):
-                message_tool.start_turn()
+        for tool_name in ("message", "noah_local_painter"):
+            if tool := self.tools.get(tool_name):
+                getattr(tool, "start_turn", lambda: None)()
 
         history = session.get_history(max_messages=0)
         fitted_history, estimated, source = self.memory_consolidator.fit_history_within_budget(
@@ -674,6 +698,7 @@ class AgentLoop:
             )
         capability_mode = self._capability_mode(msg)
         allowed_tool_names = self._allowed_tool_names_for_message(msg)
+        skill_names = self._skill_names_for_message(msg, allowed_tool_names)
         initial_messages = self.context.build_messages(
             history=fitted_history,
             current_message=msg.content,
@@ -682,6 +707,8 @@ class AgentLoop:
             chat_id=msg.chat_id,
             **self._speaker_context_kwargs(msg),
             capability_mode=capability_mode,
+            skill_names=skill_names,
+            allowed_tool_names=sorted(allowed_tool_names),
         )
 
         async def _bus_progress(content: str, *, tool_hint: bool = False) -> None:
@@ -699,14 +726,16 @@ class AgentLoop:
         )
 
         if final_content is None:
-            final_content = "I've completed processing but have no response to give."
+            final_content = "诺亚搞定啦！但是偷懒没有回复。。。"
 
         self._save_turn(session, all_msgs, 1 + len(fitted_history))
         self.sessions.save(session)
         self._schedule_background(self.memory_consolidator.maybe_consolidate_by_tokens(session))
 
-        if (mt := self.tools.get("message")) and isinstance(mt, MessageTool) and mt._sent_in_turn:
-            return None
+        for tool_name in ("message", "noah_local_painter"):
+            if tool := self.tools.get(tool_name):
+                if getattr(tool, "_sent_in_turn", False):
+                    return None
 
         preview = final_content[:120] + "..." if len(final_content) > 120 else final_content
         logger.info("Response to {}:{}: {}", msg.channel, msg.sender_id, preview)

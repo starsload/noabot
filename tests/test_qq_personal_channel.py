@@ -90,6 +90,30 @@ async def test_private_text_message_routes_to_sender_chat_id(tmp_path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_private_message_still_respects_allow_from(tmp_path) -> None:
+    channel = QQPersonalChannel(
+        QQPersonalConfig(media_dir=str(tmp_path), allow_from=["another-user"]),
+        MessageBus(),
+    )
+
+    raw = json.dumps(
+        {
+            "post_type": "message",
+            "message_type": "private",
+            "sub_type": "friend",
+            "message_id": 1005,
+            "user_id": "user1",
+            "message": [{"type": "text", "data": {"text": "hello"}}],
+        },
+        ensure_ascii=False,
+    )
+
+    await channel._handle_ws_message(raw)
+
+    assert channel.bus.inbound_size == 0
+
+
+@pytest.mark.asyncio
 async def test_ws_ignores_action_response_frames(tmp_path) -> None:
     channel = QQPersonalChannel(
         QQPersonalConfig(media_dir=str(tmp_path), allow_from=["*"]),
@@ -293,6 +317,33 @@ async def test_group_policy_open_accepts_plain_group_message(tmp_path) -> None:
     msg = await channel.bus.consume_inbound()
     assert msg.chat_id == "group1"
     assert msg.content == "hello group"
+
+
+@pytest.mark.asyncio
+async def test_group_message_bypasses_allow_from_restriction(tmp_path) -> None:
+    channel = QQPersonalChannel(
+        QQPersonalConfig(media_dir=str(tmp_path), allow_from=["another-user"], group_policy="open"),
+        MessageBus(),
+    )
+
+    raw = json.dumps(
+        {
+            "post_type": "message",
+            "message_type": "group",
+            "message_id": 2005,
+            "group_id": "group1",
+            "user_id": "user1",
+            "message": [{"type": "text", "data": {"text": "hello from group"}}],
+        },
+        ensure_ascii=False,
+    )
+
+    await channel._handle_ws_message(raw)
+
+    msg = await channel.bus.consume_inbound()
+    assert msg.sender_id == "user1"
+    assert msg.chat_id == "group1"
+    assert msg.content == "hello from group"
 
 
 @pytest.mark.asyncio

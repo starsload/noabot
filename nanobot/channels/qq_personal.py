@@ -18,7 +18,7 @@ from loguru import logger
 from pydantic import Field
 from typing import Literal
 
-from nanobot.bus.events import OutboundMessage
+from nanobot.bus.events import InboundMessage, OutboundMessage
 from nanobot.bus.queue import MessageBus
 from nanobot.channels.base import BaseChannel
 from nanobot.config.paths import get_media_dir
@@ -188,6 +188,43 @@ class QQPersonalChannel(BaseChannel):
                 action,
                 {target_key: target_id, "message": msg.content.strip()},
             )
+
+    async def _handle_message(
+        self,
+        sender_id: str,
+        chat_id: str,
+        content: str,
+        media: list[str] | None = None,
+        metadata: dict[str, Any] | None = None,
+        session_key: str | None = None,
+    ) -> None:
+        """Bypass allow_from for group chats while preserving base behavior for private chats."""
+        meta = metadata or {}
+        is_group = meta.get("chat_type") == "group" or meta.get("is_group") is True
+        if not is_group:
+            await super()._handle_message(
+                sender_id=sender_id,
+                chat_id=chat_id,
+                content=content,
+                media=media,
+                metadata=metadata,
+                session_key=session_key,
+            )
+            return
+
+        if self.supports_streaming:
+            meta = {**meta, "_wants_stream": True}
+
+        msg = InboundMessage(
+            channel=self.name,
+            sender_id=str(sender_id),
+            chat_id=str(chat_id),
+            content=content,
+            media=media or [],
+            metadata=meta,
+            session_key_override=session_key,
+        )
+        await self.bus.publish_inbound(msg)
 
     async def _send_media(
         self,

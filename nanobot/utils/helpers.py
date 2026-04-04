@@ -1,6 +1,8 @@
 """Utility functions for nanobot."""
 
 import base64
+import binascii
+import io
 import json
 import re
 import time
@@ -9,6 +11,24 @@ from pathlib import Path
 from typing import Any
 
 import tiktoken
+
+try:
+    from PIL import Image, ImageOps
+except ImportError:  # pragma: no cover - Pillow is optional at import time
+    Image = None
+    ImageOps = None
+
+if Image is not None:
+    _RESAMPLING_LANCZOS = getattr(Image, "Resampling", Image).LANCZOS
+else:  # pragma: no cover - Pillow unavailable
+    _RESAMPLING_LANCZOS = None
+
+
+LLM_INLINE_IMAGE_MAX_BYTES = 7_500_000
+LLM_INLINE_IMAGE_MAX_EDGE = 2048
+LLM_INLINE_IMAGE_MIN_EDGE = 512
+LLM_INLINE_IMAGE_DEFAULT_JPEG_QUALITY = 85
+LLM_INLINE_IMAGE_MIN_JPEG_QUALITY = 55
 
 
 def strip_think(text: str) -> str:
@@ -31,13 +51,248 @@ def detect_image_mime(data: bytes) -> str | None:
     return None
 
 
+def prepare_image_for_llm(
+    raw: bytes,
+    mime: str | None = None,
+    *,
+    max_bytes: int = LLM_INLINE_IMAGE_MAX_BYTES,
+    max_edge: int = LLM_INLINE_IMAGE_MAX_EDGE,
+) -> tuple[bytes, str]:
+    """Normalize an image for inline LLM transport.
+
+    We keep images under a conservative byte budget so the base64 data URI
+    stays below provider limits, and we bound the maximum edge length so large
+    screenshots do not balloon token/transport cost.
+    """
+    detected_mime = mime or detect_image_mime(raw) or "application/octet-stream"
+    if not detected_mime.startswith("image/") or Image is None:
+        return raw, detected_mime
+
+    try:
+        with Image.open(io.BytesIO(raw)) as opened:
+            image = opened.copy()
+    except Exception:
+        return raw, detected_mime
+
+    if ImageOps is not None:
+        try:
+            image = ImageOps.exif_transpose(image)
+        except Exception:
+            pass
+
+    width, height = image.size
+    if width <= 0 or height <= 0:
+        return raw, detected_mime
+    if len(raw) <= max_bytes and max(width, height) <= max_edge:
+        return raw, detected_mime
+
+    image.load()
+    best_bytes = raw
+    best_mime = detected_mime
+    current_edge = min(max(width, height), max_edge)
+    quality = LLM_INLINE_IMAGE_DEFAULT_JPEG_QUALITY
+
+    while True:
+        resized = _resize_image_to_edge(image, current_edge)
+        candidates = _encode_image_candidates(
+            resized,
+            detected_mime,
+            quality=quality,
+        )
+        if candidates:
+            encoded_bytes, encoded_mime = min(candidates, key=lambda item: len(item[0]))
+            if len(encoded_bytes) < len(best_bytes):
+                best_bytes = encoded_bytes
+                best_mime = encoded_mime
+            if len(encoded_bytes) <= max_bytes:
+                return encoded_bytes, encoded_mime
+
+        if current_edge <= LLM_INLINE_IMAGE_MIN_EDGE and quality <= LLM_INLINE_IMAGE_MIN_JPEG_QUALITY:
+            return best_bytes, best_mime
+
+        if current_edge > LLM_INLINE_IMAGE_MIN_EDGE:
+            current_edge = max(int(current_edge * 0.85), LLM_INLINE_IMAGE_MIN_EDGE)
+        if quality > LLM_INLINE_IMAGE_MIN_JPEG_QUALITY:
+            quality = max(quality - 5, LLM_INLINE_IMAGE_MIN_JPEG_QUALITY)
+
+
+def normalize_message_image_blocks_for_llm(
+    messages: list[dict[str, Any]],
+    *,
+    max_bytes: int = LLM_INLINE_IMAGE_MAX_BYTES,
+    max_edge: int = LLM_INLINE_IMAGE_MAX_EDGE,
+) -> list[dict[str, Any]]:
+    """Rewrite inline data-uri images in messages to fit LLM transport limits."""
+    changed = False
+    normalized_messages: list[dict[str, Any]] = []
+
+    for message in messages:
+        content = message.get("content")
+        if not isinstance(content, list):
+            normalized_messages.append(message)
+            continue
+
+        normalized_content: list[Any] = []
+        content_changed = False
+        for block in content:
+            normalized_block = _normalize_message_image_block(
+                block,
+                max_bytes=max_bytes,
+                max_edge=max_edge,
+            )
+            if normalized_block is not block:
+                content_changed = True
+            normalized_content.append(normalized_block)
+
+        if content_changed:
+            normalized_messages.append({**message, "content": normalized_content})
+            changed = True
+        else:
+            normalized_messages.append(message)
+
+    return normalized_messages if changed else messages
+
+
+def _normalize_message_image_block(
+    block: Any,
+    *,
+    max_bytes: int,
+    max_edge: int,
+) -> Any:
+    if not isinstance(block, dict):
+        return block
+
+    block_type = block.get("type")
+    if block_type == "image_url":
+        image_url = block.get("image_url") or {}
+        url = image_url.get("url")
+        if not isinstance(url, str):
+            return block
+        normalized = _normalize_data_uri_image(url, max_bytes=max_bytes, max_edge=max_edge)
+        if normalized is None or normalized == url:
+            return block
+        return {
+            **block,
+            "image_url": {**image_url, "url": normalized},
+        }
+
+    if block_type == "input_image":
+        url = block.get("image_url")
+        if not isinstance(url, str):
+            return block
+        normalized = _normalize_data_uri_image(url, max_bytes=max_bytes, max_edge=max_edge)
+        if normalized is None or normalized == url:
+            return block
+        return {
+            **block,
+            "image_url": normalized,
+        }
+
+    return block
+
+
+def _normalize_data_uri_image(
+    url: str,
+    *,
+    max_bytes: int,
+    max_edge: int,
+) -> str | None:
+    match = re.match(r"^data:(image/[\w.+-]+);base64,(.+)$", url, re.DOTALL)
+    if not match:
+        return None
+
+    try:
+        raw = base64.b64decode(match.group(2), validate=True)
+    except (ValueError, binascii.Error):
+        return None
+
+    normalized_raw, normalized_mime = prepare_image_for_llm(
+        raw,
+        match.group(1),
+        max_bytes=max_bytes,
+        max_edge=max_edge,
+    )
+    if normalized_raw == raw and normalized_mime == match.group(1):
+        return url
+
+    encoded = base64.b64encode(normalized_raw).decode()
+    return f"data:{normalized_mime};base64,{encoded}"
+
+
+def _resize_image_to_edge(image: Any, max_edge: int) -> Any:
+    width, height = image.size
+    if max(width, height) <= max_edge:
+        return image.copy()
+    scale = max_edge / float(max(width, height))
+    new_size = (
+        max(1, int(round(width * scale))),
+        max(1, int(round(height * scale))),
+    )
+    return image.resize(new_size, _RESAMPLING_LANCZOS)
+
+
+def _encode_image_candidates(
+    image: Any,
+    source_mime: str,
+    *,
+    quality: int,
+) -> list[tuple[bytes, str]]:
+    candidates: list[tuple[bytes, str]] = []
+    has_alpha = image.mode in {"RGBA", "LA"} or ("transparency" in image.info)
+
+    if source_mime in {"image/png", "image/gif", "image/webp"} and has_alpha:
+        png_bytes = _encode_image(image, fmt="PNG")
+        if png_bytes is not None:
+            candidates.append((png_bytes, "image/png"))
+
+    if source_mime == "image/png" and not has_alpha:
+        png_bytes = _encode_image(image, fmt="PNG")
+        if png_bytes is not None:
+            candidates.append((png_bytes, "image/png"))
+
+    jpeg_ready = image
+    if jpeg_ready.mode not in {"RGB", "L"}:
+        rgba = image.convert("RGBA")
+        background = Image.new("RGBA", rgba.size, color="white")
+        jpeg_ready = Image.alpha_composite(background, rgba).convert("RGB")
+    elif jpeg_ready.mode == "L":
+        jpeg_ready = jpeg_ready.convert("RGB")
+
+    jpeg_bytes = _encode_image(jpeg_ready, fmt="JPEG", quality=quality)
+    if jpeg_bytes is not None:
+        candidates.append((jpeg_bytes, "image/jpeg"))
+
+    return candidates
+
+
+def _encode_image(image: Any, *, fmt: str, quality: int | None = None) -> bytes | None:
+    buffer = io.BytesIO()
+    try:
+        if fmt == "PNG":
+            image.save(buffer, format="PNG", optimize=True)
+        elif fmt == "JPEG":
+            image.save(
+                buffer,
+                format="JPEG",
+                quality=quality or LLM_INLINE_IMAGE_DEFAULT_JPEG_QUALITY,
+                optimize=True,
+                progressive=True,
+            )
+        else:
+            return None
+    except Exception:
+        return None
+    return buffer.getvalue()
+
+
 def build_image_content_blocks(raw: bytes, mime: str, path: str, label: str) -> list[dict[str, Any]]:
     """Build native image blocks plus a short text label."""
-    b64 = base64.b64encode(raw).decode()
+    normalized_raw, normalized_mime = prepare_image_for_llm(raw, mime)
+    b64 = base64.b64encode(normalized_raw).decode()
     return [
         {
             "type": "image_url",
-            "image_url": {"url": f"data:{mime};base64,{b64}"},
+            "image_url": {"url": f"data:{normalized_mime};base64,{b64}"},
             "_meta": {"path": path},
         },
         {"type": "text", "text": label},

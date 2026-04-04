@@ -1,6 +1,5 @@
 """Context builder for assembling agent prompts."""
 
-import base64
 import mimetypes
 import platform
 from pathlib import Path
@@ -10,7 +9,11 @@ from nanobot.utils.helpers import current_time_str
 
 from nanobot.agent.memory import MemoryStore
 from nanobot.agent.skills import SkillsLoader
-from nanobot.utils.helpers import build_assistant_message, detect_image_mime
+from nanobot.utils.helpers import (
+    build_assistant_message,
+    build_image_content_blocks,
+    detect_image_mime,
+)
 
 
 class ContextBuilder:
@@ -36,13 +39,19 @@ class ContextBuilder:
         self,
         skill_names: list[str] | None = None,
         capability_mode: str = "full",
+        allowed_tool_names: list[str] | None = None,
     ) -> str:
         """Build the system prompt from identity, bootstrap files, memory, and skills."""
-        parts = [self._get_identity(capability_mode=capability_mode)]
+        parts = [self._get_identity(capability_mode=capability_mode, allowed_tool_names=allowed_tool_names)]
 
         bootstrap = self._load_bootstrap_files(capability_mode=capability_mode)
         if bootstrap:
             parts.append(bootstrap)
+
+        if skill_names:
+            selected_skills = self.skills.load_skills_for_context(skill_names)
+            if selected_skills:
+                parts.append(f"# Active Skills\n\n{selected_skills}")
 
         if capability_mode in {"full", "automation"}:
             memory = self.memory.get_memory_context()
@@ -66,7 +75,7 @@ Skills with available="false" need dependencies installed first - you can try in
 
         return "\n\n---\n\n".join(parts)
 
-    def _get_identity(self, capability_mode: str = "full") -> str:
+    def _get_identity(self, capability_mode: str = "full", allowed_tool_names: list[str] | None = None) -> str:
         """Get the core identity section."""
         workspace_path = str(self.workspace.expanduser().resolve())
         system = platform.system()
@@ -85,16 +94,19 @@ Skills with available="false" need dependencies installed first - you can try in
 - Use file tools when they are simpler or more reliable than shell commands.
 """
 
+        allowed_tool_names = allowed_tool_names or []
         capability_policy = ""
         if capability_mode == "chat_only":
+            displayed_tools = allowed_tool_names or ["web_search", "web_fetch"]
+            tools_text = ", ".join(f"`{name}`" for name in displayed_tools)
             capability_policy = """
 ## Capability Mode
 - This conversation is running in chat-only mode.
-- Only low-risk read-only tools are available: `web_search` and `web_fetch`.
-- Filesystem access, shell commands, cron, MCP, subagents, background jobs, and skills are unavailable.
+- Only low-risk tools are available in this conversation: {tools_text}.
+- Filesystem access, shell commands, cron, MCP, subagents, background jobs, and other non-surfaced skills are unavailable.
 - If asked to modify files, run commands, schedule tasks, or use integrations, explain that only the configured owner or local CLI can do that.
 - Do not reveal private owner profile details or long-term memory to a non-owner speaker.
-"""
+""".format(tools_text=tools_text)
         elif capability_mode == "automation":
             capability_policy = """
 ## Capability Mode
@@ -105,9 +117,13 @@ Skills with available="false" need dependencies installed first - you can try in
 """
 
         if capability_mode == "chat_only":
-            delivery_policy = (
-                "Reply directly with text. In chat-only mode you may use only `web_search` and `web_fetch` when needed."
-            )
+            if "noah_local_painter" in allowed_tool_names:
+                delivery_policy = (
+                    "Reply directly with text. In chat-only mode you may use the low-risk tools listed above. "
+                    "The `noah_local_painter` tool can send generated images back to the current chat directly."
+                )
+            else:
+                delivery_policy = "Reply directly with text. In chat-only mode you may use the low-risk tools listed above when needed."
         elif capability_mode == "automation":
             delivery_policy = (
                 "For scheduled automation tasks, reply with concise text summaries. "
@@ -253,6 +269,7 @@ Your workspace is at: {workspace_path}
         is_owner: bool | None = None,
         current_role: str = "user",
         capability_mode: str = "full",
+        allowed_tool_names: list[str] | None = None,
     ) -> list[dict[str, Any]]:
         """Build the complete message list for an LLM call."""
         runtime_ctx = self._build_runtime_context(
@@ -275,7 +292,14 @@ Your workspace is at: {workspace_path}
             merged = [{"type": "text", "text": runtime_ctx}] + user_content
 
         return [
-            {"role": "system", "content": self.build_system_prompt(skill_names, capability_mode=capability_mode)},
+            {
+                "role": "system",
+                "content": self.build_system_prompt(
+                    skill_names,
+                    capability_mode=capability_mode,
+                    allowed_tool_names=allowed_tool_names,
+                ),
+            },
             *history,
             {"role": current_role, "content": merged},
         ]
@@ -295,12 +319,7 @@ Your workspace is at: {workspace_path}
             mime = detect_image_mime(raw) or mimetypes.guess_type(path)[0]
             if not mime or not mime.startswith("image/"):
                 continue
-            b64 = base64.b64encode(raw).decode()
-            images.append({
-                "type": "image_url",
-                "image_url": {"url": f"data:{mime};base64,{b64}"},
-                "_meta": {"path": str(p)},
-            })
+            images.extend(build_image_content_blocks(raw, mime, str(p), f"(Image file: {p})")[:1])
 
         if not images:
             return text

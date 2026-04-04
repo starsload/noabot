@@ -236,3 +236,43 @@ async def test_image_fallback_without_meta_uses_default_placeholder() -> None:
         content = msg.get("content")
         if isinstance(content, list):
             assert any("[image omitted]" in (b.get("text") or "") for b in content)
+
+
+@pytest.mark.asyncio
+async def test_image_payload_error_retries_with_normalized_images(monkeypatch) -> None:
+    provider = ScriptedProvider([
+        LLMResponse(
+            content=(
+                "Error: Exceeded limit on max bytes per data-uri item : 10485760"
+            ),
+            finish_reason="error",
+        ),
+        LLMResponse(content="ok"),
+    ])
+    normalized = [
+        {
+            "role": "user",
+            "content": [
+                {
+                    "type": "image_url",
+                    "image_url": {"url": "data:image/jpeg;base64,xyz"},
+                    "_meta": {"path": "/media/test.png"},
+                },
+                {"type": "text", "text": "describe this"},
+            ],
+        }
+    ]
+
+    monkeypatch.setattr(
+        "nanobot.providers.base.normalize_message_image_blocks_for_llm",
+        lambda messages: normalized,
+    )
+
+    response = await provider.chat_with_retry(messages=_IMAGE_MSG)
+
+    assert response.content == "ok"
+    assert provider.calls == 2
+    assert provider.last_kwargs["messages"] == normalized
+    retried_content = provider.last_kwargs["messages"][0]["content"]
+    assert any(block.get("type") == "image_url" for block in retried_content)
+    assert all("[image" not in (block.get("text") or "") for block in retried_content)
