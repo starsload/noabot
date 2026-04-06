@@ -74,6 +74,35 @@ def test_save_turn_keeps_tool_results_under_16k() -> None:
     assert session.messages[0]["content"] == content
 
 
+def test_save_turn_replaces_tool_inline_images_with_placeholders() -> None:
+    loop = _mk_loop()
+    session = Session(key="test:tool-image")
+
+    loop._save_turn(
+        session,
+        [{
+            "role": "tool",
+            "tool_call_id": "call_1",
+            "name": "inspect_screen",
+            "content": [
+                {
+                    "type": "image_url",
+                    "image_url": {"url": "data:image/png;base64,abc"},
+                    "_meta": {"path": "D:/tmp/desktop.png"},
+                },
+                {"type": "text", "text": "(Desktop inspection: D:/tmp/desktop.png)"},
+            ],
+        }],
+        skip=0,
+    )
+
+    assert session.messages[0]["content"] == [
+        {"type": "text", "text": "[image: D:/tmp/desktop.png]"},
+        {"type": "text", "text": "(Desktop inspection: D:/tmp/desktop.png)"},
+    ]
+    assert session.messages[0]["metadata"]["had_inline_images"] is True
+
+
 def test_save_turn_keeps_group_speaker_prefix_after_runtime_strip() -> None:
     loop = _mk_loop()
     session = Session(key="test:group-speaker")

@@ -27,10 +27,12 @@ from nanobot.agent.tools.registry import ToolRegistry
 from nanobot.agent.tools.shell import ExecTool
 from nanobot.agent.tools.spawn import SpawnTool
 from nanobot.agent.tools.web import WebFetchTool, WebSearchTool
+from nanobot.agent.tools.windows_control import WindowsControlTool
 from nanobot.bus.events import InboundMessage, OutboundMessage
 from nanobot.bus.queue import MessageBus
 from nanobot.providers.base import LLMProvider
 from nanobot.session.manager import Session, SessionManager
+from nanobot.utils.helpers import replace_image_blocks_with_placeholders
 
 if TYPE_CHECKING:
     from nanobot.config.schema import ChannelsConfig, ExecToolConfig, WebSearchConfig
@@ -75,6 +77,7 @@ class AgentLoop:
         "codex_delegate",
         "codex_status",
         "codex_resume",
+        "windows_control",
     })
     _AUTOMATION_KINDS = frozenset({"cron", "heartbeat"})
 
@@ -299,6 +302,8 @@ class AgentLoop:
         self.tools.register(WebSearchTool(config=self.web_search_config, proxy=self.web_proxy))
         self.tools.register(WebFetchTool(proxy=self.web_proxy))
         self.tools.register(MessageTool(send_callback=self.bus.publish_outbound))
+        if WindowsControlTool.is_available(self.workspace):
+            self.tools.register(WindowsControlTool(workspace=self.workspace))
         if NoahLocalPainterTool.is_available(self.workspace):
             self.tools.register(NoahLocalPainterTool(workspace=self.workspace, send_callback=self.bus.publish_outbound))
         self.tools.register(SpawnTool(manager=self.subagents))
@@ -754,6 +759,12 @@ class AgentLoop:
                 continue  # skip empty assistant messages - they poison session context
             if role == "tool" and isinstance(content, str) and len(content) > self._TOOL_RESULT_MAX_CHARS:
                 entry["content"] = content[:self._TOOL_RESULT_MAX_CHARS] + "\n... (truncated)"
+            elif role == "tool" and isinstance(content, list):
+                filtered, replaced = replace_image_blocks_with_placeholders(content)
+                entry["content"] = filtered
+                if replaced:
+                    entry.setdefault("metadata", {})
+                    entry["metadata"]["had_inline_images"] = True
             elif role == "user":
                 if isinstance(content, str) and content.startswith(ContextBuilder._RUNTIME_CONTEXT_TAG):
                     runtime_meta, user_text = ContextBuilder.extract_runtime_metadata(content)
@@ -769,13 +780,8 @@ class AgentLoop:
                         if c.get("type") == "text" and isinstance(c.get("text"), str) and c["text"].startswith(ContextBuilder._RUNTIME_CONTEXT_TAG):
                             runtime_meta, _ = ContextBuilder.extract_runtime_metadata(c["text"])
                             continue  # Strip runtime context from multimodal messages
-                        if (c.get("type") == "image_url"
-                                and c.get("image_url", {}).get("url", "").startswith("data:image/")):
-                            path = (c.get("_meta") or {}).get("path", "")
-                            placeholder = f"[image: {path}]" if path else "[image]"
-                            filtered.append({"type": "text", "text": placeholder})
-                        else:
-                            filtered.append(c)
+                        image_filtered, replaced = replace_image_blocks_with_placeholders([c])
+                        filtered.extend(image_filtered)
                     if not filtered:
                         continue
                     prefix = ContextBuilder.build_historical_speaker_prefix(runtime_meta)

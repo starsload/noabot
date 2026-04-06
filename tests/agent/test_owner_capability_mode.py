@@ -67,6 +67,47 @@ class NoahLocalPainter:
     (skill_dir / "SKILL.md").write_text("# noah-local-painter\n\nUse the dedicated painter tool.", encoding="utf-8")
 
 
+def _install_fake_windows_automation_workspace(workspace: Path) -> None:
+    skill_dir = workspace / "skills" / "windows-automation"
+    skill_dir.mkdir(parents=True, exist_ok=True)
+    (skill_dir / "__init__.py").write_text(
+        """
+class SafetyConfig:
+    def __init__(self, dry_run=True, require_confirmation=True, log_path=None, failsafe=True, max_clicks_per_second=10, min_action_interval=0.02):
+        self.dry_run = dry_run
+        self.require_confirmation = require_confirmation
+        self.log_path = log_path
+        self.failsafe = failsafe
+        self.max_clicks_per_second = max_clicks_per_second
+        self.min_action_interval = min_action_interval
+
+class ActionGuard:
+    def __init__(self, config):
+        self.config = config
+
+class WindowsAutomation:
+    def __init__(self, workspace_root, safety):
+        self.workspace_root = workspace_root
+        self.safety = safety
+        self.pytesseract = None
+
+    def temporary_config(self, **kwargs):
+        automation = self
+        class _Ctx:
+            def __enter__(self_inner):
+                return automation
+            def __exit__(self_inner, exc_type, exc, tb):
+                return False
+        return _Ctx()
+
+    def capabilities(self):
+        return {"dry_run": True}
+""".strip(),
+        encoding="utf-8",
+    )
+    (skill_dir / "SKILL.md").write_text("# windows-automation\n\nUse the windows_control tool.", encoding="utf-8")
+
+
 def test_chat_only_prompt_excludes_private_context(tmp_path: Path) -> None:
     workspace = tmp_path / "workspace"
     workspace.mkdir()
@@ -155,6 +196,7 @@ async def test_chat_only_blocks_write_file(tmp_path: Path) -> None:
     assert "write_file" not in tool_names
     assert "exec" not in tool_names
     assert "cron" not in tool_names
+    assert "windows_control" not in tool_names
 
 
 @pytest.mark.asyncio
@@ -196,6 +238,7 @@ async def test_chat_only_injects_painter_skill_when_available(tmp_path: Path) ->
 
 @pytest.mark.asyncio
 async def test_full_mode_allows_all_tools(tmp_path: Path) -> None:
+    _install_fake_windows_automation_workspace(tmp_path)
     loop = _make_loop(tmp_path, owner_ids=["telegram:owner"])
     loop.provider.chat_with_retry = AsyncMock(return_value=LLMResponse(content="hello", tool_calls=[]))
 
@@ -209,6 +252,7 @@ async def test_full_mode_allows_all_tools(tmp_path: Path) -> None:
     assert "web_fetch" in tool_names
     assert "write_file" in tool_names
     assert "exec" in tool_names
+    assert "windows_control" in tool_names
 
 
 @pytest.mark.asyncio
@@ -293,6 +337,7 @@ async def test_internal_automation_allows_task_tools_but_blocks_delegation(tmp_p
     assert "exec" in tool_names
     assert "message" in tool_names
     assert "cron" in tool_names
+    assert "windows_control" not in tool_names
     assert "spawn" not in tool_names
     assert "codex_delegate" not in tool_names
     assert "codex_status" not in tool_names

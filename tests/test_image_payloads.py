@@ -4,8 +4,12 @@ import io
 from PIL import Image
 
 from nanobot.utils.helpers import (
+    estimate_message_tokens,
+    estimate_prompt_tokens,
+    image_block_placeholder,
     normalize_message_image_blocks_for_llm,
     prepare_image_for_llm,
+    replace_image_blocks_with_placeholders,
 )
 
 
@@ -76,3 +80,57 @@ def test_normalize_message_image_blocks_for_llm_preserves_metadata() -> None:
     payload = url.split(",", 1)[1]
     with Image.open(io.BytesIO(base64.b64decode(payload))) as image:
         assert max(image.size) <= 256
+
+
+def test_replace_image_blocks_with_placeholders_keeps_path() -> None:
+    content = [
+        {
+            "type": "image_url",
+            "image_url": {"url": "data:image/png;base64,abc"},
+            "_meta": {"path": "D:/tmp/screen.png"},
+        },
+        {"type": "text", "text": "after"},
+    ]
+
+    replaced, changed = replace_image_blocks_with_placeholders(content)
+
+    assert changed is True
+    assert replaced == [
+        {"type": "text", "text": "[image: D:/tmp/screen.png]"},
+        {"type": "text", "text": "after"},
+    ]
+
+
+def test_estimate_prompt_tokens_counts_inline_images() -> None:
+    image_message = [{
+        "role": "tool",
+        "content": [
+            {"type": "text", "text": "before"},
+            {
+                "type": "image_url",
+                "image_url": {"url": "data:image/png;base64,abc"},
+                "_meta": {"path": "D:/tmp/screen.png"},
+            },
+        ],
+    }]
+    text_only_message = [{"role": "tool", "content": [{"type": "text", "text": "before"}]}]
+
+    image_tokens = estimate_prompt_tokens(image_message)
+    text_tokens = estimate_prompt_tokens(text_only_message)
+
+    assert image_tokens > text_tokens
+    assert image_block_placeholder(image_message[0]["content"][1]) == "[image: D:/tmp/screen.png]"
+
+
+def test_estimate_message_tokens_counts_inline_images() -> None:
+    image_message = {
+        "role": "tool",
+        "content": [
+            {
+                "type": "image_url",
+                "image_url": {"url": "data:image/png;base64,abc"},
+            }
+        ],
+    }
+
+    assert estimate_message_tokens(image_message) >= 1024

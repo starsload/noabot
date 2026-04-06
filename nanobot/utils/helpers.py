@@ -29,6 +29,7 @@ LLM_INLINE_IMAGE_MAX_EDGE = 2048
 LLM_INLINE_IMAGE_MIN_EDGE = 512
 LLM_INLINE_IMAGE_DEFAULT_JPEG_QUALITY = 85
 LLM_INLINE_IMAGE_MIN_JPEG_QUALITY = 55
+ESTIMATED_TOKENS_PER_INLINE_IMAGE = 1024
 
 
 def strip_think(text: str) -> str:
@@ -189,6 +190,36 @@ def _normalize_message_image_block(
         }
 
     return block
+
+
+def image_block_placeholder(block: dict[str, Any]) -> str | None:
+    """Return a compact text placeholder for a multimodal image block."""
+    if not isinstance(block, dict):
+        return None
+
+    block_type = block.get("type")
+    if block_type not in {"image_url", "input_image"}:
+        return None
+
+    path = (block.get("_meta") or {}).get("path", "")
+    if path:
+        return f"[image: {path}]"
+    return "[image]"
+
+
+def replace_image_blocks_with_placeholders(content: list[Any]) -> tuple[list[Any], bool]:
+    """Replace multimodal image blocks with lightweight text placeholders."""
+    replaced = False
+    normalized: list[Any] = []
+    for part in content:
+        if isinstance(part, dict):
+            placeholder = image_block_placeholder(part)
+            if placeholder is not None:
+                normalized.append({"type": "text", "text": placeholder})
+                replaced = True
+                continue
+        normalized.append(part)
+    return normalized, replaced
 
 
 def _normalize_data_uri_image(
@@ -398,16 +429,23 @@ def estimate_prompt_tokens(
     try:
         enc = tiktoken.get_encoding("cl100k_base")
         parts: list[str] = []
+        image_count = 0
         for msg in messages:
             content = msg.get("content")
             if isinstance(content, str):
                 parts.append(content)
             elif isinstance(content, list):
                 for part in content:
-                    if isinstance(part, dict) and part.get("type") == "text":
-                        txt = part.get("text", "")
-                        if txt:
-                            parts.append(txt)
+                    if isinstance(part, dict):
+                        if part.get("type") == "text":
+                            txt = part.get("text", "")
+                            if txt:
+                                parts.append(txt)
+                            continue
+                        placeholder = image_block_placeholder(part)
+                        if placeholder:
+                            parts.append(placeholder)
+                            image_count += 1
 
             tc = msg.get("tool_calls")
             if tc:
@@ -426,7 +464,11 @@ def estimate_prompt_tokens(
             parts.append(json.dumps(tools, ensure_ascii=False))
 
         per_message_overhead = len(messages) * 4
-        return len(enc.encode("\n".join(parts))) + per_message_overhead
+        return (
+            len(enc.encode("\n".join(parts)))
+            + per_message_overhead
+            + image_count * ESTIMATED_TOKENS_PER_INLINE_IMAGE
+        )
     except Exception:
         return 0
 
@@ -435,14 +477,22 @@ def estimate_message_tokens(message: dict[str, Any]) -> int:
     """Estimate prompt tokens contributed by one persisted message."""
     content = message.get("content")
     parts: list[str] = []
+    image_count = 0
     if isinstance(content, str):
         parts.append(content)
     elif isinstance(content, list):
         for part in content:
-            if isinstance(part, dict) and part.get("type") == "text":
-                text = part.get("text", "")
-                if text:
-                    parts.append(text)
+            if isinstance(part, dict):
+                if part.get("type") == "text":
+                    text = part.get("text", "")
+                    if text:
+                        parts.append(text)
+                    continue
+                placeholder = image_block_placeholder(part)
+                if placeholder:
+                    parts.append(placeholder)
+                    image_count += 1
+                    continue
             else:
                 parts.append(json.dumps(part, ensure_ascii=False))
     elif content is not None:
@@ -461,12 +511,12 @@ def estimate_message_tokens(message: dict[str, Any]) -> int:
 
     payload = "\n".join(parts)
     if not payload:
-        return 4
+        return max(4, image_count * ESTIMATED_TOKENS_PER_INLINE_IMAGE)
     try:
         enc = tiktoken.get_encoding("cl100k_base")
-        return max(4, len(enc.encode(payload)) + 4)
+        return max(4, len(enc.encode(payload)) + 4 + image_count * ESTIMATED_TOKENS_PER_INLINE_IMAGE)
     except Exception:
-        return max(4, len(payload) // 4 + 4)
+        return max(4, len(payload) // 4 + 4 + image_count * ESTIMATED_TOKENS_PER_INLINE_IMAGE)
 
 
 def estimate_prompt_tokens_chain(
