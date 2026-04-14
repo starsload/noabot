@@ -22,7 +22,7 @@ from nanobot.cli.models import (
     get_model_suggestions,
 )
 from nanobot.config.loader import get_config_path, load_config
-from nanobot.config.schema import Config
+from nanobot.config.schema import Config, get_channel_section
 
 console = Console()
 
@@ -899,7 +899,7 @@ def _show_summary(config: Config) -> None:
     # Channels
     channel_rows = []
     for name, display in _get_channel_names().items():
-        channel = getattr(config.channels, name, None)
+        channel = get_channel_section(config.channels, name)
         if channel:
             enabled = (
                 channel.get("enabled", False)

@@ -7,13 +7,14 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 import pytest
+from typer.testing import CliRunner
 
 from nanobot.bus.events import OutboundMessage
 from nanobot.bus.queue import MessageBus
 from nanobot.channels.base import BaseChannel
 from nanobot.channels.manager import ChannelManager
-from nanobot.config.schema import ChannelsConfig
-
+from nanobot.cli.commands import app
+from nanobot.config.schema import ChannelsConfig, Config
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -54,6 +55,24 @@ class _FakeTelegram(BaseChannel):
 
     async def send(self, msg: OutboundMessage) -> None:
         pass
+
+
+class _FakeDesktopVoice(BaseChannel):
+    name = "desktop_voice"
+    display_name = "Desktop Voice"
+
+    def __init__(self, config, bus):
+        super().__init__(config, bus)
+        self.sent: list[OutboundMessage] = []
+
+    async def start(self) -> None:
+        pass
+
+    async def stop(self) -> None:
+        pass
+
+    async def send(self, msg: OutboundMessage) -> None:
+        self.sent.append(msg)
 
 
 def _make_entry_point(name: str, cls: type):
@@ -193,10 +212,6 @@ async def test_manager_loads_plugin_from_dict_config():
 
 
 def test_channels_login_uses_discovered_plugin_class(monkeypatch):
-    from nanobot.cli.commands import app
-    from nanobot.config.schema import Config
-    from typer.testing import CliRunner
-
     runner = CliRunner()
     seen: dict[str, object] = {}
 
@@ -241,6 +256,100 @@ async def test_manager_skips_disabled_plugin():
         mgr._init_channels()
 
     assert "fakeplugin" not in mgr.channels
+
+
+@pytest.mark.asyncio
+async def test_manager_mirrors_final_outbound_to_desktop_voice():
+    class _SourceChannel(_FakePlugin):
+        name = "fakeplugin"
+
+        def __init__(self, config, bus):
+            super().__init__(config, bus)
+            self.sent: list[OutboundMessage] = []
+
+        async def send(self, msg: OutboundMessage) -> None:
+            self.sent.append(msg)
+
+    fake_config = SimpleNamespace(
+        channels=ChannelsConfig.model_validate(
+            {
+                "fakeplugin": {"enabled": True, "allowFrom": ["*"]},
+                "desktop_voice": {
+                    "enabled": True,
+                    "allowFrom": ["desktop_user"],
+                    "chatId": "desktop_local",
+                    "mirrorFromChannels": ["fakeplugin"],
+                },
+            }
+        ),
+        providers=SimpleNamespace(groq=SimpleNamespace(api_key="")),
+    )
+
+    with patch(
+        "nanobot.channels.registry.discover_all",
+        return_value={"fakeplugin": _SourceChannel, "desktop_voice": _FakeDesktopVoice},
+    ):
+        mgr = ChannelManager.__new__(ChannelManager)
+        mgr.config = fake_config
+        mgr.bus = MessageBus()
+        mgr.channels = {}
+        mgr._dispatch_task = None
+        mgr._init_channels()
+
+    source = mgr.channels["fakeplugin"]
+    desktop = mgr.channels["desktop_voice"]
+    outbound = OutboundMessage(channel="fakeplugin", chat_id="room1", content="hello mirror")
+    await mgr._send_with_retry(source, outbound)
+    await mgr._maybe_mirror_to_desktop_voice(outbound)
+
+    assert source.sent[0].content == "hello mirror"
+    assert desktop.sent[0].channel == "desktop_voice"
+    assert desktop.sent[0].chat_id == "desktop_local"
+    assert desktop.sent[0].content == "hello mirror"
+
+
+@pytest.mark.asyncio
+async def test_manager_does_not_mirror_progress_messages():
+    desktop = _FakeDesktopVoice(
+        SimpleNamespace(allow_from=["desktop_user"], mirror_from_channels=["fakeplugin"], chat_id="desktop_local"),
+        MessageBus(),
+    )
+    mgr = ChannelManager.__new__(ChannelManager)
+    mgr.channels = {"desktop_voice": desktop}
+    progress = OutboundMessage(
+        channel="fakeplugin",
+        chat_id="room1",
+        content="partial",
+        metadata={"_progress": True},
+    )
+
+    await mgr._maybe_mirror_to_desktop_voice(progress)
+
+    assert desktop.sent == []
+
+
+@pytest.mark.asyncio
+async def test_manager_loads_plugin_from_camel_case_extra_key():
+    fake_config = SimpleNamespace(
+        channels=ChannelsConfig.model_validate({
+            "desktopVoice": {"enabled": True, "allowFrom": ["*"]},
+        }),
+        providers=SimpleNamespace(groq=SimpleNamespace(api_key="")),
+    )
+
+    with patch(
+        "nanobot.channels.registry.discover_all",
+        return_value={"desktop_voice": _FakePlugin},
+    ):
+        mgr = ChannelManager.__new__(ChannelManager)
+        mgr.config = fake_config
+        mgr.bus = MessageBus()
+        mgr.channels = {}
+        mgr._dispatch_task = None
+        mgr._init_channels()
+
+    assert "desktop_voice" in mgr.channels
+    assert isinstance(mgr.channels["desktop_voice"], _FakePlugin)
 
 
 # ---------------------------------------------------------------------------

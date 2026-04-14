@@ -52,6 +52,16 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+voice = [
+    "edge-tts>=6.1.0,<8.0.0",
+]
+avatar_vts = [
+    "pyvts>=0.3.3,<1.0.0",
+]
+voice_native = [
+    "sounddevice>=0.5.0,<1.0.0",
+    "soundfile>=0.13.0,<1.0.0",
+]
 wecom = [
     "wecom-aibot-sdk-python>=0.1.5",
 ]

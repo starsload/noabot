@@ -114,4 +114,26 @@ def _migrate_config(data: dict) -> dict:
     for server_cfg in mcp_servers.values():
         if isinstance(server_cfg, dict) and isinstance(server_cfg.get("args"), list):
             server_cfg["args"] = [_normalize_mcp_arg(arg) for arg in server_cfg["args"]]
+
+    # Migrate legacy voice flat provider keys:
+    # {
+    #   "voice": {"sttProvider": "...", "ttsProvider": "..."}
+    # }
+    # -> {
+    #   "voice": {"stt": {"provider": "..."}, "tts": {"provider": "..."}}
+    # }
+    voice = data.get("voice")
+    if isinstance(voice, dict):
+        stt_provider = voice.pop("sttProvider", voice.pop("stt_provider", None))
+        tts_provider = voice.pop("ttsProvider", voice.pop("tts_provider", None))
+        if stt_provider:
+            stt_cfg = voice.get("stt", {})
+            if isinstance(stt_cfg, dict) and "provider" not in stt_cfg:
+                stt_cfg["provider"] = stt_provider
+                voice["stt"] = stt_cfg
+        if tts_provider:
+            tts_cfg = voice.get("tts", {})
+            if isinstance(tts_cfg, dict) and "provider" not in tts_cfg:
+                tts_cfg["provider"] = tts_provider
+                voice["tts"] = tts_cfg
     return data

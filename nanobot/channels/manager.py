@@ -10,7 +10,7 @@ from loguru import logger
 from nanobot.bus.events import OutboundMessage
 from nanobot.bus.queue import MessageBus
 from nanobot.channels.base import BaseChannel
-from nanobot.config.schema import Config
+from nanobot.config.schema import Config, get_channel_section
 
 # Retry delays for message sending (exponential backoff: 1s, 2s, 4s)
 _SEND_RETRY_DELAYS = (1, 2, 4)
@@ -41,7 +41,7 @@ class ChannelManager:
         groq_key = self.config.providers.groq.api_key
 
         for name, cls in discover_all().items():
-            section = getattr(self.config.channels, name, None)
+            section = get_channel_section(self.config.channels, name)
             if section is None:
                 continue
             enabled = (
@@ -54,6 +54,7 @@ class ChannelManager:
             try:
                 channel = cls(section, self.bus)
                 channel.transcription_api_key = groq_key
+                channel.set_runtime_config(self.config)
                 self.channels[name] = channel
                 logger.info("{} channel enabled", cls.display_name)
             except Exception as e:
@@ -134,6 +135,7 @@ class ChannelManager:
                 channel = self.channels.get(msg.channel)
                 if channel:
                     await self._send_with_retry(channel, msg)
+                    await self._maybe_mirror_to_desktop_voice(msg)
                 else:
                     logger.warning("Unknown channel: {}", msg.channel)
 
@@ -179,6 +181,38 @@ class ChannelManager:
                     await asyncio.sleep(delay)
                 except asyncio.CancelledError:
                     raise  # Propagate cancellation during sleep
+
+    async def _maybe_mirror_to_desktop_voice(self, msg: OutboundMessage) -> None:
+        """Mirror eligible outbound replies to the local desktop voice channel."""
+        if msg.channel == "desktop_voice":
+            return
+        if msg.metadata.get("_progress") or msg.metadata.get("_stream_delta") or msg.metadata.get("_stream_end"):
+            return
+        if not (msg.content or "").strip():
+            return
+
+        desktop_channel = self.channels.get("desktop_voice")
+        if not desktop_channel:
+            return
+
+        cfg = desktop_channel.config
+        if isinstance(cfg, dict):
+            mirrored_from = cfg.get("mirrorFromChannels", cfg.get("mirror_from_channels", [])) or []
+            target_chat_id = cfg.get("chatId", cfg.get("chat_id", "desktop_local"))
+        else:
+            mirrored_from = getattr(cfg, "mirror_from_channels", []) or []
+            target_chat_id = getattr(cfg, "chat_id", "desktop_local")
+        if msg.channel not in mirrored_from:
+            return
+
+        mirrored = OutboundMessage(
+            channel="desktop_voice",
+            chat_id=target_chat_id,
+            content=msg.content,
+            media=[],
+            metadata={"_mirrored_from": msg.channel},
+        )
+        await self._send_with_retry(desktop_channel, mirrored)
 
     def get_channel(self, name: str) -> BaseChannel | None:
         """Get a channel by name."""

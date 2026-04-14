@@ -105,6 +105,7 @@
 - [Install](#-install)
 - [Quick Start](#-quick-start)
 - [Chat Apps](#-chat-apps)
+- [Voice & Avatar](#-voice--avatar)
 - [Agent Social Network](#-agent-social-network)
 - [Configuration](#️-configuration)
 - [Multiple Instances](#-multiple-instances)
@@ -137,6 +138,19 @@
     <td align="center">Learn • Memory • Reasoning</td>
   </tr>
 </table>
+
+### 🎤 Desktop Voice & Avatar
+
+nanobot supports **local voice interaction** and **Live2D avatar** integration — turn your AI assistant into a desktop companion!
+
+| Feature | Description |
+|---------|-------------|
+| **Voice I/O** | Speech-to-text (Groq Whisper / local) and text-to-speech (Edge TTS / command) for hands-free conversation |
+| **Desktop Voice Channel** | Always-listening mic input with configurable duration, barge-in support, and sounddevice backend |
+| **VTube Studio Avatar** | Connect to VTube Studio for Live2D avatar expressions, mouth sync, and hotkey-triggered animations |
+| **Desktop Pet Mode** | Combine voice + avatar for an interactive desktop pet experience |
+
+See the [Voice & Avatar Configuration](#voice--avatar) section below for setup details.
 
 ## 📦 Install
 
@@ -253,6 +267,7 @@ For current code-level group reply behavior across channels, see the [Channel Gr
 | **Matrix** | Homeserver URL + Access token |
 | **Email** | IMAP/SMTP credentials |
 | **QQ** | App ID + App Secret |
+| **QQ Personal** | OneBot bridge (NapCat) + QR login |
 | **Wecom** | Bot ID + Bot Secret |
 | **Mochat** | Claw token (auto-setup available) |
 
@@ -883,6 +898,88 @@ nanobot gateway
 
 </details>
 
+## 🎤 Voice & Avatar
+
+Turn nanobot into an interactive desktop companion with voice input/output and a Live2D avatar.
+
+### Desktop Voice
+
+Configure voice I/O under the `voice` section in `~/.nanobot/config.json`:
+
+```json
+{
+  "voice": {
+    "enabled": true,
+    "barge_in": true,
+    "input_device": "",
+    "output_device": "",
+    "stt": {
+      "provider": "groq",
+      "language": "zh"
+    },
+    "tts": {
+      "provider": "edge_tts",
+      "voice": "zh-CN-XiaoxiaoNeural"
+    },
+    "capture": {
+      "backend": "sounddevice",
+      "sample_rate_hz": 16000,
+      "channels": 1
+    },
+    "playback": {
+      "backend": "sounddevice"
+    }
+  }
+}
+```
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `enabled` | `false` | Enable voice I/O |
+| `barge_in` | `true` | Allow interrupting TTS playback with new voice input |
+| `stt.provider` | `"openai"` | Speech-to-text provider: `openai`, `groq` (free Whisper) |
+| `stt.language` | `"zh"` | Recognition language code |
+| `tts.provider` | `"command"` | TTS backend: `edge_tts` (free), `command` (custom) |
+| `tts.voice` | `"zh-CN-XiaoxiaoNeural"` | Edge TTS voice name |
+| `capture.backend` | `"command"` | Audio capture: `sounddevice` (native), `command` (external) |
+| `playback.backend` | `"command"` | Audio playback: `sounddevice` (native), `command` (external) |
+
+### Avatar (VTube Studio)
+
+Connect to VTube Studio for Live2D avatar integration. Configure under the `avatar` section:
+
+```json
+{
+  "avatar": {
+    "enabled": true,
+    "runtime": "vtube_studio",
+    "host": "127.0.0.1",
+    "port": 8001,
+    "speakingParameter": "MouthOpen",
+    "speakingValueOn": 0.75,
+    "speakingValueOff": 0.0,
+    "expressionHotkeys": {
+      "smile": "ExpSmile"
+    },
+    "motionHotkeys": {
+      "wave": "MotionWave"
+    }
+  }
+}
+```
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `enabled` | `false` | Enable avatar runtime |
+| `runtime` | `"vtube_studio"` | Avatar backend: `vtube_studio`, `none` |
+| `host` / `port` | `127.0.0.1:8001` | VTube Studio API endpoint |
+| `speakingParameter` | `"MouthOpen"` | VTS parameter name for mouth sync |
+| `speakingValueOn` / `speakingValueOff` | `1.0` / `0.0` | Mouth open/close values |
+| `expressionHotkeys` | `{}` | Expression name → VTS hotkey ID mapping |
+| `motionHotkeys` | `{}` | Motion name → VTS hotkey ID mapping |
+
+> **Setup:** Install [VTube Studio](https://store.steampowered.com/app/1325860/VTube_Studio/) on Steam, enable the WebSocket API in settings, and grant nanobot's plugin authentication token.
+
 ## 🌐 Agent Social Network
 
 🐈 nanobot is capable of linking to the agent social network (agent community). **Just send one message and your nanobot joins automatically!**
@@ -902,6 +999,7 @@ Config file: `~/.nanobot/config.json`
 
 > [!TIP]
 > - **Groq** provides free voice transcription via Whisper. If configured, Telegram voice messages will be automatically transcribed.
+> - **Thinking Mode**: Models like Qwen3.6-Plus support hybrid thinking mode. Enable it with `"reasoningEffort": "high"` and `"thinkingBudgetTokens": 10240` in your `agents.defaults` config.
 > - **MiniMax Coding Plan**: Exclusive discount links for the nanobot community: [Overseas](https://platform.minimax.io/subscribe/coding-plan?code=9txpdXw04g&source=link) · [Mainland China](https://platform.minimaxi.com/subscribe/token-plan?code=GILTJpMTqZ&source=link)
 > - **MiniMax (Mainland China)**: If your API key is from MiniMax's mainland China platform (minimaxi.com), set `"apiBase": "https://api.minimaxi.com/v1"` in your minimax provider config.
 > - **VolcEngine / BytePlus Coding Plan**: Use dedicated providers `volcengineCodingPlan` or `byteplusCodingPlan` instead of the pay-per-use `volcengine` / `byteplus` providers.

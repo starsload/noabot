@@ -13,12 +13,14 @@ from typing import TYPE_CHECKING, Any, Awaitable, Callable
 
 from loguru import logger
 
+from nanobot.agent.claude_code_jobs import ClaudeCodeJobManager
 from nanobot.agent.codex_jobs import CodexJobManager
 from nanobot.agent.context import ContextBuilder
 from nanobot.agent.memory import MemoryConsolidator
 from nanobot.agent.skills import BUILTIN_SKILLS_DIR
 from nanobot.agent.tools.noah_local_painter import NoahLocalPainterTool
 from nanobot.agent.subagent import SubagentManager
+from nanobot.agent.tools.claude_code import CCDelegateTool, CCResumeTool, CCStatusTool
 from nanobot.agent.tools.codex import CodexDelegateTool, CodexResumeTool, CodexStatusTool
 from nanobot.agent.tools.cron import CronTool
 from nanobot.agent.tools.filesystem import EditFileTool, ListDirTool, ReadFileTool, WriteFileTool
@@ -77,6 +79,9 @@ class AgentLoop:
         "codex_delegate",
         "codex_status",
         "codex_resume",
+        "cc_delegate",
+        "cc_status",
+        "cc_resume",
         "windows_control",
     })
     _AUTOMATION_KINDS = frozenset({"cron", "heartbeat"})
@@ -119,6 +124,7 @@ class AgentLoop:
         self.sessions = session_manager or SessionManager(workspace)
         self.tools = ToolRegistry()
         self.codex_jobs = CodexJobManager(workspace=workspace, bus=bus)
+        self.cc_jobs = ClaudeCodeJobManager(workspace=workspace, bus=bus)
         self.subagents = SubagentManager(
             provider=provider,
             workspace=workspace,
@@ -310,6 +316,9 @@ class AgentLoop:
         self.tools.register(CodexDelegateTool(manager=self.codex_jobs))
         self.tools.register(CodexStatusTool(manager=self.codex_jobs))
         self.tools.register(CodexResumeTool(manager=self.codex_jobs))
+        self.tools.register(CCDelegateTool(manager=self.cc_jobs))
+        self.tools.register(CCStatusTool(manager=self.cc_jobs))
+        self.tools.register(CCResumeTool(manager=self.cc_jobs))
         if self.cron_service:
             self.tools.register(CronTool(self.cron_service))
 
@@ -359,7 +368,7 @@ class AgentLoop:
 
     def _set_tool_context(self, channel: str, chat_id: str, message_id: str | None = None) -> None:
         """Update context for all tools that need routing info."""
-        for name in ("message", "noah_local_painter", "spawn", "cron", "codex_delegate", "codex_status", "codex_resume"):
+        for name in ("message", "noah_local_painter", "spawn", "cron", "codex_delegate", "codex_status", "codex_resume", "cc_delegate", "cc_status", "cc_resume"):
             if tool := self.tools.get(name):
                 if hasattr(tool, "set_context"):
                     extra = [message_id] if name in {"message", "noah_local_painter"} else []
@@ -567,6 +576,7 @@ class AgentLoop:
             await asyncio.gather(*self._background_tasks, return_exceptions=True)
             self._background_tasks.clear()
         await self.codex_jobs.close()
+        await self.cc_jobs.close()
         if self._mcp_stack:
             try:
                 await self._mcp_stack.aclose()

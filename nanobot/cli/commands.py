@@ -33,7 +33,7 @@ from rich.text import Text
 
 from nanobot import __logo__, __version__
 from nanobot.config.paths import get_workspace_path
-from nanobot.config.schema import Config
+from nanobot.config.schema import Config, get_channel_section
 from nanobot.utils.helpers import sync_workspace_templates
 
 app = typer.Typer(
@@ -421,6 +421,112 @@ def _make_provider(config: Config):
     return provider
 
 
+def _make_stt_provider(config: Config):
+    """Create STT provider from desktop voice config."""
+    provider_name = (config.voice.stt.provider or "").strip().lower()
+    if provider_name in {"groq", "groq_whisper"}:
+        from nanobot.providers.stt import GroqSTTProvider
+
+        return GroqSTTProvider(api_key=config.providers.groq.api_key or None)
+
+    console.print(f"[red]Error: Unsupported STT provider: {provider_name}[/red]")
+    console.print("Currently supported: groq")
+    raise typer.Exit(1)
+
+
+def _make_tts_provider(config: Config):
+    """Create TTS provider from desktop voice config."""
+    provider_name = (config.voice.tts.provider or "").strip().lower()
+    if provider_name in {"edge_tts", "edge-tts"}:
+        from nanobot.providers.tts import EdgeTTSProvider
+
+        return EdgeTTSProvider(
+            default_voice=config.voice.tts.voice,
+            rate=config.voice.tts.rate,
+            volume=config.voice.tts.volume,
+            pitch=config.voice.tts.pitch,
+        )
+
+    console.print(f"[red]Error: Unsupported TTS provider: {provider_name}[/red]")
+    console.print("Currently supported: edge_tts")
+    raise typer.Exit(1)
+
+
+def _make_avatar_runtime(config: Config, enabled: bool):
+    """Create avatar runtime for desktop voice mode."""
+    from nanobot.avatar import NullAvatarRuntime, VTubeStudioRuntime
+
+    if not enabled:
+        return NullAvatarRuntime()
+
+    runtime_name = (config.avatar.runtime or "").strip().lower()
+    if runtime_name in {"none", ""}:
+        return NullAvatarRuntime()
+    if runtime_name == "vtube_studio":
+        return VTubeStudioRuntime(
+            host=config.avatar.host,
+            port=config.avatar.port,
+            plugin_name=config.avatar.plugin_name,
+            plugin_developer=config.avatar.plugin_developer,
+            token_path=config.avatar.token_path,
+            speaking_parameter=config.avatar.speaking_parameter,
+            speaking_value_on=config.avatar.speaking_value_on,
+            speaking_value_off=config.avatar.speaking_value_off,
+            expression_hotkeys=config.avatar.expression_hotkeys,
+            motion_hotkeys=config.avatar.motion_hotkeys,
+        )
+
+    console.print(f"[red]Error: Unsupported avatar runtime: {runtime_name}[/red]")
+    console.print("Currently supported: vtube_studio, none")
+    raise typer.Exit(1)
+
+
+def _make_audio_io(enabled: bool):
+    """Create audio playback adapter for desktop voice mode."""
+    from nanobot.voice import CommandAudioIO, NullAudioIO
+
+    if not enabled:
+        return NullAudioIO()
+    return CommandAudioIO()
+
+
+def _make_audio_io_from_config(config: Config, enabled: bool):
+    """Create audio playback adapter using config-driven command template."""
+    from nanobot.voice import CommandAudioIO, NullAudioIO, SoundDeviceAudioIO, parse_device_selector
+
+    if not enabled:
+        return NullAudioIO()
+    backend = (config.voice.playback.backend or "").strip().lower()
+    if backend == "sounddevice":
+        return SoundDeviceAudioIO(output_device=parse_device_selector(config.voice.output_device))
+    return CommandAudioIO(play_command=list(config.voice.playback.command_template))
+
+
+def _make_audio_capture_from_config(
+    config: Config,
+    *,
+    backend: str | None = None,
+    command_template: list[str] | None = None,
+):
+    """Create audio capture adapter using config or explicit command template."""
+    from nanobot.voice import CommandAudioCapture, SoundDeviceAudioCapture, parse_device_selector
+
+    selected_backend = (backend or config.voice.capture.backend or "").strip().lower()
+    if selected_backend == "sounddevice":
+        return SoundDeviceAudioCapture(
+            sample_rate_hz=config.voice.capture.sample_rate_hz,
+            channels=config.voice.capture.channels,
+            input_device=parse_device_selector(config.voice.input_device),
+        )
+
+    template = list(command_template or config.voice.capture.command_template)
+    if not template:
+        console.print("[red]Error: No capture command template configured.[/red]")
+        console.print("Set voice.capture.commandTemplate in config, or pass --capture-cmd-part repeatedly.")
+        raise typer.Exit(1)
+    return CommandAudioCapture(template)
+
+
 def _load_runtime_config(config: str | None = None, workspace: str | None = None) -> Config:
     """Load config and optionally override the active workspace."""
     from nanobot.config.loader import load_config, set_config_path
@@ -438,6 +544,20 @@ def _load_runtime_config(config: str | None = None, workspace: str | None = None
     if workspace:
         loaded.agents.defaults.workspace = workspace
     return loaded
+
+
+def _apply_voice_device_overrides(
+    config: Config,
+    *,
+    input_device: str | None = None,
+    output_device: str | None = None,
+) -> Config:
+    """Apply one-shot CLI device overrides to runtime config."""
+    if input_device is not None:
+        config.voice.input_device = input_device
+    if output_device is not None:
+        config.voice.output_device = output_device
+    return config
 
 
 def _print_deprecated_memory_window_notice(config: Config) -> None:
@@ -838,6 +958,548 @@ def agent(
         asyncio.run(run_interactive())
 
 
+@app.command("desktop-voice-smoke")
+def desktop_voice_smoke(
+    input_audio: str = typer.Option(..., "--input-audio", "-i", help="Path to input audio file"),
+    output_dir: str | None = typer.Option(None, "--output-dir", help="Directory for synthesized outputs"),
+    session_id: str = typer.Option("desktop:local", "--session", "-s", help="Session ID"),
+    output_device: str | None = typer.Option(None, "--output-device", help="Override playback output device (index or name)"),
+    workspace: str | None = typer.Option(None, "--workspace", "-w", help="Workspace directory"),
+    config: str | None = typer.Option(None, "--config", "-c", help="Config file path"),
+    playback: bool = typer.Option(False, "--playback/--no-playback", help="Play synthesized audio after generation"),
+    avatar: bool = typer.Option(False, "--avatar/--no-avatar", help="Send speaking intents to avatar runtime"),
+):
+    """Run a local desktop voice smoke test from an input audio file."""
+    from nanobot.agent.loop import AgentLoop
+    from nanobot.bus.queue import MessageBus
+    from nanobot.config.paths import get_cron_dir
+    from nanobot.cron.service import CronService
+    from nanobot.voice.runtime import DesktopVoiceTurnRunner
+
+    runtime_config = _load_runtime_config(config, workspace)
+    runtime_config = _apply_voice_device_overrides(runtime_config, output_device=output_device)
+    _print_deprecated_memory_window_notice(runtime_config)
+    sync_workspace_templates(runtime_config.workspace_path)
+
+    bus = MessageBus()
+    provider = _make_provider(runtime_config)
+    stt = _make_stt_provider(runtime_config)
+    tts = _make_tts_provider(runtime_config)
+    avatar_runtime = _make_avatar_runtime(runtime_config, enabled=avatar)
+    audio_io = _make_audio_io_from_config(runtime_config, enabled=playback)
+
+    cron_store_path = get_cron_dir() / "jobs.json"
+    cron = CronService(cron_store_path)
+    agent_loop = AgentLoop(
+        bus=bus,
+        provider=provider,
+        workspace=runtime_config.workspace_path,
+        model=runtime_config.agents.defaults.model,
+        max_iterations=runtime_config.agents.defaults.max_tool_iterations,
+        context_window_tokens=runtime_config.agents.defaults.context_window_tokens,
+        web_search_config=runtime_config.tools.web.search,
+        web_proxy=runtime_config.tools.web.proxy or None,
+        exec_config=runtime_config.tools.exec,
+        cron_service=cron,
+        restrict_to_workspace=runtime_config.tools.restrict_to_workspace,
+        mcp_servers=runtime_config.tools.mcp_servers,
+        channels_config=runtime_config.channels,
+        owner_ids=runtime_config.agents.identity.owner_ids,
+    )
+
+    if output_dir:
+        target_dir = Path(output_dir).expanduser().resolve()
+    else:
+        target_dir = runtime_config.workspace_path / "runtime" / "desktop_voice"
+
+    if ":" in session_id:
+        channel, chat_id = session_id.split(":", 1)
+    else:
+        channel, chat_id = "cli", session_id
+
+    async def _run() -> None:
+        from nanobot.avatar import DesktopVoiceAvatarOrchestrator
+
+        orchestrator = DesktopVoiceAvatarOrchestrator(
+            stt=stt,
+            tts=tts,
+            avatar=avatar_runtime,
+            audio_io=audio_io,
+        )
+        runner = DesktopVoiceTurnRunner(
+            orchestrator=orchestrator,
+            agent=agent_loop,
+            output_dir=target_dir,
+            session_key=session_id,
+            channel=channel,
+            chat_id=chat_id,
+        )
+
+        try:
+            await orchestrator.start()
+            result = await runner.run_turn_from_audio_file(
+                input_audio,
+                language=runtime_config.voice.stt.language,
+                voice=runtime_config.voice.tts.voice,
+            )
+            console.print(f"[green]Input audio:[/green] {result.input_audio}")
+            console.print(f"[green]Transcript:[/green] {result.transcript or '(empty)'}")
+            console.print(f"[green]Response:[/green] {result.response}")
+            console.print(f"[green]Synthesized audio:[/green] {result.synthesized_audio}")
+        finally:
+            await orchestrator.shutdown()
+            await agent_loop.close_mcp()
+
+    asyncio.run(_run())
+
+
+@app.command("desktop-voice-record")
+def desktop_voice_record(
+    output_dir: str | None = typer.Option(None, "--output-dir", help="Directory for captured and synthesized outputs"),
+    session_id: str = typer.Option("desktop:local", "--session", "-s", help="Session ID"),
+    duration: float | None = typer.Option(None, "--duration", help="Capture duration in seconds"),
+    input_device: str | None = typer.Option(None, "--input-device", help="Override capture input device (index or name)"),
+    output_device: str | None = typer.Option(None, "--output-device", help="Override playback output device (index or name)"),
+    native_capture: bool = typer.Option(False, "--native-capture/--no-native-capture", help="Use native sounddevice capture instead of command-template capture"),
+    capture_cmd_part: list[str] | None = typer.Option(None, "--capture-cmd-part", help="One command token; repeat to override capture command template"),
+    workspace: str | None = typer.Option(None, "--workspace", "-w", help="Workspace directory"),
+    config: str | None = typer.Option(None, "--config", "-c", help="Config file path"),
+    playback: bool = typer.Option(False, "--playback/--no-playback", help="Play synthesized audio after generation"),
+    avatar: bool = typer.Option(False, "--avatar/--no-avatar", help="Send speaking intents to avatar runtime"),
+):
+    """Record one local audio segment and run the desktop voice pipeline."""
+    from nanobot.agent.loop import AgentLoop
+    from nanobot.bus.queue import MessageBus
+    from nanobot.config.paths import get_cron_dir
+    from nanobot.cron.service import CronService
+    from nanobot.voice.runtime import DesktopVoiceTurnRunner
+
+    runtime_config = _load_runtime_config(config, workspace)
+    runtime_config = _apply_voice_device_overrides(
+        runtime_config,
+        input_device=input_device,
+        output_device=output_device,
+    )
+    _print_deprecated_memory_window_notice(runtime_config)
+    sync_workspace_templates(runtime_config.workspace_path)
+
+    bus = MessageBus()
+    provider = _make_provider(runtime_config)
+    stt = _make_stt_provider(runtime_config)
+    tts = _make_tts_provider(runtime_config)
+    avatar_runtime = _make_avatar_runtime(runtime_config, enabled=avatar)
+    audio_io = _make_audio_io_from_config(runtime_config, enabled=playback)
+    capture = _make_audio_capture_from_config(
+        runtime_config,
+        backend="sounddevice" if native_capture else None,
+        command_template=list(capture_cmd_part or []),
+    )
+
+    cron_store_path = get_cron_dir() / "jobs.json"
+    cron = CronService(cron_store_path)
+    agent_loop = AgentLoop(
+        bus=bus,
+        provider=provider,
+        workspace=runtime_config.workspace_path,
+        model=runtime_config.agents.defaults.model,
+        max_iterations=runtime_config.agents.defaults.max_tool_iterations,
+        context_window_tokens=runtime_config.agents.defaults.context_window_tokens,
+        web_search_config=runtime_config.tools.web.search,
+        web_proxy=runtime_config.tools.web.proxy or None,
+        exec_config=runtime_config.tools.exec,
+        cron_service=cron,
+        restrict_to_workspace=runtime_config.tools.restrict_to_workspace,
+        mcp_servers=runtime_config.tools.mcp_servers,
+        channels_config=runtime_config.channels,
+        owner_ids=runtime_config.agents.identity.owner_ids,
+    )
+
+    if output_dir:
+        target_dir = Path(output_dir).expanduser().resolve()
+    else:
+        target_dir = runtime_config.workspace_path / "runtime" / "desktop_voice"
+
+    if ":" in session_id:
+        channel, chat_id = session_id.split(":", 1)
+    else:
+        channel, chat_id = "cli", session_id
+
+    async def _run() -> None:
+        from nanobot.avatar import DesktopVoiceAvatarOrchestrator
+
+        orchestrator = DesktopVoiceAvatarOrchestrator(
+            stt=stt,
+            tts=tts,
+            avatar=avatar_runtime,
+            audio_io=audio_io,
+        )
+        runner = DesktopVoiceTurnRunner(
+            orchestrator=orchestrator,
+            agent=agent_loop,
+            output_dir=target_dir,
+            session_key=session_id,
+            channel=channel,
+            chat_id=chat_id,
+        )
+
+        try:
+            await orchestrator.start()
+            result = await runner.run_turn_from_capture(
+                capture,
+                duration_s=duration or runtime_config.voice.capture.duration_s,
+                language=runtime_config.voice.stt.language,
+                voice=runtime_config.voice.tts.voice,
+            )
+            console.print(f"[green]Input audio:[/green] {result.input_audio}")
+            console.print(f"[green]Transcript:[/green] {result.transcript or '(empty)'}")
+            console.print(f"[green]Response:[/green] {result.response}")
+            console.print(f"[green]Synthesized audio:[/green] {result.synthesized_audio}")
+        finally:
+            await orchestrator.shutdown()
+            await agent_loop.close_mcp()
+
+    asyncio.run(_run())
+
+
+@app.command("desktop-voice-devices")
+def desktop_voice_devices(
+    input_only: bool = typer.Option(False, "--input-only", help="Show only input-capable devices"),
+    output_only: bool = typer.Option(False, "--output-only", help="Show only output-capable devices"),
+):
+    """List local audio devices via sounddevice."""
+    from nanobot.voice import list_audio_devices
+
+    try:
+        devices = list_audio_devices(input_only=input_only, output_only=output_only)
+    except RuntimeError as exc:
+        console.print(f"[red]Error:[/red] {exc}")
+        raise typer.Exit(1) from exc
+
+    table = Table(title="Audio Devices")
+    table.add_column("Index", style="cyan")
+    table.add_column("Name", style="green")
+    table.add_column("Default", style="yellow")
+    table.add_column("Input", justify="right")
+    table.add_column("Output", justify="right")
+    table.add_column("Default SR", justify="right")
+
+    for item in devices:
+        sr = f"{item.default_samplerate:.0f}" if item.default_samplerate else "-"
+        default_marks = []
+        if item.is_default_input:
+            default_marks.append("in")
+        if item.is_default_output:
+            default_marks.append("out")
+        table.add_row(
+            str(item.index),
+            item.name,
+            ",".join(default_marks) if default_marks else "-",
+            str(item.max_input_channels),
+            str(item.max_output_channels),
+            sr,
+        )
+    console.print(table)
+
+
+@app.command("desktop-voice-loop")
+def desktop_voice_loop(
+    turns: int = typer.Option(3, "--turns", help="Number of voice turns to run"),
+    output_dir: str | None = typer.Option(None, "--output-dir", help="Directory for captured and synthesized outputs"),
+    session_id: str = typer.Option("desktop:local", "--session", "-s", help="Session ID"),
+    duration: float | None = typer.Option(None, "--duration", help="Capture duration in seconds"),
+    input_device: str | None = typer.Option(None, "--input-device", help="Override capture input device (index or name)"),
+    output_device: str | None = typer.Option(None, "--output-device", help="Override playback output device (index or name)"),
+    native_capture: bool = typer.Option(False, "--native-capture/--no-native-capture", help="Use native sounddevice capture instead of command-template capture"),
+    capture_cmd_part: list[str] | None = typer.Option(None, "--capture-cmd-part", help="One command token; repeat to override capture command template"),
+    workspace: str | None = typer.Option(None, "--workspace", "-w", help="Workspace directory"),
+    config: str | None = typer.Option(None, "--config", "-c", help="Config file path"),
+    playback: bool = typer.Option(False, "--playback/--no-playback", help="Play synthesized audio after generation"),
+    avatar: bool = typer.Option(False, "--avatar/--no-avatar", help="Send speaking intents to avatar runtime"),
+):
+    """Run multiple local desktop voice turns in sequence."""
+    from nanobot.agent.loop import AgentLoop
+    from nanobot.bus.queue import MessageBus
+    from nanobot.config.paths import get_cron_dir
+    from nanobot.cron.service import CronService
+    from nanobot.voice.runtime import DesktopVoiceTurnRunner
+
+    runtime_config = _load_runtime_config(config, workspace)
+    runtime_config = _apply_voice_device_overrides(
+        runtime_config,
+        input_device=input_device,
+        output_device=output_device,
+    )
+    _print_deprecated_memory_window_notice(runtime_config)
+    sync_workspace_templates(runtime_config.workspace_path)
+
+    bus = MessageBus()
+    provider = _make_provider(runtime_config)
+    stt = _make_stt_provider(runtime_config)
+    tts = _make_tts_provider(runtime_config)
+    avatar_runtime = _make_avatar_runtime(runtime_config, enabled=avatar)
+    audio_io = _make_audio_io_from_config(runtime_config, enabled=playback)
+    capture = _make_audio_capture_from_config(
+        runtime_config,
+        backend="sounddevice" if native_capture else None,
+        command_template=list(capture_cmd_part or []),
+    )
+
+    cron_store_path = get_cron_dir() / "jobs.json"
+    cron = CronService(cron_store_path)
+    agent_loop = AgentLoop(
+        bus=bus,
+        provider=provider,
+        workspace=runtime_config.workspace_path,
+        model=runtime_config.agents.defaults.model,
+        max_iterations=runtime_config.agents.defaults.max_tool_iterations,
+        context_window_tokens=runtime_config.agents.defaults.context_window_tokens,
+        web_search_config=runtime_config.tools.web.search,
+        web_proxy=runtime_config.tools.web.proxy or None,
+        exec_config=runtime_config.tools.exec,
+        cron_service=cron,
+        restrict_to_workspace=runtime_config.tools.restrict_to_workspace,
+        mcp_servers=runtime_config.tools.mcp_servers,
+        channels_config=runtime_config.channels,
+        owner_ids=runtime_config.agents.identity.owner_ids,
+    )
+
+    if output_dir:
+        target_dir = Path(output_dir).expanduser().resolve()
+    else:
+        target_dir = runtime_config.workspace_path / "runtime" / "desktop_voice"
+
+    if ":" in session_id:
+        channel, chat_id = session_id.split(":", 1)
+    else:
+        channel, chat_id = "cli", session_id
+
+    async def _run() -> None:
+        from nanobot.avatar import DesktopVoiceAvatarOrchestrator
+
+        orchestrator = DesktopVoiceAvatarOrchestrator(
+            stt=stt,
+            tts=tts,
+            avatar=avatar_runtime,
+            audio_io=audio_io,
+        )
+        runner = DesktopVoiceTurnRunner(
+            orchestrator=orchestrator,
+            agent=agent_loop,
+            output_dir=target_dir,
+            session_key=session_id,
+            channel=channel,
+            chat_id=chat_id,
+        )
+
+        try:
+            await orchestrator.start()
+            for idx in range(1, turns + 1):
+                console.print(f"[cyan]Turn {idx}/{turns}[/cyan]")
+                result = await runner.run_turn_from_capture(
+                    capture,
+                    duration_s=duration or runtime_config.voice.capture.duration_s,
+                    language=runtime_config.voice.stt.language,
+                    voice=runtime_config.voice.tts.voice,
+                )
+                console.print(f"[green]Input audio:[/green] {result.input_audio}")
+                console.print(f"[green]Transcript:[/green] {result.transcript or '(empty)'}")
+                console.print(f"[green]Response:[/green] {result.response}")
+                console.print(f"[green]Synthesized audio:[/green] {result.synthesized_audio}")
+        finally:
+            await orchestrator.shutdown()
+            await agent_loop.close_mcp()
+
+    asyncio.run(_run())
+
+
+@app.command("desktop-voice-chat")
+def desktop_voice_chat(
+    max_turns: int = typer.Option(0, "--max-turns", help="Maximum turns to run; 0 means until interrupted"),
+    output_dir: str | None = typer.Option(None, "--output-dir", help="Directory for captured and synthesized outputs"),
+    session_id: str = typer.Option("desktop:local", "--session", "-s", help="Session ID"),
+    duration: float | None = typer.Option(None, "--duration", help="Capture duration in seconds"),
+    input_device: str | None = typer.Option(None, "--input-device", help="Override capture input device (index or name)"),
+    output_device: str | None = typer.Option(None, "--output-device", help="Override playback output device (index or name)"),
+    native_capture: bool = typer.Option(False, "--native-capture/--no-native-capture", help="Use native sounddevice capture instead of command-template capture"),
+    capture_cmd_part: list[str] | None = typer.Option(None, "--capture-cmd-part", help="One command token; repeat to override capture command template"),
+    stop_on_empty: bool = typer.Option(False, "--stop-on-empty/--no-stop-on-empty", help="Stop the chat loop when transcript is empty"),
+    workspace: str | None = typer.Option(None, "--workspace", "-w", help="Workspace directory"),
+    config: str | None = typer.Option(None, "--config", "-c", help="Config file path"),
+    playback: bool = typer.Option(False, "--playback/--no-playback", help="Play synthesized audio after generation"),
+    avatar: bool = typer.Option(False, "--avatar/--no-avatar", help="Send speaking intents to avatar runtime"),
+):
+    """Run a persistent local desktop voice chat until interrupted or max turns is reached."""
+    from nanobot.agent.loop import AgentLoop
+    from nanobot.bus.queue import MessageBus
+    from nanobot.config.paths import get_cron_dir
+    from nanobot.cron.service import CronService
+    from nanobot.voice.runtime import DesktopVoiceTurnRunner
+
+    runtime_config = _load_runtime_config(config, workspace)
+    runtime_config = _apply_voice_device_overrides(
+        runtime_config,
+        input_device=input_device,
+        output_device=output_device,
+    )
+    _print_deprecated_memory_window_notice(runtime_config)
+    sync_workspace_templates(runtime_config.workspace_path)
+
+    bus = MessageBus()
+    provider = _make_provider(runtime_config)
+    stt = _make_stt_provider(runtime_config)
+    tts = _make_tts_provider(runtime_config)
+    avatar_runtime = _make_avatar_runtime(runtime_config, enabled=avatar)
+    audio_io = _make_audio_io_from_config(runtime_config, enabled=playback)
+    capture = _make_audio_capture_from_config(
+        runtime_config,
+        backend="sounddevice" if native_capture else None,
+        command_template=list(capture_cmd_part or []),
+    )
+
+    cron_store_path = get_cron_dir() / "jobs.json"
+    cron = CronService(cron_store_path)
+    agent_loop = AgentLoop(
+        bus=bus,
+        provider=provider,
+        workspace=runtime_config.workspace_path,
+        model=runtime_config.agents.defaults.model,
+        max_iterations=runtime_config.agents.defaults.max_tool_iterations,
+        context_window_tokens=runtime_config.agents.defaults.context_window_tokens,
+        web_search_config=runtime_config.tools.web.search,
+        web_proxy=runtime_config.tools.web.proxy or None,
+        exec_config=runtime_config.tools.exec,
+        cron_service=cron,
+        restrict_to_workspace=runtime_config.tools.restrict_to_workspace,
+        mcp_servers=runtime_config.tools.mcp_servers,
+        channels_config=runtime_config.channels,
+        owner_ids=runtime_config.agents.identity.owner_ids,
+    )
+
+    if output_dir:
+        target_dir = Path(output_dir).expanduser().resolve()
+    else:
+        target_dir = runtime_config.workspace_path / "runtime" / "desktop_voice"
+
+    if ":" in session_id:
+        channel, chat_id = session_id.split(":", 1)
+    else:
+        channel, chat_id = "cli", session_id
+
+    async def _run() -> None:
+        from nanobot.avatar import DesktopVoiceAvatarOrchestrator
+
+        orchestrator = DesktopVoiceAvatarOrchestrator(
+            stt=stt,
+            tts=tts,
+            avatar=avatar_runtime,
+            audio_io=audio_io,
+        )
+        runner = DesktopVoiceTurnRunner(
+            orchestrator=orchestrator,
+            agent=agent_loop,
+            output_dir=target_dir,
+            session_key=session_id,
+            channel=channel,
+            chat_id=chat_id,
+        )
+
+        turn = 0
+        try:
+            await orchestrator.start()
+            while True:
+                turn += 1
+                if max_turns > 0 and turn > max_turns:
+                    break
+                console.print(f"[cyan]Chat turn {turn}[/cyan]")
+                result = await runner.run_turn_from_capture(
+                    capture,
+                    duration_s=duration or runtime_config.voice.capture.duration_s,
+                    language=runtime_config.voice.stt.language,
+                    voice=runtime_config.voice.tts.voice,
+                )
+                console.print(f"[green]Input audio:[/green] {result.input_audio}")
+                console.print(f"[green]Transcript:[/green] {result.transcript or '(empty)'}")
+                console.print(f"[green]Response:[/green] {result.response}")
+                console.print(f"[green]Synthesized audio:[/green] {result.synthesized_audio}")
+                if stop_on_empty and not result.transcript.strip():
+                    console.print("[yellow]Stopping because transcript is empty.[/yellow]")
+                    break
+        except KeyboardInterrupt:
+            console.print("\nStopping desktop voice chat...")
+        finally:
+            await orchestrator.shutdown()
+            await agent_loop.close_mcp()
+
+    asyncio.run(_run())
+
+
+@app.command("desktop-voice-say")
+def desktop_voice_say(
+    text: str = typer.Option(..., "--text", "-t", help="Text to speak locally"),
+    output_dir: str | None = typer.Option(None, "--output-dir", help="Directory for synthesized outputs"),
+    output_device: str | None = typer.Option(None, "--output-device", help="Override playback output device (index or name)"),
+    workspace: str | None = typer.Option(None, "--workspace", "-w", help="Workspace directory"),
+    config: str | None = typer.Option(None, "--config", "-c", help="Config file path"),
+    playback: bool = typer.Option(True, "--playback/--no-playback", help="Play synthesized audio after generation"),
+    avatar: bool = typer.Option(False, "--avatar/--no-avatar", help="Send speaking intents to avatar runtime"),
+):
+    """Speak one local text output through the desktop voice output chain."""
+    from nanobot.avatar import DesktopVoiceAvatarOrchestrator
+
+    runtime_config = _load_runtime_config(config, workspace)
+    runtime_config = _apply_voice_device_overrides(runtime_config, output_device=output_device)
+    _print_deprecated_memory_window_notice(runtime_config)
+    sync_workspace_templates(runtime_config.workspace_path)
+
+    tts = _make_tts_provider(runtime_config)
+    avatar_runtime = _make_avatar_runtime(runtime_config, enabled=avatar)
+    audio_io = _make_audio_io_from_config(runtime_config, enabled=playback)
+
+    if output_dir:
+        target_dir = Path(output_dir).expanduser().resolve()
+    else:
+        target_dir = runtime_config.workspace_path / "runtime" / "desktop_voice"
+    target_dir.mkdir(parents=True, exist_ok=True)
+    output_path = target_dir / "say-output.mp3"
+
+    async def _run() -> None:
+        from nanobot.avatar import NullAvatarRuntime
+        from nanobot.providers.stt.base import BaseSTTProvider, STTResult
+
+        class _NoopSTT(BaseSTTProvider):
+            @property
+            def name(self) -> str:
+                return "noop"
+
+            async def transcribe_file(self, file_path, *, language=None):  # noqa: ANN001
+                _ = file_path, language
+                return STTResult(text="")
+
+        orchestrator = DesktopVoiceAvatarOrchestrator(
+            stt=_NoopSTT(),
+            tts=tts,
+            avatar=avatar_runtime if avatar else NullAvatarRuntime(),
+            audio_io=audio_io,
+        )
+        try:
+            await orchestrator.start()
+            from nanobot.voice.runtime import infer_expression_from_text
+
+            expression = infer_expression_from_text(text)
+            result = await orchestrator.speak_text(
+                text,
+                output_path,
+                voice=runtime_config.voice.tts.voice,
+                expression=expression,
+            )
+            console.print(f"[green]Spoken text:[/green] {text}")
+            console.print(f"[green]Synthesized audio:[/green] {result.path}")
+        finally:
+            await orchestrator.shutdown()
+
+    asyncio.run(_run())
+
+
 # ============================================================================
 # News Digest
 # ============================================================================
@@ -851,12 +1513,12 @@ def news_digest(
     """Collect news from RSS/Atom feeds and optionally push a digest."""
     import sys
     from pathlib import Path
-    
+
     # Add workspace to path for utils import
     workspace_root = Path(__file__).resolve().parents[2] / "workspace"
     if str(workspace_root) not in sys.path:
         sys.path.insert(0, str(workspace_root))
-    
+
     from utils.news_digest import run_news_digest
 
     config_path = Path(config).expanduser().resolve()
@@ -912,7 +1574,7 @@ def channels_status():
     table.add_column("Enabled", style="green")
 
     for name, cls in sorted(discover_all().items()):
-        section = getattr(config.channels, name, None)
+        section = get_channel_section(config.channels, name)
         if section is None:
             enabled = False
         elif isinstance(section, dict):
@@ -989,36 +1651,61 @@ def _get_bridge_dir() -> Path:
 
 
 @channels_app.command("login")
-def channels_login():
-    """Link device via QR code."""
+def channels_login(
+    channel_name: str = typer.Argument(..., help="Channel name to authenticate"),
+    force: bool = typer.Option(False, "--force", help="Force re-authentication"),
+):
+    """Link/authenticate a channel interactively."""
     import shutil
     import subprocess
 
+    from nanobot.bus.queue import MessageBus
+    from nanobot.channels.registry import discover_all
     from nanobot.config.loader import load_config
     from nanobot.config.paths import get_runtime_subdir
 
     config = load_config()
-    bridge_dir = _get_bridge_dir()
-
-    console.print(f"{__logo__} Starting bridge...")
-    console.print("Scan the QR code to connect.\n")
-
-    env = {**os.environ}
-    wa_cfg = getattr(config.channels, "whatsapp", None) or {}
-    bridge_token = wa_cfg.get("bridgeToken", "") if isinstance(wa_cfg, dict) else getattr(wa_cfg, "bridge_token", "")
-    if bridge_token:
-        env["BRIDGE_TOKEN"] = bridge_token
-    env["AUTH_DIR"] = str(get_runtime_subdir("whatsapp-auth"))
-
-    npm_path = shutil.which("npm")
-    if not npm_path:
-        console.print("[red]npm not found. Please install Node.js.[/red]")
+    all_channels = discover_all()
+    cls = all_channels.get(channel_name)
+    if cls is None:
+        console.print(f"[red]Unknown channel: {channel_name}[/red]")
         raise typer.Exit(1)
 
-    try:
-        subprocess.run([npm_path, "start"], cwd=bridge_dir, check=True, env=env)
-    except subprocess.CalledProcessError as e:
-        console.print(f"[red]Bridge failed: {e}[/red]")
+    if channel_name == "whatsapp":
+        bridge_dir = _get_bridge_dir()
+
+        console.print(f"{__logo__} Starting bridge...")
+        console.print("Scan the QR code to connect.\n")
+
+        env = {**os.environ}
+        wa_cfg = get_channel_section(config.channels, "whatsapp") or {}
+        bridge_token = wa_cfg.get("bridgeToken", "") if isinstance(wa_cfg, dict) else getattr(wa_cfg, "bridge_token", "")
+        if bridge_token:
+            env["BRIDGE_TOKEN"] = bridge_token
+        env["AUTH_DIR"] = str(get_runtime_subdir("whatsapp-auth"))
+
+        npm_path = shutil.which("npm")
+        if not npm_path:
+            console.print("[red]npm not found. Please install Node.js.[/red]")
+            raise typer.Exit(1)
+
+        try:
+            subprocess.run([npm_path, "start"], cwd=bridge_dir, check=True, env=env)
+        except subprocess.CalledProcessError as e:
+            console.print(f"[red]Bridge failed: {e}[/red]")
+        return
+
+    section = get_channel_section(config.channels, channel_name)
+    if section is None:
+        section = cls.default_config()
+
+    channel = cls(section, MessageBus())
+    ok = asyncio.run(channel.login(force=force))
+    if ok:
+        console.print(f"[green]✓[/green] {cls.display_name} login completed")
+    else:
+        console.print(f"[red]Login failed for {cls.display_name}[/red]")
+        raise typer.Exit(1)
 
 
 # ============================================================================
@@ -1047,7 +1734,7 @@ def plugins_list():
     for name in sorted(all_channels):
         cls = all_channels[name]
         source = "builtin" if name in builtin_names else "plugin"
-        section = getattr(config.channels, name, None)
+        section = get_channel_section(config.channels, name)
         if section is None:
             enabled = False
         elif isinstance(section, dict):

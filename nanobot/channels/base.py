@@ -35,6 +35,11 @@ class BaseChannel(ABC):
         self.config = config
         self.bus = bus
         self._running = False
+        self._runtime_config: Any | None = None
+
+    def set_runtime_config(self, runtime_config: Any) -> None:
+        """Inject root runtime configuration when a channel needs global settings."""
+        self._runtime_config = runtime_config
 
     async def transcribe_audio(self, file_path: str | Path) -> str:
         """Transcribe an audio file via Groq Whisper. Returns empty string on failure."""
