@@ -121,7 +121,7 @@ class AgentLoop:
         self.owner_ids = {str(item).strip() for item in (owner_ids or []) if str(item).strip()}
 
         self.context = ContextBuilder(workspace, owner_ids=list(self.owner_ids))
-        self.sessions = session_manager or SessionManager(workspace)
+        self.sessions = session_manager or SessionManager(workspace, owner_ids=self.owner_ids)
         self.tools = ToolRegistry()
         self.codex_jobs = CodexJobManager(workspace=workspace, bus=bus)
         self.cc_jobs = ClaudeCodeJobManager(workspace=workspace, bus=bus)
@@ -644,8 +644,8 @@ class AgentLoop:
                 messages,
                 allowed_tool_names=set(self.tools.tool_names),
             )
-            self._save_turn(session, all_msgs, 1 + len(fitted_history))
-            self.sessions.save(session)
+            self._save_turn(session, all_msgs, 1 + len(fitted_history), channel=channel)
+            self.sessions.save(session, channel=channel)
             self._schedule_background(self.memory_consolidator.maybe_consolidate_by_tokens(session))
             return OutboundMessage(channel=channel, chat_id=chat_id,
                                   content=final_content or "Background task completed.")
@@ -668,7 +668,7 @@ class AgentLoop:
         if cmd == "/new":
             snapshot = session.messages[session.last_consolidated:]
             session.clear()
-            self.sessions.save(session)
+            self.sessions.save(session, channel=msg.channel)
             self.sessions.invalidate(session.key)
 
             if snapshot:
@@ -743,8 +743,8 @@ class AgentLoop:
         if final_content is None:
             final_content = "诺亚搞定啦！但是偷懒没有回复。。。"
 
-        self._save_turn(session, all_msgs, 1 + len(fitted_history))
-        self.sessions.save(session)
+        self._save_turn(session, all_msgs, 1 + len(fitted_history), channel=msg.channel)
+        self.sessions.save(session, channel=msg.channel)
         self._schedule_background(self.memory_consolidator.maybe_consolidate_by_tokens(session))
 
         for tool_name in ("message", "noah_local_painter"):
@@ -759,9 +759,10 @@ class AgentLoop:
             metadata=msg.metadata or {},
         )
 
-    def _save_turn(self, session: Session, messages: list[dict], skip: int) -> None:
+    def _save_turn(self, session: Session, messages: list[dict], skip: int, channel: str | None = None) -> None:
         """Save new-turn messages into session, truncating large tool results."""
         from datetime import datetime
+        is_owner = self.sessions.is_owner_session(session.key)
         for m in messages[skip:]:
             entry = dict(m)
             role, content = entry.get("role"), entry.get("content")
@@ -802,6 +803,9 @@ class AgentLoop:
                             filtered.insert(0, {"type": "text", "text": prefix.rstrip()})
                     entry["content"] = filtered
             entry.setdefault("timestamp", datetime.now().isoformat())
+            # Add source_channel for owner shared sessions
+            if is_owner and channel and "source_channel" not in entry:
+                entry["source_channel"] = channel
             session.messages.append(entry)
         session.updated_at = datetime.now()
 

@@ -2,6 +2,7 @@
 
 import json
 import shutil
+import threading
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -130,16 +131,37 @@ class SessionManager:
     Manages conversation sessions.
 
     Sessions are stored as JSONL files in the sessions directory.
+    Owner sessions are merged into a shared file (owner_shared.jsonl).
     """
 
-    def __init__(self, workspace: Path):
+    _OWNER_SHARED_KEY = "owner:shared"
+    _OWNER_SHARED_FILENAME = "owner_shared.jsonl"
+
+    def __init__(self, workspace: Path, owner_ids: set[str] | None = None):
         self.workspace = workspace
         self.sessions_dir = ensure_dir(self.workspace / "sessions")
         self.legacy_sessions_dir = get_legacy_sessions_dir()
         self._cache: dict[str, Session] = {}
+        self._owner_ids = owner_ids or set()
+        # threading.Lock works in both sync and async contexts for single-process safety
+        self._owner_write_lock = threading.Lock()
+
+    def is_owner_session(self, key: str) -> bool:
+        """Check if a session key belongs to the owner."""
+        if not self._owner_ids:
+            return False
+        # key format is typically "channel:chat_id"
+        candidates = {key}
+        if ":" in key:
+            channel, chat_id = key.split(":", 1)
+            candidates.add(chat_id)
+            candidates.add(f"{channel}:{chat_id}")
+        return any(c in self._owner_ids for c in candidates)
 
     def _get_session_path(self, key: str) -> Path:
-        """Get the file path for a session."""
+        """Get the file path for a session. Owner sessions route to shared file."""
+        if self.is_owner_session(key):
+            return self.sessions_dir / self._OWNER_SHARED_FILENAME
         safe_key = safe_filename(key.replace(":", "_"))
         return self.sessions_dir / f"{safe_key}.jsonl"
 
@@ -147,6 +169,12 @@ class SessionManager:
         """Legacy global session path (~/.nanobot/sessions/)."""
         safe_key = safe_filename(key.replace(":", "_"))
         return self.legacy_sessions_dir / f"{safe_key}.jsonl"
+
+    def _resolve_cache_key(self, key: str) -> str:
+        """Return the cache key to use. Owner sessions all share one key."""
+        if self.is_owner_session(key):
+            return self._OWNER_SHARED_KEY
+        return key
 
     def get_or_create(self, key: str) -> Session:
         """
@@ -158,14 +186,15 @@ class SessionManager:
         Returns:
             The session.
         """
-        if key in self._cache:
-            return self._cache[key]
+        cache_key = self._resolve_cache_key(key)
+        if cache_key in self._cache:
+            return self._cache[cache_key]
 
         session = self._load(key)
         if session is None:
-            session = Session(key=key)
+            session = Session(key=cache_key)
 
-        self._cache[key] = session
+        self._cache[cache_key] = session
         return session
 
     def _load(self, key: str) -> Session | None:
@@ -204,8 +233,11 @@ class SessionManager:
                     else:
                         messages.append(data)
 
+            # For owner sessions, use a consistent key so cache works across channels
+            effective_key = self._OWNER_SHARED_KEY if self.is_owner_session(key) else key
+
             return Session(
-                key=key,
+                key=effective_key,
                 messages=messages,
                 created_at=created_at or datetime.now(),
                 metadata=metadata,
@@ -215,28 +247,36 @@ class SessionManager:
             logger.warning("Failed to load session {}: {}", key, e)
             return None
 
-    def save(self, session: Session) -> None:
-        """Save a session to disk."""
+    def save(self, session: Session, channel: str | None = None) -> None:
+        """Save a session to disk. For owner sessions, uses a write lock."""
         path = self._get_session_path(session.key)
 
-        with open(path, "w", encoding="utf-8") as f:
-            metadata_line = {
-                "_type": "metadata",
-                "key": session.key,
-                "created_at": session.created_at.isoformat(),
-                "updated_at": session.updated_at.isoformat(),
-                "metadata": session.metadata,
-                "last_consolidated": session.last_consolidated
-            }
-            f.write(json.dumps(metadata_line, ensure_ascii=False) + "\n")
-            for msg in session.messages:
-                f.write(json.dumps(msg, ensure_ascii=False) + "\n")
+        def _do_save():
+            with open(path, "w", encoding="utf-8") as f:
+                metadata_line = {
+                    "_type": "metadata",
+                    "key": self._OWNER_SHARED_KEY if self.is_owner_session(session.key) else session.key,
+                    "created_at": session.created_at.isoformat(),
+                    "updated_at": session.updated_at.isoformat(),
+                    "metadata": session.metadata,
+                    "last_consolidated": session.last_consolidated
+                }
+                f.write(json.dumps(metadata_line, ensure_ascii=False) + "\n")
+                for msg in session.messages:
+                    f.write(json.dumps(msg, ensure_ascii=False) + "\n")
+
+        if self.is_owner_session(session.key):
+            with self._owner_write_lock:
+                _do_save()
+        else:
+            _do_save()
 
         self._cache[session.key] = session
 
     def invalidate(self, key: str) -> None:
         """Remove a session from the in-memory cache."""
-        self._cache.pop(key, None)
+        cache_key = self._resolve_cache_key(key)
+        self._cache.pop(cache_key, None)
 
     def list_sessions(self) -> list[dict[str, Any]]:
         """

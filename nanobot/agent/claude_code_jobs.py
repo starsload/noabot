@@ -519,11 +519,30 @@ class ClaudeCodeJobManager:
             task.strip(),
             "",
             "Work directly in the repository and finish the implementation end-to-end.",
-            "When you are done, summarize the files you changed and any validation you ran.",
         ]
         if acceptance:
-            lines.extend(["", "Acceptance criteria:"])
-            lines.extend(f"- {item}" for item in acceptance)
+            lines.extend(["", "## Acceptance Criteria (MUST VERIFY ALL BEFORE FINISHING)", ""])
+            lines.extend(f"- [ ] {item}" for item in acceptance)
+            lines.extend([
+                "",
+                "## Pre-completion Checklist",
+                "",
+                "Before you finish, you MUST explicitly verify each acceptance criterion above:",
+                "1. Confirm every item in the Acceptance Criteria list is satisfied.",
+                "2. For each file you created or modified, verify it exists and contains complete code.",
+                "3. If the repository contains a progress tracking file (e.g. ARCHITECTURE.md, TODO.md, STATUS.md), "
+                "update it to reflect completed work (change ❌/pending to ✅/done).",
+                "4. Only after ALL criteria are met, summarize your changes and finish.",
+                "",
+                "Do NOT skip this checklist. If any criterion is not met, complete it before finishing.",
+            ])
+        else:
+            lines.extend(["", "When you are done, summarize the files you changed and any validation you ran.", ""])
+            lines.extend([
+                "IMPORTANT: If the repository contains a progress tracking file (e.g. ARCHITECTURE.md, TODO.md, STATUS.md, or similar), "
+                "you MUST update it to reflect the completed work. Change status markers from ❌/pending to ✅/done for files you created or modified. "
+                "This is not optional — always check for and update progress documentation before finishing.",
+            ])
         return "\n".join(lines).strip()
 
     @staticmethod
@@ -532,13 +551,34 @@ class ClaudeCodeJobManager:
             "Resume the existing task in the current workspace state.",
             "Do not restart from scratch.",
             "Inspect the current diff and continue until the task is complete.",
-            "When finished, summarize changed files and validation.",
         ]
+        acceptance = job.acceptance
         if extra_prompt and extra_prompt.strip():
             lines.extend(["", extra_prompt.strip()])
-        elif job.acceptance:
-            lines.extend(["", "Acceptance criteria:"])
-            lines.extend(f"- {item}" for item in job.acceptance)
+        if acceptance:
+            lines.extend(["", "## Acceptance Criteria (MUST VERIFY ALL BEFORE FINISHING)", ""])
+            lines.extend(f"- [ ] {item}" for item in acceptance)
+            lines.extend([
+                "",
+                "## Pre-completion Checklist",
+                "",
+                "Before you finish, you MUST explicitly verify each acceptance criterion above:",
+                "1. Confirm every item in the Acceptance Criteria list is satisfied.",
+                "2. For each file you created or modified, verify it exists and contains complete code.",
+                "3. If the repository contains a progress tracking file (e.g. ARCHITECTURE.md, TODO.md, STATUS.md), "
+                "update it to reflect completed work (change ❌/pending to ✅/done).",
+                "4. Only after ALL criteria are met, summarize your changes and finish.",
+                "",
+                "Do NOT skip this checklist. If any criterion is not met, complete it before finishing.",
+            ])
+        else:
+            lines.extend([
+                "When finished, summarize changed files and validation.",
+                "",
+                "IMPORTANT: If the repository contains a progress tracking file (e.g. ARCHITECTURE.md, TODO.md, STATUS.md, or similar), "
+                "you MUST update it to reflect the completed work. Change status markers from ❌/pending to ✅/done for files you created or modified. "
+                "This is not optional — always check for and update progress documentation before finishing.",
+            ])
         return "\n".join(lines)
 
     @classmethod
