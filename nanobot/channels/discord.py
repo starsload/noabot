@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import Any, Literal
 
 import httpx
-from pydantic import Field
+from pydantic import ConfigDict, Field
 import websockets
 from loguru import logger
 
@@ -25,6 +25,7 @@ MAX_MESSAGE_LEN = 2000  # Discord message character limit
 class DiscordConfig(Base):
     """Discord channel configuration."""
 
+    model_config = ConfigDict(extra="allow")  # Accept merge_owner_in_group and other extra fields
     enabled: bool = False
     token: str = ""
     allow_from: list[str] = Field(default_factory=list)

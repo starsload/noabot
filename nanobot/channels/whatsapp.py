@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Any, Literal
 
 from loguru import logger
-from pydantic import Field
+from pydantic import ConfigDict, Field
 
 from nanobot.bus.events import OutboundMessage
 from nanobot.bus.queue import MessageBus
@@ -22,6 +22,7 @@ from nanobot.config.schema import Base
 class WhatsAppConfig(Base):
     """WhatsApp channel configuration."""
 
+    model_config = ConfigDict(extra="allow")  # Accept merge_owner_in_group and other extra fields
     enabled: bool = False
     bridge_url: str = "ws://localhost:3001"
     bridge_token: str = ""

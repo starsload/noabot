@@ -16,7 +16,7 @@ from nanobot.bus.queue import MessageBus
 from nanobot.channels.base import BaseChannel
 from nanobot.config.paths import get_media_dir
 from nanobot.config.schema import Base
-from pydantic import Field
+from pydantic import ConfigDict, Field
 
 import importlib.util
 
@@ -239,6 +239,7 @@ def _extract_post_text(content_json: dict) -> str:
 class FeishuConfig(Base):
     """Feishu/Lark channel configuration using WebSocket long connection."""
 
+    model_config = ConfigDict(extra="allow")  # Accept merge_owner_in_group and other extra fields
     enabled: bool = False
     app_id: str = ""
     app_secret: str = ""

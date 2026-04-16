@@ -11,7 +11,7 @@ from urllib.parse import unquote, urlparse
 
 import httpx
 from loguru import logger
-from pydantic import Field
+from pydantic import ConfigDict, Field
 
 from nanobot.bus.events import OutboundMessage
 from nanobot.bus.queue import MessageBus
@@ -149,6 +149,7 @@ class NanobotDingTalkHandler(CallbackHandler):
 class DingTalkConfig(Base):
     """DingTalk channel configuration using Stream mode."""
 
+    model_config = ConfigDict(extra="allow")  # Accept merge_owner_in_group and other extra fields
     enabled: bool = False
     client_id: str = ""
     client_secret: str = ""

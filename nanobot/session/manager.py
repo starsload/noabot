@@ -148,6 +148,9 @@ class SessionManager:
 
     def is_owner_session(self, key: str) -> bool:
         """Check if a session key belongs to the owner."""
+        # Direct owner:shared key (set by channel layer via session_key_override)
+        if key == self._OWNER_SHARED_KEY:
+            return True
         if not self._owner_ids:
             return False
         # key format is typically "channel:chat_id"

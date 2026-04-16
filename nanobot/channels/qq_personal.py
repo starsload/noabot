@@ -15,7 +15,7 @@ from urllib.parse import unquote, urlparse
 
 import aiohttp
 from loguru import logger
-from pydantic import Field
+from pydantic import ConfigDict, Field
 from typing import Literal
 
 from nanobot.bus.events import InboundMessage, OutboundMessage
@@ -66,6 +66,7 @@ def _maybe_numeric_id(value: str) -> int | str:
 class QQPersonalConfig(Base):
     """QQ personal-account channel configuration via OneBot 11 bridge."""
 
+    model_config = ConfigDict(extra="allow")  # Accept merge_owner_in_group and other extra fields
     enabled: bool = False
     ws_url: str = "ws://127.0.0.1:3001"
     http_url: str = "http://127.0.0.1:3000"

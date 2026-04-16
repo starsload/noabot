@@ -13,7 +13,7 @@ from slackify_markdown import slackify_markdown
 
 from nanobot.bus.events import OutboundMessage
 from nanobot.bus.queue import MessageBus
-from pydantic import Field
+from pydantic import ConfigDict, Field
 
 from nanobot.channels.base import BaseChannel
 from nanobot.config.schema import Base
@@ -30,6 +30,7 @@ class SlackDMConfig(Base):
 class SlackConfig(Base):
     """Slack channel configuration."""
 
+    model_config = ConfigDict(extra="allow")  # Accept merge_owner_in_group and other extra fields
     enabled: bool = False
     mode: str = "socket"
     webhook_path: str = "/slack/events"

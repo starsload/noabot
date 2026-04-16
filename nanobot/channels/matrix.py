@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Any, Literal, TypeAlias
 
 from loguru import logger
-from pydantic import Field
+from pydantic import ConfigDict, Field
 
 try:
     import nh3
@@ -148,6 +148,7 @@ def _configure_nio_logging_bridge() -> None:
 class MatrixConfig(Base):
     """Matrix (Element) channel configuration."""
 
+    model_config = ConfigDict(extra="allow")  # Accept merge_owner_in_group and other extra fields
     enabled: bool = False
     homeserver: str = "https://matrix.org"
     access_token: str = ""

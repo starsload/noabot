@@ -10,7 +10,7 @@ from dataclasses import dataclass, field
 from typing import Any, Literal
 
 from loguru import logger
-from pydantic import Field
+from pydantic import ConfigDict, Field
 from telegram import BotCommand, ReactionTypeEmoji, ReplyParameters, Update
 from telegram.error import BadRequest, TimedOut
 from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
@@ -169,6 +169,7 @@ class _StreamBuf:
 class TelegramConfig(Base):
     """Telegram channel configuration."""
 
+    model_config = ConfigDict(extra="allow")  # Accept merge_owner_in_group and other extra fields
     enabled: bool = False
     token: str = ""
     allow_from: list[str] = Field(default_factory=list)
