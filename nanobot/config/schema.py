@@ -59,14 +59,20 @@ class AgentDefaults(Base):
     )
     max_tokens: int = 8192
     context_window_tokens: int = 65_536
+    context_block_limit: int | None = None
     temperature: float = 0.1
     max_tool_iterations: int = 40
+    max_tool_result_chars: int = 16_000
+    provider_retry_mode: Literal["standard", "persistent"] = "standard"
     reasoning_effort: str | None = None  # low / medium / high - enables LLM thinking mode
     thinking_budget_tokens: int | None = Field(
         default=None,
         ge=1,
     )  # Provider-specific reasoning budget; Qwen maps this to thinking_budget
     timezone: str = "UTC"  # IANA timezone, e.g. "Asia/Shanghai", "America/New_York"
+    unified_session: bool = False  # Share one session across all channels
+    disabled_skills: list[str] = Field(default_factory=list)
+    session_ttl_minutes: int = Field(default=0, ge=0)  # Auto-compact idle threshold
     should_warn_deprecated_memory_window: bool = Field(default=False, exclude=True)
 
 
@@ -145,11 +151,13 @@ class WebSearchConfig(Base):
     api_key: str = ""
     base_url: str = ""  # SearXNG base URL
     max_results: int = 5
+    timeout: int = 30  # Wall-clock timeout (seconds) for search operations
 
 
 class WebToolsConfig(Base):
     """Web tools configuration."""
 
+    enable: bool = True
     proxy: str | None = (
         None  # HTTP/SOCKS5 proxy URL, e.g. "http://127.0.0.1:7890" or "socks5://127.0.0.1:1080"
     )
@@ -162,6 +170,8 @@ class ExecToolConfig(Base):
     enable: bool = True
     timeout: int = 60
     path_append: str = ""
+    sandbox: str = ""  # sandbox backend: "" (none) or "bwrap"
+    allowed_env_keys: list[str] = Field(default_factory=list)  # Env var names to pass through
 
 class MCPServerConfig(Base):
     """MCP server connection configuration (stdio or HTTP)."""

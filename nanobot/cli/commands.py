@@ -618,15 +618,20 @@ def gateway(
         model=config.agents.defaults.model,
         max_iterations=config.agents.defaults.max_tool_iterations,
         context_window_tokens=config.agents.defaults.context_window_tokens,
-        web_search_config=config.tools.web.search,
-        web_proxy=config.tools.web.proxy or None,
+        web_config=config.tools.web,
+        context_block_limit=config.agents.defaults.context_block_limit,
+        max_tool_result_chars=config.agents.defaults.max_tool_result_chars,
+        provider_retry_mode=config.agents.defaults.provider_retry_mode,
         exec_config=config.tools.exec,
         cron_service=cron,
         restrict_to_workspace=config.tools.restrict_to_workspace,
         session_manager=session_manager,
         mcp_servers=config.tools.mcp_servers,
         channels_config=config.channels,
-        owner_ids=config.agents.identity.owner_ids,
+        timezone=config.agents.defaults.timezone,
+        unified_session=config.agents.defaults.unified_session,
+        disabled_skills=config.agents.defaults.disabled_skills,
+        session_ttl_minutes=config.agents.defaults.session_ttl_minutes,
     )
 
     # Set cron callback (needs agent)
