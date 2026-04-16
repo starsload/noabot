@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import uuid
 from typing import Any
 
@@ -10,13 +11,29 @@ from openai import AsyncOpenAI
 
 from nanobot.providers.base import LLMProvider, LLMResponse, ToolCallRequest
 from nanobot.providers.openai_responses import (
-    build_prompt_cache_key,
-    convert_messages_to_responses_input,
-    convert_tool_choice_to_responses,
-    convert_tools_to_responses_tools,
-    parse_responses_api_response,
+    convert_messages,
+    convert_tools,
+    parse_response_output,
 )
 from nanobot.utils.helpers import estimate_prompt_tokens as estimate_prompt_tokens_fallback
+
+
+def _build_prompt_cache_key(messages: list[dict[str, Any]], model: str) -> str:
+    """Build a deterministic cache key from messages and model."""
+    content = model + "\n" + str(messages)
+    return hashlib.sha256(content.encode()).hexdigest()[:32]
+
+
+def _convert_tool_choice_for_responses(tool_choice: str | dict[str, Any] | None) -> str | dict[str, Any] | None:
+    """Normalize tool_choice for Responses API format."""
+    if tool_choice is None or isinstance(tool_choice, str):
+        return tool_choice
+    if isinstance(tool_choice, dict) and tool_choice.get("type") == "function":
+        fn = tool_choice.get("function") or {}
+        name = tool_choice.get("name") or fn.get("name")
+        if name:
+            return {"type": "function", "name": name}
+    return tool_choice
 
 
 class CustomProvider(LLMProvider):
@@ -276,14 +293,14 @@ class CustomProvider(LLMProvider):
         tool_choice: str | dict[str, Any] | None = None,
     ) -> LLMResponse:
         model_name = model or self.default_model
-        instructions, input_items = convert_messages_to_responses_input(
+        instructions, input_items = convert_messages(
             self._prepare_request_messages(messages, model_name)
         )
         kwargs: dict[str, Any] = {
             "model": model_name,
             "input": input_items,
             "max_output_tokens": max(1, max_tokens),
-            "prompt_cache_key": build_prompt_cache_key(
+            "prompt_cache_key": _build_prompt_cache_key(
                 messages,
                 model=model_name,
             ),
@@ -297,11 +314,11 @@ class CustomProvider(LLMProvider):
         elif reasoning_effort:
             kwargs["reasoning"] = {"effort": reasoning_effort}
         if tools:
-            kwargs["tools"] = convert_tools_to_responses_tools(tools)
-            kwargs["tool_choice"] = convert_tool_choice_to_responses(tool_choice or "auto")
+            kwargs["tools"] = convert_tools(tools)
+            kwargs["tool_choice"] = _convert_tool_choice_for_responses(tool_choice or "auto")
             kwargs["parallel_tool_calls"] = True
         response = await self._client.responses.create(**kwargs)
-        return parse_responses_api_response(response)
+        return parse_response_output(response)
 
     def estimate_prompt_tokens(
         self,

@@ -5,7 +5,8 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
-from typing import Any, AsyncGenerator
+from collections.abc import Awaitable, Callable
+from typing import Any
 
 import httpx
 from loguru import logger
@@ -13,11 +14,9 @@ from oauth_cli_kit import get_token as get_codex_token
 
 from nanobot.providers.base import LLMProvider, LLMResponse, ToolCallRequest
 from nanobot.providers.openai_responses import (
-    convert_messages_to_responses_input,
-    convert_tool_choice_to_responses,
-    convert_tools_to_responses_tools,
-    join_tool_call_id,
-    map_responses_finish_reason,
+    consume_sse,
+    convert_messages,
+    convert_tools,
 )
 
 DEFAULT_CODEX_URL = "https://chatgpt.com/backend-api/codex/responses"
@@ -31,18 +30,18 @@ class OpenAICodexProvider(LLMProvider):
         super().__init__(api_key=None, api_base=None)
         self.default_model = default_model
 
-    async def chat(
+    async def _call_codex(
         self,
         messages: list[dict[str, Any]],
-        tools: list[dict[str, Any]] | None = None,
-        model: str | None = None,
-        max_tokens: int = 4096,
-        temperature: float = 0.7,
-        reasoning_effort: str | None = None,
-        tool_choice: str | dict[str, Any] | None = None,
+        tools: list[dict[str, Any]] | None,
+        model: str | None,
+        reasoning_effort: str | None,
+        tool_choice: str | dict[str, Any] | None,
+        on_content_delta: Callable[[str], Awaitable[None]] | None = None,
     ) -> LLMResponse:
+        """Shared request logic for both chat() and chat_stream()."""
         model = model or self.default_model
-        system_prompt, input_items = convert_messages_to_responses_input(messages)
+        system_prompt, input_items = convert_messages(messages)
 
         token = await asyncio.to_thread(get_codex_token)
         headers = _build_headers(token.account_id, token.access)
@@ -56,36 +55,50 @@ class OpenAICodexProvider(LLMProvider):
             "text": {"verbosity": "medium"},
             "include": ["reasoning.encrypted_content"],
             "prompt_cache_key": _prompt_cache_key(messages),
-            "tool_choice": convert_tool_choice_to_responses(tool_choice or "auto"),
+            "tool_choice": tool_choice or "auto",
             "parallel_tool_calls": True,
         }
-
         if reasoning_effort:
             body["reasoning"] = {"effort": reasoning_effort}
-
         if tools:
-            body["tools"] = convert_tools_to_responses_tools(tools)
-
-        url = DEFAULT_CODEX_URL
+            body["tools"] = convert_tools(tools)
 
         try:
             try:
-                content, tool_calls, finish_reason = await _request_codex(url, headers, body, verify=True)
+                content, tool_calls, finish_reason = await _request_codex(
+                    DEFAULT_CODEX_URL, headers, body, verify=True,
+                    on_content_delta=on_content_delta,
+                )
             except Exception as e:
                 if "CERTIFICATE_VERIFY_FAILED" not in str(e):
                     raise
-                logger.warning("SSL certificate verification failed for Codex API; retrying with verify=False")
-                content, tool_calls, finish_reason = await _request_codex(url, headers, body, verify=False)
-            return LLMResponse(
-                content=content,
-                tool_calls=tool_calls,
-                finish_reason=finish_reason,
-            )
+                logger.warning("SSL verification failed for Codex API; retrying with verify=False")
+                content, tool_calls, finish_reason = await _request_codex(
+                    DEFAULT_CODEX_URL, headers, body, verify=False,
+                    on_content_delta=on_content_delta,
+                )
+            return LLMResponse(content=content, tool_calls=tool_calls, finish_reason=finish_reason)
         except Exception as e:
-            return LLMResponse(
-                content=f"Error calling Codex: {str(e)}",
-                finish_reason="error",
-            )
+            msg = f"Error calling Codex: {e}"
+            retry_after = getattr(e, "retry_after", None) or self._extract_retry_after(msg)
+            return LLMResponse(content=msg, finish_reason="error", retry_after=retry_after)
+
+    async def chat(
+        self, messages: list[dict[str, Any]], tools: list[dict[str, Any]] | None = None,
+        model: str | None = None, max_tokens: int = 4096, temperature: float = 0.7,
+        reasoning_effort: str | None = None,
+        tool_choice: str | dict[str, Any] | None = None,
+    ) -> LLMResponse:
+        return await self._call_codex(messages, tools, model, reasoning_effort, tool_choice)
+
+    async def chat_stream(
+        self, messages: list[dict[str, Any]], tools: list[dict[str, Any]] | None = None,
+        model: str | None = None, max_tokens: int = 4096, temperature: float = 0.7,
+        reasoning_effort: str | None = None,
+        tool_choice: str | dict[str, Any] | None = None,
+        on_content_delta: Callable[[str], Awaitable[None]] | None = None,
+    ) -> LLMResponse:
+        return await self._call_codex(messages, tools, model, reasoning_effort, tool_choice, on_content_delta)
 
     def get_default_model(self) -> str:
         return self.default_model
@@ -109,102 +122,34 @@ def _build_headers(account_id: str, token: str) -> dict[str, str]:
     }
 
 
+class _CodexHTTPError(RuntimeError):
+    def __init__(self, message: str, retry_after: float | None = None):
+        super().__init__(message)
+        self.retry_after = retry_after
+
+
 async def _request_codex(
     url: str,
     headers: dict[str, str],
     body: dict[str, Any],
     verify: bool,
+    on_content_delta: Callable[[str], Awaitable[None]] | None = None,
 ) -> tuple[str, list[ToolCallRequest], str]:
     async with httpx.AsyncClient(timeout=60.0, verify=verify) as client:
         async with client.stream("POST", url, headers=headers, json=body) as response:
             if response.status_code != 200:
                 text = await response.aread()
-                raise RuntimeError(_friendly_error(response.status_code, text.decode("utf-8", "ignore")))
-            return await _consume_sse(response)
+                retry_after = LLMProvider._extract_retry_after_from_headers(response.headers)
+                raise _CodexHTTPError(
+                    _friendly_error(response.status_code, text.decode("utf-8", "ignore")),
+                    retry_after=retry_after,
+                )
+            return await consume_sse(response, on_content_delta)
+
 
 def _prompt_cache_key(messages: list[dict[str, Any]]) -> str:
     raw = json.dumps(messages, ensure_ascii=True, sort_keys=True)
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
-
-
-async def _iter_sse(response: httpx.Response) -> AsyncGenerator[dict[str, Any], None]:
-    buffer: list[str] = []
-    async for line in response.aiter_lines():
-        if line == "":
-            if buffer:
-                data_lines = [data_line[5:].strip() for data_line in buffer if data_line.startswith("data:")]
-                buffer = []
-                if not data_lines:
-                    continue
-                data = "\n".join(data_lines).strip()
-                if not data or data == "[DONE]":
-                    continue
-                try:
-                    yield json.loads(data)
-                except Exception:
-                    continue
-            continue
-        buffer.append(line)
-
-
-async def _consume_sse(response: httpx.Response) -> tuple[str, list[ToolCallRequest], str]:
-    content = ""
-    tool_calls: list[ToolCallRequest] = []
-    tool_call_buffers: dict[str, dict[str, Any]] = {}
-    finish_reason = "stop"
-
-    async for event in _iter_sse(response):
-        event_type = event.get("type")
-        if event_type == "response.output_item.added":
-            item = event.get("item") or {}
-            if item.get("type") == "function_call":
-                call_id = item.get("call_id")
-                if not call_id:
-                    continue
-                tool_call_buffers[call_id] = {
-                    "id": item.get("id") or "fc_0",
-                    "name": item.get("name"),
-                    "arguments": item.get("arguments") or "",
-                }
-        elif event_type == "response.output_text.delta":
-            content += event.get("delta") or ""
-        elif event_type == "response.function_call_arguments.delta":
-            call_id = event.get("call_id")
-            if call_id and call_id in tool_call_buffers:
-                tool_call_buffers[call_id]["arguments"] += event.get("delta") or ""
-        elif event_type == "response.function_call_arguments.done":
-            call_id = event.get("call_id")
-            if call_id and call_id in tool_call_buffers:
-                tool_call_buffers[call_id]["arguments"] = event.get("arguments") or ""
-        elif event_type == "response.output_item.done":
-            item = event.get("item") or {}
-            if item.get("type") == "function_call":
-                call_id = item.get("call_id")
-                if not call_id:
-                    continue
-                buf = tool_call_buffers.get(call_id) or {}
-                args_raw = buf.get("arguments") or item.get("arguments") or "{}"
-                try:
-                    args = json.loads(args_raw)
-                except Exception:
-                    args = {"raw": args_raw}
-                tool_calls.append(
-                    ToolCallRequest(
-                        id=join_tool_call_id(
-                            call_id,
-                            buf.get("id") or item.get("id") or "fc_0",
-                        ),
-                        name=buf.get("name") or item.get("name"),
-                        arguments=args,
-                    )
-                )
-        elif event_type == "response.completed":
-            status = (event.get("response") or {}).get("status")
-            finish_reason = map_responses_finish_reason(status)
-        elif event_type in {"error", "response.failed"}:
-            raise RuntimeError("Codex response failed")
-
-    return content, tool_calls, finish_reason
 
 
 def _friendly_error(status_code: int, raw: str) -> str:
