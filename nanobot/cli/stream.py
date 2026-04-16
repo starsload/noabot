@@ -18,7 +18,7 @@ from nanobot import __logo__
 
 
 def _make_console() -> Console:
-    return Console(file=sys.stdout)
+    return Console(file=sys.stdout, force_terminal=True)
 
 
 class ThinkingSpinner:
@@ -102,7 +102,7 @@ class StreamRenderer:
             self._live = Live(self._render(), console=c, auto_refresh=False)
             self._live.start()
         now = time.monotonic()
-        if "\n" in delta or (now - self._t) > 0.05:
+        if (now - self._t) > 0.15:
             self._live.update(self._render())
             self._live.refresh()
             self._t = now
@@ -119,6 +119,10 @@ class StreamRenderer:
             self._start_spinner()
         else:
             _make_console().print()
+
+    def stop_for_input(self) -> None:
+        """Stop spinner before user input to avoid prompt_toolkit conflicts."""
+        self._stop_spinner()
 
     async def close(self) -> None:
         """Stop spinner/live without rendering a final streamed round."""
