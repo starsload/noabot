@@ -297,9 +297,16 @@ class AgentLoop:
                 self._mcp_connected = True
             else:
                 logger.warning("No MCP servers connected successfully (will retry next message)")
-        except asyncio.CancelledError:
-            logger.warning("MCP connection cancelled (will retry next message)")
+        except asyncio.CancelledError as exc:
+            logger.warning("MCP connection cancelled (will retry next message): {}", exc)
             self._mcp_stacks.clear()
+            # Clear cancellation state so later awaits can proceed
+            task = asyncio.current_task()
+            if task:
+                uncancel = getattr(task, "uncancel", None)
+                if callable(uncancel):
+                    while task.cancelling() > 0:
+                        uncancel()
         except BaseException as e:
             logger.error("Failed to connect MCP servers (will retry next message): {}", e)
             self._mcp_stacks.clear()
@@ -334,6 +341,26 @@ class AgentLoop:
         if self._unified_session and not msg.session_key_override:
             return UNIFIED_SESSION_KEY
         return msg.session_key
+
+    def _has_full_capabilities(self, msg: InboundMessage) -> bool:
+        """Check if the sender has full capabilities (owner privileges).
+
+        Commands like /restart, /stop, /status require owner privileges.
+        If no owner_ids are configured, all users have full capabilities.
+        """
+        owner_ids = self.sessions._owner_ids
+        if not owner_ids:
+            return True
+        # Check sender_id and session_key against owner_ids
+        candidates = {msg.sender_id, msg.session_key}
+        if ":" in msg.session_key:
+            _, chat_id = msg.session_key.split(":", 1)
+            candidates.add(chat_id)
+        return any(c in owner_ids for c in candidates)
+
+    def _owner_only_message(self) -> str:
+        """Return the error message for non-owners trying to use owner-only commands."""
+        return "Only the owner can use this command."
 
     async def _run_agent_loop(
         self,
@@ -966,12 +993,14 @@ class AgentLoop:
         on_progress: Callable[[str], Awaitable[None]] | None = None,
         on_stream: Callable[[str], Awaitable[None]] | None = None,
         on_stream_end: Callable[..., Awaitable[None]] | None = None,
+        sender_id: str = "user",
+        metadata: dict[str, Any] | None = None,
     ) -> OutboundMessage | None:
         """Process a message directly and return the outbound payload."""
         await self._connect_mcp()
         msg = InboundMessage(
-            channel=channel, sender_id="user", chat_id=chat_id,
-            content=content, media=media or [],
+            channel=channel, sender_id=sender_id, chat_id=chat_id,
+            content=content, media=media or [], metadata=metadata or {},
         )
         return await self._process_message(
             msg,

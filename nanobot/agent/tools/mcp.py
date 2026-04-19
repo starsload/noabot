@@ -154,16 +154,17 @@ class MCPToolWrapper(Tool):
 
 
 async def connect_mcp_servers(
-    mcp_servers: dict, registry: ToolRegistry, stack: AsyncExitStack
-) -> tuple[int, int]:
-    """Connect to configured MCP servers and register their tools."""
+    mcp_servers: dict, registry: ToolRegistry
+) -> dict[str, AsyncExitStack]:
+    """Connect to configured MCP servers and register their tools.
+    Returns a dict mapping server name to its AsyncExitStack for cleanup.
+    """
     from mcp import ClientSession, StdioServerParameters
     from mcp.client.sse import sse_client
     from mcp.client.stdio import stdio_client
     from mcp.client.streamable_http import streamable_http_client
 
-    connected_count = 0
-    cancelled_count = 0
+    stacks: dict[str, AsyncExitStack] = {}
 
     for name, cfg in mcp_servers.items():
         try:
@@ -172,7 +173,6 @@ async def connect_mcp_servers(
                 if cfg.command:
                     transport_type = "stdio"
                 elif cfg.url:
-                    # Convention: URLs ending with /sse use SSE transport; others use streamableHttp
                     transport_type = (
                         "sse" if cfg.url.rstrip("/").endswith("/sse") else "streamableHttp"
                     )
@@ -180,9 +180,12 @@ async def connect_mcp_servers(
                     logger.warning("MCP server '{}': no command or url configured, skipping", name)
                     continue
 
+            stack = AsyncExitStack()
+
             if transport_type == "stdio":
                 params = StdioServerParameters(
-                    command=cfg.command, args=cfg.args, env=cfg.env or None
+                    command=cfg.command, args=cfg.args, env=cfg.env or None,
+                    cwd=cfg.cwd or None,
                 )
                 read, write = await stack.enter_async_context(stdio_client(params))
             elif transport_type == "sse":
@@ -203,8 +206,6 @@ async def connect_mcp_servers(
                     sse_client(cfg.url, httpx_client_factory=httpx_client_factory)
                 )
             elif transport_type == "streamableHttp":
-                # Always provide an explicit httpx client so MCP HTTP transport does not
-                # inherit httpx's default 5s timeout and preempt the higher-level tool timeout.
                 http_client = await stack.enter_async_context(
                     httpx.AsyncClient(
                         headers=cfg.headers or None,
@@ -264,13 +265,12 @@ async def connect_mcp_servers(
                         ", ".join(available_wrapped_names) or "(none)",
                     )
 
+            stacks[name] = stack
             logger.info("MCP server '{}': connected, {} tools registered", name, registered_count)
-            connected_count += 1
         except asyncio.CancelledError as exc:
             if _should_propagate_cancelled_error(exc):
                 raise
             _clear_current_task_cancellation()
-            cancelled_count += 1
             logger.warning(
                 "MCP server '{}': connection was cancelled by server/SDK: {}",
                 name,
@@ -278,4 +278,4 @@ async def connect_mcp_servers(
             )
         except Exception as e:
             logger.error("MCP server '{}': failed to connect: {}", name, e)
-    return connected_count, cancelled_count
+    return stacks

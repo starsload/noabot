@@ -25,4 +25,5 @@ workspace/
 .DS_Store
 uv.lock
 docs/
-token.txt 
+token.txt
+config_backup.json 

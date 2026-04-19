@@ -93,8 +93,8 @@ async def cmd_new(ctx: CommandContext) -> OutboundMessage:
     )
 
 
-async def cmd_help(ctx: CommandContext) -> OutboundMessage:
-    """Return available slash commands."""
+def build_help_text() -> str:
+    """Build help text for display in channels like Telegram."""
     lines = [
         "🐈 nanobot commands:",
         "/new — Start a new conversation",
@@ -103,10 +103,15 @@ async def cmd_help(ctx: CommandContext) -> OutboundMessage:
         "/status — Show bot status",
         "/help — Show available commands",
     ]
+    return "\n".join(lines)
+
+
+async def cmd_help(ctx: CommandContext) -> OutboundMessage:
+    """Return available slash commands."""
     return OutboundMessage(
         channel=ctx.msg.channel,
         chat_id=ctx.msg.chat_id,
-        content="\n".join(lines),
+        content=build_help_text(),
         metadata={"render_as": "text"},
     )
 
