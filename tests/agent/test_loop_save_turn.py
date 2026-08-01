@@ -1,0 +1,145 @@
+from nanobot.agent.context import ContextBuilder
+from nanobot.agent.loop import AgentLoop
+from nanobot.session.manager import Session
+
+
+def _mk_loop() -> AgentLoop:
+    loop = AgentLoop.__new__(AgentLoop)
+    loop._TOOL_RESULT_MAX_CHARS = AgentLoop._TOOL_RESULT_MAX_CHARS
+    return loop
+
+
+def test_save_turn_skips_multimodal_user_when_only_runtime_context() -> None:
+    loop = _mk_loop()
+    session = Session(key="test:runtime-only")
+    runtime = ContextBuilder._RUNTIME_CONTEXT_TAG + "\nCurrent Time: now (UTC)"
+
+    loop._save_turn(
+        session,
+        [{"role": "user", "content": [{"type": "text", "text": runtime}]}],
+        skip=0,
+    )
+    assert session.messages == []
+
+
+def test_save_turn_keeps_image_placeholder_with_path_after_runtime_strip() -> None:
+    loop = _mk_loop()
+    session = Session(key="test:image")
+    runtime = ContextBuilder._RUNTIME_CONTEXT_TAG + "\nCurrent Time: now (UTC)"
+
+    loop._save_turn(
+        session,
+        [{
+            "role": "user",
+            "content": [
+                {"type": "text", "text": runtime},
+                {"type": "image_url", "image_url": {"url": "data:image/png;base64,abc"}, "_meta": {"path": "/media/feishu/photo.jpg"}},
+            ],
+        }],
+        skip=0,
+    )
+    assert session.messages[0]["content"] == [{"type": "text", "text": "[image: /media/feishu/photo.jpg]"}]
+
+
+def test_save_turn_keeps_image_placeholder_without_meta() -> None:
+    loop = _mk_loop()
+    session = Session(key="test:image-no-meta")
+    runtime = ContextBuilder._RUNTIME_CONTEXT_TAG + "\nCurrent Time: now (UTC)"
+
+    loop._save_turn(
+        session,
+        [{
+            "role": "user",
+            "content": [
+                {"type": "text", "text": runtime},
+                {"type": "image_url", "image_url": {"url": "data:image/png;base64,abc"}},
+            ],
+        }],
+        skip=0,
+    )
+    assert session.messages[0]["content"] == [{"type": "text", "text": "[image]"}]
+
+
+def test_save_turn_keeps_tool_results_under_16k() -> None:
+    loop = _mk_loop()
+    session = Session(key="test:tool-result")
+    content = "x" * 12_000
+
+    loop._save_turn(
+        session,
+        [{"role": "tool", "tool_call_id": "call_1", "name": "read_file", "content": content}],
+        skip=0,
+    )
+
+    assert session.messages[0]["content"] == content
+
+
+def test_save_turn_replaces_tool_inline_images_with_placeholders() -> None:
+    loop = _mk_loop()
+    session = Session(key="test:tool-image")
+
+    loop._save_turn(
+        session,
+        [{
+            "role": "tool",
+            "tool_call_id": "call_1",
+            "name": "inspect_screen",
+            "content": [
+                {
+                    "type": "image_url",
+                    "image_url": {"url": "data:image/png;base64,abc"},
+                    "_meta": {"path": "D:/tmp/desktop.png"},
+                },
+                {"type": "text", "text": "(Desktop inspection: D:/tmp/desktop.png)"},
+            ],
+        }],
+        skip=0,
+    )
+
+    assert session.messages[0]["content"] == [
+        {"type": "text", "text": "[image: D:/tmp/desktop.png]"},
+        {"type": "text", "text": "(Desktop inspection: D:/tmp/desktop.png)"},
+    ]
+    assert session.messages[0]["metadata"]["had_inline_images"] is True
+
+
+def test_save_turn_keeps_group_speaker_prefix_after_runtime_strip() -> None:
+    loop = _mk_loop()
+    session = Session(key="test:group-speaker")
+    runtime = ContextBuilder._build_runtime_context(
+        channel="qq",
+        chat_id="group123",
+        sender_id="user1",
+        sender_name="Alice",
+        conversation_type="group",
+        is_owner=False,
+    )
+
+    loop._save_turn(
+        session,
+        [{"role": "user", "content": f"{runtime}\n\nhello group"}],
+        skip=0,
+    )
+
+    assert session.messages[0]["content"] == "[speaker: Alice (user1), owner=false] hello group"
+
+
+def test_save_turn_does_not_prefix_direct_message_history() -> None:
+    loop = _mk_loop()
+    session = Session(key="test:direct-speaker")
+    runtime = ContextBuilder._build_runtime_context(
+        channel="qq_personal",
+        chat_id="user1",
+        sender_id="user1",
+        sender_name="Alice",
+        conversation_type="direct",
+        is_owner=False,
+    )
+
+    loop._save_turn(
+        session,
+        [{"role": "user", "content": f"{runtime}\n\nhello direct"}],
+        skip=0,
+    )
+
+    assert session.messages[0]["content"] == "hello direct"

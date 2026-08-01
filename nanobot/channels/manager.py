@@ -7,9 +7,13 @@ from typing import Any
 
 from loguru import logger
 
+from nanobot.bus.events import OutboundMessage
 from nanobot.bus.queue import MessageBus
 from nanobot.channels.base import BaseChannel
-from nanobot.config.schema import Config
+from nanobot.config.schema import Config, get_channel_section
+
+# Retry delays for message sending (exponential backoff: 1s, 2s, 4s)
+_SEND_RETRY_DELAYS = (1, 2, 4)
 
 
 class ChannelManager:
@@ -31,23 +35,30 @@ class ChannelManager:
         self._init_channels()
 
     def _init_channels(self) -> None:
-        """Initialize channels discovered via pkgutil scan."""
-        from nanobot.channels.registry import discover_channel_names, load_channel_class
+        """Initialize channels discovered via pkgutil scan + entry_points plugins."""
+        from nanobot.channels.registry import discover_all
 
         groq_key = self.config.providers.groq.api_key
 
-        for modname in discover_channel_names():
-            section = getattr(self.config.channels, modname, None)
-            if not section or not getattr(section, "enabled", False):
+        for name, cls in discover_all().items():
+            section = get_channel_section(self.config.channels, name)
+            if section is None:
+                continue
+            enabled = (
+                section.get("enabled", False)
+                if isinstance(section, dict)
+                else getattr(section, "enabled", False)
+            )
+            if not enabled:
                 continue
             try:
-                cls = load_channel_class(modname)
                 channel = cls(section, self.bus)
                 channel.transcription_api_key = groq_key
-                self.channels[modname] = channel
+                channel.set_runtime_config(self.config)
+                self.channels[name] = channel
                 logger.info("{} channel enabled", cls.display_name)
-            except ImportError as e:
-                logger.warning("{} channel not available: {}", modname, e)
+            except Exception as e:
+                logger.warning("{} channel not available: {}", name, e)
 
         self._validate_allow_from()
 
@@ -123,10 +134,8 @@ class ChannelManager:
 
                 channel = self.channels.get(msg.channel)
                 if channel:
-                    try:
-                        await channel.send(msg)
-                    except Exception as e:
-                        logger.error("Error sending to {}: {}", msg.channel, e)
+                    await self._send_with_retry(channel, msg)
+                    await self._maybe_mirror_to_desktop_voice(msg)
                 else:
                     logger.warning("Unknown channel: {}", msg.channel)
 
@@ -134,6 +143,76 @@ class ChannelManager:
                 continue
             except asyncio.CancelledError:
                 break
+
+    @staticmethod
+    async def _send_once(channel: BaseChannel, msg: OutboundMessage) -> None:
+        """Send one outbound message without retry policy."""
+        if msg.metadata.get("_stream_delta") or msg.metadata.get("_stream_end"):
+            await channel.send_delta(msg.chat_id, msg.content, msg.metadata)
+        elif not msg.metadata.get("_streamed"):
+            await channel.send(msg)
+
+    async def _send_with_retry(self, channel: BaseChannel, msg: OutboundMessage) -> None:
+        """Send a message with retry on failure using exponential backoff.
+
+        Note: CancelledError is re-raised to allow graceful shutdown.
+        """
+        max_attempts = max(self.config.channels.send_max_retries, 1)
+
+        for attempt in range(max_attempts):
+            try:
+                await self._send_once(channel, msg)
+                return  # Send succeeded
+            except asyncio.CancelledError:
+                raise  # Propagate cancellation for graceful shutdown
+            except Exception as e:
+                if attempt == max_attempts - 1:
+                    logger.error(
+                        "Failed to send to {} after {} attempts: {} - {}",
+                        msg.channel, max_attempts, type(e).__name__, e
+                    )
+                    return
+                delay = _SEND_RETRY_DELAYS[min(attempt, len(_SEND_RETRY_DELAYS) - 1)]
+                logger.warning(
+                    "Send to {} failed (attempt {}/{}): {}, retrying in {}s",
+                    msg.channel, attempt + 1, max_attempts, type(e).__name__, delay
+                )
+                try:
+                    await asyncio.sleep(delay)
+                except asyncio.CancelledError:
+                    raise  # Propagate cancellation during sleep
+
+    async def _maybe_mirror_to_desktop_voice(self, msg: OutboundMessage) -> None:
+        """Mirror eligible outbound replies to the local desktop voice channel."""
+        if msg.channel == "desktop_voice":
+            return
+        if msg.metadata.get("_progress") or msg.metadata.get("_stream_delta") or msg.metadata.get("_stream_end"):
+            return
+        if not (msg.content or "").strip():
+            return
+
+        desktop_channel = self.channels.get("desktop_voice")
+        if not desktop_channel:
+            return
+
+        cfg = desktop_channel.config
+        if isinstance(cfg, dict):
+            mirrored_from = cfg.get("mirrorFromChannels", cfg.get("mirror_from_channels", [])) or []
+            target_chat_id = cfg.get("chatId", cfg.get("chat_id", "desktop_local"))
+        else:
+            mirrored_from = getattr(cfg, "mirror_from_channels", []) or []
+            target_chat_id = getattr(cfg, "chat_id", "desktop_local")
+        if msg.channel not in mirrored_from:
+            return
+
+        mirrored = OutboundMessage(
+            channel="desktop_voice",
+            chat_id=target_chat_id,
+            content=msg.content,
+            media=[],
+            metadata={"_mirrored_from": msg.channel},
+        )
+        await self._send_with_retry(desktop_channel, mirrored)
 
     def get_channel(self, name: str) -> BaseChannel | None:
         """Get a channel by name."""

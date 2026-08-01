@@ -19,6 +19,16 @@ _ALLOWED_MSG_KEYS = frozenset({"role", "content", "tool_calls", "tool_call_id", 
 _ANTHROPIC_EXTRA_KEYS = frozenset({"thinking_blocks"})
 _ALNUM = string.ascii_letters + string.digits
 
+
+def _has_thought_signature(tool_call: dict[str, Any]) -> bool:
+    """Return True when a tool_call carries Gemini thought_signature metadata."""
+    provider_fields = tool_call.get("provider_specific_fields")
+    return (
+        isinstance(provider_fields, dict)
+        and bool(provider_fields.get("thought_signature") or provider_fields.get("thoughtSignature"))
+    )
+
+
 def _short_tool_id() -> str:
     """Generate a 9-char alphanumeric ID compatible with all providers (incl. Mistral)."""
     return "".join(secrets.choice(_ALNUM) for _ in range(9))
@@ -27,7 +37,7 @@ def _short_tool_id() -> str:
 class LiteLLMProvider(LLMProvider):
     """
     LLM provider using LiteLLM for multi-provider support.
-    
+
     Supports OpenRouter, Anthropic, OpenAI, Gemini, MiniMax, and many other providers through
     a unified interface.  Provider-specific logic is driven by the registry
     (see providers/registry.py) — no if-elif chains needed here.
@@ -62,6 +72,8 @@ class LiteLLMProvider(LLMProvider):
         # Drop unsupported parameters for providers (e.g., gpt-5 rejects some params)
         litellm.drop_params = True
 
+        self._langsmith_enabled = bool(os.getenv("LANGSMITH_API_KEY"))
+
     def _setup_env(self, api_key: str, api_base: str | None, model: str) -> None:
         """Set environment variables based on detected provider."""
         spec = self._gateway or find_by_model(model)
@@ -89,11 +101,10 @@ class LiteLLMProvider(LLMProvider):
     def _resolve_model(self, model: str) -> str:
         """Resolve model name by applying provider/gateway prefixes."""
         if self._gateway:
-            # Gateway mode: apply gateway prefix, skip provider-specific prefixes
             prefix = self._gateway.litellm_prefix
             if self._gateway.strip_model_prefix:
                 model = model.split("/")[-1]
-            if prefix and not model.startswith(f"{prefix}/"):
+            if prefix:
                 model = f"{prefix}/{model}"
             return model
 
@@ -181,10 +192,23 @@ class LiteLLMProvider(LLMProvider):
         """Strip non-standard keys and ensure assistant messages have a content key."""
         allowed = _ALLOWED_MSG_KEYS | extra_keys
         sanitized = LLMProvider._sanitize_request_messages(messages, allowed)
+        preserve_ids: set[str] = set()
+        for clean in sanitized:
+            if clean.get("role") != "assistant":
+                continue
+            for tc in clean.get("tool_calls") or []:
+                if not isinstance(tc, dict):
+                    continue
+                call_id = tc.get("id")
+                if isinstance(call_id, str) and call_id and _has_thought_signature(tc):
+                    preserve_ids.add(call_id)
+
         id_map: dict[str, str] = {}
 
         def map_id(value: Any) -> Any:
             if not isinstance(value, str):
+                return value
+            if value in preserve_ids:
                 return value
             return id_map.setdefault(value, LiteLLMProvider._normalize_tool_call_id(value))
 
@@ -247,8 +271,14 @@ class LiteLLMProvider(LLMProvider):
             "temperature": temperature,
         }
 
+        if self._gateway:
+            kwargs.update(self._gateway.litellm_kwargs)
+
         # Apply model-specific overrides (e.g. kimi-k2.5 temperature)
         self._apply_model_overrides(model, kwargs)
+
+        if self._langsmith_enabled:
+            kwargs.setdefault("callbacks", []).append("langsmith")
 
         # Pass api_key directly — more reliable than env vars alone
         if self.api_key:
@@ -261,11 +291,11 @@ class LiteLLMProvider(LLMProvider):
         # Pass extra headers (e.g. APP-Code for AiHubMix)
         if self.extra_headers:
             kwargs["extra_headers"] = self.extra_headers
-        
+
         if reasoning_effort:
             kwargs["reasoning_effort"] = reasoning_effort
             kwargs["drop_params"] = True
-        
+
         if tools:
             kwargs["tools"] = tools
             kwargs["tool_choice"] = tool_choice or "auto"
@@ -282,6 +312,11 @@ class LiteLLMProvider(LLMProvider):
 
     def _parse_response(self, response: Any) -> LLMResponse:
         """Parse LiteLLM response into our standard format."""
+        def _get(obj: Any, key: str, default: Any = None) -> Any:
+            if isinstance(obj, dict):
+                return obj.get(key, default)
+            return getattr(obj, key, default)
+
         choice = response.choices[0]
         message = choice.message
         content = message.content
@@ -306,18 +341,38 @@ class LiteLLMProvider(LLMProvider):
         tool_calls = []
         for tc in raw_tool_calls:
             # Parse arguments from JSON string if needed
-            args = tc.function.arguments
+            function = _get(tc, "function", {}) or {}
+            args = _get(function, "arguments")
             if isinstance(args, str):
                 args = json_repair.loads(args)
 
-            provider_specific_fields = getattr(tc, "provider_specific_fields", None) or None
-            function_provider_specific_fields = (
-                getattr(tc.function, "provider_specific_fields", None) or None
-            )
+            provider_specific_fields = _get(tc, "provider_specific_fields") or None
+            function_provider_specific_fields = _get(function, "provider_specific_fields") or None
+
+            # Backward compatibility for older LiteLLM/Gemini adapters that expose
+            # thought_signature outside provider_specific_fields.
+            if not provider_specific_fields:
+                thought_signature = (
+                    _get(tc, "thought_signature")
+                    or _get(tc, "thoughtSignature")
+                    or _get(function, "thought_signature")
+                    or _get(function, "thoughtSignature")
+                )
+                if thought_signature:
+                    provider_specific_fields = {"thought_signature": thought_signature}
+
+            tool_call_id = _short_tool_id()
+            # Gemini tool-call continuation requires thought_signature bound
+            # to the original call id; re-minting ids breaks that linkage.
+            if provider_specific_fields and (
+                provider_specific_fields.get("thought_signature")
+                or provider_specific_fields.get("thoughtSignature")
+            ):
+                tool_call_id = _get(tc, "id") or tool_call_id
 
             tool_calls.append(ToolCallRequest(
-                id=_short_tool_id(),
-                name=tc.function.name,
+                id=tool_call_id,
+                name=_get(function, "name", ""),
                 arguments=args,
                 provider_specific_fields=provider_specific_fields,
                 function_provider_specific_fields=function_provider_specific_fields,
