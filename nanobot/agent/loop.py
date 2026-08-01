@@ -37,6 +37,7 @@ from nanobot.agent.tools.context import RequestContext, bind_request_context, re
 from nanobot.agent.tools.exec_session import ExecSessionManager
 from nanobot.agent.tools.file_state import FileStateStore, bind_file_states, reset_file_states
 from nanobot.agent.tools.message import MessageTool
+from nanobot.agent.tools.noah_local_painter import NoahLocalPainterTool
 from nanobot.agent.tools.registry import ToolRegistry
 from nanobot.agent.tools.self import MyTool
 from nanobot.agent.turn_delivery import (
@@ -636,6 +637,12 @@ class AgentLoop:
         self.tools.register(CodexStatusTool(manager=self.codex_jobs))
         self.tools.register(CodexResumeTool(manager=self.codex_jobs))
         registered.extend(("codex_delegate", "codex_status", "codex_resume"))
+
+        # Noah local painter tool needs workspace + bus — manual registration
+        self.tools.register(
+            NoahLocalPainterTool(workspace=self.workspace, send_callback=self.bus.publish_outbound)
+        )
+        registered.append("noah_local_painter")
 
         logger.info("Registered {} tools: {}", len(registered), registered)
 
