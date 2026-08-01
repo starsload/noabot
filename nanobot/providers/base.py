@@ -294,7 +294,6 @@ class GenerationSettings:
     temperature: float = 0.7
     max_tokens: int = 4096
     reasoning_effort: str | None = None
-    thinking_budget_tokens: int | None = None  # Provider-specific reasoning budget
 
 
 _SYNTHETIC_USER_CONTENT = "(conversation continued)"

@@ -15,8 +15,7 @@ from pathlib import Path
 from typing import Any, Callable, Literal, Protocol, TypeAlias, cast
 from urllib.parse import quote, unquote, urlparse
 
-from loguru import logger
-from pydantic import ConfigDict, Field
+from pydantic import Field
 
 from nanobot.security.workspace_policy import is_path_within
 
@@ -268,7 +267,6 @@ def _matrix_stream_key(chat_id: str, stream_id: str | None) -> str:
 class MatrixConfig(Base):
     """Matrix (Element) channel configuration."""
 
-    model_config = ConfigDict(extra="allow")  # Accept merge_owner_in_group and other extra fields
     enabled: bool = False
     homeserver: str = "https://matrix.org"
     user_id: str = ""

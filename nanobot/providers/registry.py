@@ -127,23 +127,6 @@ class ProviderSpec:
     def label(self) -> str:
         return self.display_name or self.name.title()
 
-    @property
-    def litellm_prefix(self) -> str:
-        """Best-effort LiteLLM prefix for this provider."""
-        if self.backend == "anthropic":
-            return "anthropic"
-        if self.name in {"openai", "custom", "azure_openai", "openai_codex", "ovms"}:
-            return ""
-        return self.name
-
-    @property
-    def skip_prefixes(self) -> tuple[str, ...]:
-        """Prefixes that indicate the model is already namespaced correctly."""
-        prefix = self.litellm_prefix
-        if not prefix:
-            return ()
-        return (f"{prefix}/",)
-
 
 # ---------------------------------------------------------------------------
 # PROVIDERS — the registry. Order = priority. Copy any entry as template.
@@ -746,49 +729,22 @@ def find_by_name(name: str) -> ProviderSpec | None:
     return None
 
 
-def find_by_model(model: str | None) -> ProviderSpec | None:
-    """Best-effort provider lookup from a model identifier."""
-    if not model:
-        return None
-
-    model_lower = str(model).lower()
-    normalized = model_lower.replace("-", "_")
-    model_prefix = model_lower.split("/", 1)[0] if "/" in model_lower else ""
-    normalized_prefix = model_prefix.replace("-", "_")
-
-    for spec in PROVIDERS:
-        if model_prefix and normalized_prefix == spec.name:
-            return spec
-
-    for spec in PROVIDERS:
-        for kw in spec.keywords:
-            kw_lower = kw.lower()
-            if kw_lower in model_lower or kw_lower.replace("-", "_") in normalized:
-                return spec
-
-    return None
-
-
-def find_gateway(
-    provider_name: str | None,
-    api_key: str | None,
-    api_base: str | None,
-) -> ProviderSpec | None:
-    """Detect whether the resolved provider should be treated as a gateway/local route."""
-    if provider_name:
-        spec = find_by_name(provider_name)
-        if spec and (spec.is_gateway or spec.is_local):
-            return spec
-
-    api_key = api_key or ""
-    api_base = (api_base or "").lower()
-
-    for spec in PROVIDERS:
-        if not (spec.is_gateway or spec.is_local):
-            continue
-        if spec.detect_by_key_prefix and api_key.startswith(spec.detect_by_key_prefix):
-            return spec
-        if spec.detect_by_base_keyword and spec.detect_by_base_keyword.lower() in api_base:
-            return spec
-
-    return None
+def create_dynamic_spec(
+    name: str,
+    *,
+    display_name: str = "",
+    thinking_style: str = "",
+) -> ProviderSpec:
+    """Create a dynamic ProviderSpec for custom user-defined providers."""
+    normalized = to_snake(name.replace("-", "_"))
+    strip_prefixes = tuple(dict.fromkeys((name, normalized)))
+    return ProviderSpec(
+        name=normalized,
+        keywords=(),
+        env_key="",
+        display_name=display_name or name.replace("-", " ").replace("_", " ").title(),
+        backend="openai_compat",
+        is_direct=True,
+        strip_model_prefixes=strip_prefixes,
+        thinking_style=thinking_style,
+    )

@@ -4,10 +4,19 @@ from __future__ import annotations
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, ClassVar, Literal
 
-from pydantic import BaseModel, ConfigDict, Field
-from pydantic.alias_generators import to_camel
-from pydantic_settings import BaseSettings
+from pydantic import AliasChoices, ConfigDict, Field, field_validator, model_validator
+from pydantic_settings import BaseSettings, SettingsConfigDict
 
+from nanobot.config_base import Base
+from nanobot.cron.types import CronSchedule
+
+if TYPE_CHECKING:
+    from nanobot.agent.tools.cli_apps import CliAppsToolConfig
+    from nanobot.agent.tools.filesystem import FileToolsConfig
+    from nanobot.agent.tools.image_generation import ImageGenerationToolConfig
+    from nanobot.agent.tools.self import MyToolConfig
+    from nanobot.agent.tools.shell import ExecToolConfig
+    from nanobot.agent.tools.web import WebToolsConfig
 
 
 class ChannelsConfig(Base):
@@ -25,27 +34,49 @@ class ChannelsConfig(Base):
     show_reasoning: bool = True  # surface model reasoning when channel implements it
     extract_document_text: bool = True  # Deprecated and ignored; documents are read on demand
     send_max_retries: int = Field(default=3, ge=0, le=10)  # Max delivery attempts (initial send included)
+    transcription_provider: str = "groq"  # Deprecated: use top-level transcription.provider
+    transcription_language: str | None = Field(default=None, pattern=r"^[a-z]{2,3}$")  # Deprecated: use top-level transcription.language
 
 
-def get_channel_section(channels: ChannelsConfig, name: str) -> object | None:
-    """Return a channel config section by built-in/plugin name.
+class TranscriptionConfig(Base):
+    """Cross-channel audio transcription configuration."""
 
-    Extra channel configs may be stored with either snake_case or camelCase keys.
-    This helper resolves both forms consistently.
-    """
-    section = getattr(channels, name, None)
-    if section is not None:
-        return section
+    enabled: bool = True
+    provider: str | None = None  # Validated by nanobot.audio.transcription_registry.
+    model: str | None = None
+    language: str | None = Field(default=None, pattern=r"^[a-z]{2,3}$")
+    max_duration_sec: int = Field(default=120, ge=1, le=600)
+    max_upload_mb: int = Field(default=25, ge=1, le=100)
 
-    extra = getattr(channels, "model_extra", None) or {}
-    if name in extra:
-        return extra[name]
 
-    camel_name = to_camel(name)
-    if camel_name in extra:
-        return extra[camel_name]
+class DreamConfig(Base):
+    """Dream memory consolidation configuration."""
 
-    return None
+    _HOUR_MS = 3_600_000
+
+    enabled: bool = True  # Register the periodic Dream consolidation job on startup
+    interval_h: int = Field(default=2, ge=1)  # Every 2 hours by default
+    cron: str | None = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
+    )  # Legacy cron expression override
+    model_override: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices("modelOverride", "model", "model_override"),
+    )  # Model preset name for Dream sessions
+
+    def build_schedule(self, timezone: str) -> CronSchedule:
+        """Build the runtime schedule, preferring the legacy cron override if present."""
+        if self.cron:
+            return CronSchedule(kind="cron", expr=self.cron, tz=timezone)
+        return CronSchedule(kind="every", every_ms=self.interval_h * self._HOUR_MS)
+
+    def describe_schedule(self) -> str:
+        """Return a human-readable summary for logs and startup output."""
+        if self.cron:
+            return f"cron {self.cron} (legacy)"
+        hours = self.interval_h
+        return f"every {hours}h"
 
 
 class InlineFallbackConfig(Base):
@@ -95,25 +126,43 @@ class AgentDefaults(Base):
     context_window_tokens: int = 200_000
     context_block_limit: int | None = None
     temperature: float = 0.1
-    max_tool_iterations: int = 40
+    fallback_models: list[FallbackCandidate] = Field(default_factory=list)
+    max_tool_iterations: int = 200
+    max_concurrent_subagents: int = Field(default=1, ge=1)
+    fail_on_tool_error: bool = True
     max_tool_result_chars: int = 16_000
     provider_retry_mode: Literal["standard", "persistent"] = "standard"
-    reasoning_effort: str | None = None  # low / medium / high - enables LLM thinking mode
-    thinking_budget_tokens: int | None = Field(
-        default=None,
-        ge=1,
-    )  # Provider-specific reasoning budget; Qwen maps this to thinking_budget
+    tool_hint_max_length: int = Field(
+        default=40,
+        ge=20,
+        le=500,
+        validation_alias=AliasChoices("toolHintMaxLength"),
+        serialization_alias="toolHintMaxLength",
+    )  # Max characters for tool hint display (e.g. "$ cd …/project && npm test")
+    reasoning_effort: str | None = None  # low / medium / high / adaptive / none — LLM thinking effort; None preserves the provider default
     timezone: str = "UTC"  # IANA timezone, e.g. "Asia/Shanghai", "America/New_York"
-    unified_session: bool = False  # Share one session across all channels
-    disabled_skills: list[str] = Field(default_factory=list)
-    session_ttl_minutes: int = Field(default=0, ge=0)  # Auto-compact idle threshold
-    should_warn_deprecated_memory_window: bool = Field(default=False, exclude=True)
-
-
-class AgentIdentityConfig(Base):
-    """Agent identity / ownership hints used for prompt context."""
-
-    owner_ids: list[str] = Field(default_factory=list)
+    bot_name: str = "nanobot"  # Display name shown in CLI prompts (e.g. "{name} is thinking...")
+    bot_icon: str = "🐈"  # Short icon (emoji or text) shown next to the bot name in CLI; "" to omit
+    unified_session: bool = False  # Share one session across all channels (single-user multi-device)
+    disabled_skills: list[str] = Field(default_factory=list)  # Skill names to exclude from loading (e.g. ["summarize", "skill-creator"])
+    session_ttl_minutes: int = Field(
+        default=15,
+        ge=0,
+        validation_alias=AliasChoices("idleCompactAfterMinutes", "sessionTtlMinutes"),
+        serialization_alias="idleCompactAfterMinutes",
+    )  # Auto-compact idle threshold in minutes (0 = disabled)
+    idle_compact_check_interval_seconds: int = Field(
+        default=60,
+        ge=0,
+    )  # Minimum interval in seconds between scans for idle sessions
+    consolidation_ratio: float = Field(
+        default=0.5,
+        ge=0.1,
+        le=0.95,
+        validation_alias=AliasChoices("consolidationRatio"),
+        serialization_alias="consolidationRatio",
+    )  # Consolidation target ratio (0.5 = 50% of budget retained after compression)
+    dream: DreamConfig = Field(default_factory=DreamConfig)
 
     @field_validator("timezone")
     @classmethod
@@ -131,17 +180,53 @@ class AgentsConfig(Base):
     """Agent configuration."""
 
     defaults: AgentDefaults = Field(default_factory=AgentDefaults)
-    identity: AgentIdentityConfig = Field(default_factory=AgentIdentityConfig)
 
 
 class ProviderConfig(Base):
     """LLM provider configuration."""
 
-    api_key: str = ""
+    # User-facing name for dynamic custom providers.
+    display_name: str | None = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
+    )
+    api_key: str | None = Field(default=None, repr=False)
     api_base: str | None = None
     api_type: Literal["auto", "chat_completions", "responses"] = "auto"  # Request API surface
     extra_headers: dict[str, str] | None = None  # Custom headers (e.g. APP-Code for AiHubMix)
-    api_mode: Literal["chat_completions", "responses", "auto"] = "chat_completions"
+    extra_body: dict[str, Any] | None = None  # Extra provider request fields; shape depends on provider/API surface
+    extra_query: dict[str, str] | None = None  # Extra query params (e.g. api-version for Azure-style gateways)
+    proxy: str | None = None  # Explicit HTTP proxy; image downloads trust its DNS and egress
+    thinking_style: str | None = None  # Thinking/reasoning style for custom providers
+
+    # Valid values mirror the keys of _THINKING_STYLE_MAP in
+    # nanobot/providers/openai_compat_provider.py. Kept duplicated here to
+    # avoid an import cycle (schema.py must not import from providers/).
+    _VALID_THINKING_STYLES: ClassVar[tuple[str, ...]] = (
+        "thinking_type",
+        "enable_thinking",
+        "reasoning_split",
+    )
+
+    @field_validator("thinking_style")
+    @classmethod
+    def _validate_thinking_style(cls, v: str | None) -> str | None:
+        if not v:  # None or "" -> no injection, valid (backwards compatible)
+            return v
+        if v not in cls._VALID_THINKING_STYLES:
+            raise ValueError(
+                f"Invalid thinking_style {v!r}. "
+                f"Must be one of: {', '.join(repr(s) for s in cls._VALID_THINKING_STYLES)} "
+                f"(or empty/omitted)."
+            )
+        return v
+
+
+class BedrockProviderConfig(ProviderConfig):
+    """AWS Bedrock Runtime provider configuration."""
+
+    region: str | None = None  # AWS region, falls back to AWS_REGION/AWS_DEFAULT_REGION/profile
+    profile: str | None = None  # Optional AWS shared config profile
 
 
 class ProvidersConfig(Base):
@@ -169,13 +254,19 @@ class ProvidersConfig(Base):
     modelscope: ProviderConfig = Field(default_factory=ProviderConfig)
     vllm: ProviderConfig = Field(default_factory=ProviderConfig)
     ollama: ProviderConfig = Field(default_factory=ProviderConfig)  # Ollama local models
+    lm_studio: ProviderConfig = Field(default_factory=ProviderConfig)  # LM Studio local models
+    atomic_chat: ProviderConfig = Field(default_factory=ProviderConfig)  # Atomic Chat local models
     ovms: ProviderConfig = Field(default_factory=ProviderConfig)  # OpenVINO Model Server (OVMS)
     gemini: ProviderConfig = Field(default_factory=ProviderConfig)
     moonshot: ProviderConfig = Field(default_factory=ProviderConfig)
     kimi_coding: ProviderConfig = Field(default_factory=ProviderConfig)  # Kimi Coding Plan (Anthropic Messages API)
     minimax: ProviderConfig = Field(default_factory=ProviderConfig)
+    minimax_anthropic: ProviderConfig = Field(default_factory=ProviderConfig)  # MiniMax Anthropic endpoint (thinking)
     mistral: ProviderConfig = Field(default_factory=ProviderConfig)
-    stepfun: ProviderConfig = Field(default_factory=ProviderConfig)  # Step Fun (阶跃星辰)
+    stepfun: ProviderConfig = Field(default_factory=ProviderConfig)  # Step Fun (阶跃星辰) — LLM + ASR (set apiBase to Plan URL for ASR)
+    xiaomi_mimo: ProviderConfig = Field(default_factory=ProviderConfig)  # Xiaomi MIMO (小米)
+    longcat: ProviderConfig = Field(default_factory=ProviderConfig)  # LongCat
+    ant_ling: ProviderConfig = Field(default_factory=ProviderConfig)  # Ant Ling
     aihubmix: ProviderConfig = Field(default_factory=ProviderConfig)  # AiHubMix API gateway
     siliconflow: ProviderConfig = Field(default_factory=ProviderConfig)  # SiliconFlow (硅基流动)
     novita: ProviderConfig = Field(default_factory=ProviderConfig)  # Novita AI
@@ -186,6 +277,40 @@ class ProvidersConfig(Base):
     openai_codex: ProviderConfig = Field(default_factory=ProviderConfig, exclude=True)  # OpenAI Codex (OAuth)
     xai_grok: ProviderConfig = Field(default_factory=ProviderConfig, exclude=True)  # xAI Grok (OAuth)
     github_copilot: ProviderConfig = Field(default_factory=ProviderConfig, exclude=True)  # Github Copilot (OAuth)
+    qianfan: ProviderConfig = Field(default_factory=ProviderConfig)  # Qianfan (百度千帆)
+    nvidia: ProviderConfig = Field(default_factory=ProviderConfig)  # NVIDIA NIM (nvapi- keys)
+    opencode: ProviderConfig = Field(default_factory=ProviderConfig)  # OpenCode Zen (canonical provider id)
+    opencode_zen: ProviderConfig = Field(default_factory=ProviderConfig)  # OpenCode Zen (curated coding models)
+    opencode_go: ProviderConfig = Field(default_factory=ProviderConfig)  # OpenCode Go (low-cost coding models)
+
+    @model_validator(mode="after")
+    def convert_extra_providers(self):
+        """Convert extra fields (custom providers) to ProviderConfig objects."""
+        if self.model_extra:
+            from nanobot.providers.registry import find_by_name
+
+            for key, value in self.model_extra.items():
+                if spec := find_by_name(key):
+                    raise ValueError(
+                        f"providers.{key} conflicts with built-in provider {spec.name!r}; "
+                        "use the built-in provider key or choose a different custom provider name"
+                    )
+                if isinstance(value, dict):
+                    self.model_extra[key] = ProviderConfig.model_validate(value)
+        return self
+
+    @model_validator(mode="after")
+    def _validate_api_type_scope(self) -> "ProvidersConfig":
+        for name in self.__class__.model_fields:
+            if name == "openai":
+                continue
+            provider = getattr(self, name, None)
+            if isinstance(provider, ProviderConfig) and provider.api_type != "auto":
+                raise ValueError("providers.<name>.api_type is only supported for providers.openai")
+        for provider in (self.model_extra or {}).values():
+            if isinstance(provider, ProviderConfig) and provider.api_type != "auto":
+                raise ValueError("providers.<name>.api_type is only supported for providers.openai")
+        return self
 
 
 class HeartbeatConfig(Base):
@@ -196,43 +321,34 @@ class HeartbeatConfig(Base):
     keep_recent_messages: int = 8
 
 
+class ApiConfig(Base):
+    """OpenAI-compatible API server configuration."""
+
+    host: str = "127.0.0.1"  # Safer default: local-only bind.
+    port: int = 8900
+    timeout: float = 120.0  # Per-request timeout in seconds.
+    api_key: str = Field(default="", repr=False)
+
+    @model_validator(mode="after")
+    def wildcard_host_requires_auth(self) -> "ApiConfig":
+        if self.host not in ("0.0.0.0", "::"):
+            return self
+        if self.api_key.strip():
+            return self
+        raise ValueError(
+            "host is 0.0.0.0 (all interfaces) but api_key is not set "
+            "- set api.api_key to prevent unauthenticated access"
+        )
+
+
 class GatewayConfig(Base):
     """Gateway/server configuration."""
 
-    host: str = "0.0.0.0"
+    host: str = "127.0.0.1"  # Safer default: local-only bind.
     port: int = 18790
     restart_mode: Literal["auto", "exec", "spawn", "exit"] = "auto"
     heartbeat: HeartbeatConfig = Field(default_factory=HeartbeatConfig)
 
-
-class WebSearchConfig(Base):
-    """Web search tool configuration."""
-
-    provider: str = "brave"  # brave, tavily, duckduckgo, searxng, jina
-    api_key: str = ""
-    base_url: str = ""  # SearXNG base URL
-    max_results: int = 5
-    timeout: int = 30  # Wall-clock timeout (seconds) for search operations
-
-
-class WebToolsConfig(Base):
-    """Web tools configuration."""
-
-    enable: bool = True
-    proxy: str | None = (
-        None  # HTTP/SOCKS5 proxy URL, e.g. "http://127.0.0.1:7890" or "socks5://127.0.0.1:1080"
-    )
-    search: WebSearchConfig = Field(default_factory=WebSearchConfig)
-
-
-class ExecToolConfig(Base):
-    """Shell exec tool configuration."""
-
-    enable: bool = True
-    timeout: int = 60
-    path_append: str = ""
-    sandbox: str = ""  # sandbox backend: "" (none) or "bwrap"
-    allowed_env_keys: list[str] = Field(default_factory=list)  # Env var names to pass through
 
 class MCPServerConfig(Base):
     """MCP server connection configuration (stdio or HTTP)."""
@@ -241,7 +357,7 @@ class MCPServerConfig(Base):
     command: str = ""  # Stdio: command to run (e.g. "npx")
     args: list[str] = Field(default_factory=list)  # Stdio: command arguments
     env: dict[str, str] = Field(default_factory=dict)  # Stdio: extra env vars
-    cwd: str = ""  # Stdio: working directory for the subprocess
+    cwd: str = ""  # Stdio: working directory for MCP server runtime artifacts
     url: str = ""  # HTTP/SSE: endpoint URL
     headers: dict[str, str] = Field(default_factory=dict)  # HTTP/SSE: custom headers
     tool_timeout: int = 30  # seconds before a tool call is cancelled
@@ -258,94 +374,38 @@ def _lazy_default(module_path: str, class_name: str) -> Any:
 class ToolsConfig(Base):
     """Tools configuration.
 
-    web: WebToolsConfig = Field(default_factory=WebToolsConfig)
-    exec: ExecToolConfig = Field(default_factory=ExecToolConfig)
-    restrict_to_workspace: bool = False  # If true, restrict all tool access to workspace directory
-    mcp_servers: dict[str, MCPServerConfig] = Field(default_factory=dict)
+    Field types for tool-specific sub-configs are resolved via model_rebuild()
+    at the bottom of this file so tool config classes can stay next to their
+    tool implementations.
+    """
 
-
-class VoiceSTTConfig(Base):
-    """Speech-to-text configuration."""
-
-    provider: str = "groq"
-    language: str = "zh"
-
-
-class VoiceTTSConfig(Base):
-    """Text-to-speech configuration."""
-
-    provider: str = "edge_tts"
-    voice: str = "zh-CN-XiaoxiaoNeural"
-    rate: str = "+0%"
-    volume: str = "+0%"
-    pitch: str = "+0Hz"
-
-
-class VoiceCaptureConfig(Base):
-    """Audio capture command configuration."""
-
-    backend: Literal["command", "sounddevice"] = "command"
-    command_template: list[str] = Field(default_factory=list)
-    format: str = "wav"
-    duration_s: float = Field(default=5.0, ge=0.1, le=600.0)
-    sample_rate_hz: int = Field(default=16_000, ge=8_000, le=192_000)
-    channels: int = Field(default=1, ge=1, le=8)
-
-
-class VoicePlaybackConfig(Base):
-    """Audio playback command configuration."""
-
-    backend: Literal["command", "sounddevice"] = "command"
-    command_template: list[str] = Field(
-        default_factory=lambda: [
-            "ffplay",
-            "-nodisp",
-            "-autoexit",
-            "-loglevel",
-            "quiet",
-            "{file}",
-        ]
+    web: WebToolsConfig = Field(default_factory=lambda: _lazy_default("nanobot.agent.tools.web", "WebToolsConfig"))
+    exec: ExecToolConfig = Field(default_factory=lambda: _lazy_default("nanobot.agent.tools.shell", "ExecToolConfig"))
+    file: FileToolsConfig = Field(default_factory=lambda: _lazy_default("nanobot.agent.tools.filesystem", "FileToolsConfig"))
+    cli_apps: CliAppsToolConfig = Field(default_factory=lambda: _lazy_default("nanobot.agent.tools.cli_apps", "CliAppsToolConfig"))
+    my: MyToolConfig = Field(default_factory=lambda: _lazy_default("nanobot.agent.tools.self", "MyToolConfig"))
+    image_generation: ImageGenerationToolConfig = Field(
+        default_factory=lambda: _lazy_default("nanobot.agent.tools.image_generation", "ImageGenerationToolConfig"),
     )
-
-
-class VoiceConfig(Base):
-    """Voice I/O configuration for desktop pet mode."""
-
-    enabled: bool = False
-    barge_in: bool = True
-    input_device: str = ""
-    output_device: str = ""
-    stt: VoiceSTTConfig = Field(default_factory=VoiceSTTConfig)
-    tts: VoiceTTSConfig = Field(default_factory=VoiceTTSConfig)
-    capture: VoiceCaptureConfig = Field(default_factory=VoiceCaptureConfig)
-    playback: VoicePlaybackConfig = Field(default_factory=VoicePlaybackConfig)
-
-
-class AvatarConfig(Base):
-    """Avatar runtime configuration."""
-
-    enabled: bool = False
-    runtime: Literal["vtube_studio", "none"] = "vtube_studio"
-    host: str = "127.0.0.1"
-    port: int = Field(default=8001, ge=1, le=65535)
-    model_preset: str = "default"
-    plugin_name: str = "nanobot-desktop-avatar"
-    plugin_developer: str = "nanobot"
-    token_path: str = "./token.txt"
-    speaking_parameter: str = "MouthOpen"
-    speaking_value_on: float = 1.0
-    speaking_value_off: float = 0.0
-    expression_hotkeys: dict[str, str] = Field(default_factory=dict)
-    motion_hotkeys: dict[str, str] = Field(default_factory=dict)
-
-
-class OpenPetsConfig(Base):
-    """OpenPets desktop pet integration."""
-
-    enabled: bool = False
-    cli_path: str = "npx"  # CLI command (usually "npx")
-    pet_name: str | None = None  # Pet name (None = default pet)
-    say_max_length: int = 60  # Max chars for speech bubbles
+    restrict_to_workspace: bool = False  # policy intent: keep tool access inside workspace when possible
+    webui_allow_local_service_access: bool = Field(
+        default=True,
+        validation_alias=AliasChoices(
+            "webuiAllowLocalServiceAccess",
+            "webui_allow_local_service_access",
+            "allowLocalPreviewAccess",
+            "allow_local_preview_access",
+        ),
+    )  # allow WebUI Full Access shell checks against localhost services; legacy allowLocalPreviewAccess still reads
+    webui_allow_remote_package_install: bool = Field(
+        default=False,
+        validation_alias=AliasChoices(
+            "webuiAllowRemotePackageInstall",
+            "webui_allow_remote_package_install",
+        ),
+    )  # allow non-local WebUI clients to install optional packages and agent skills
+    mcp_servers: dict[str, MCPServerConfig] = Field(default_factory=dict)
+    ssrf_whitelist: list[str] = Field(default_factory=list)  # CIDR ranges to exempt from SSRF blocking (e.g. ["100.64.0.0/10"] for Tailscale)
 
 
 class Config(BaseSettings):
@@ -355,11 +415,52 @@ class Config(BaseSettings):
     channels: ChannelsConfig = Field(default_factory=ChannelsConfig)
     transcription: TranscriptionConfig = Field(default_factory=TranscriptionConfig)
     providers: ProvidersConfig = Field(default_factory=ProvidersConfig)
+    api: ApiConfig = Field(default_factory=ApiConfig)
     gateway: GatewayConfig = Field(default_factory=GatewayConfig)
     tools: ToolsConfig = Field(default_factory=ToolsConfig)
-    voice: VoiceConfig = Field(default_factory=VoiceConfig)
-    avatar: AvatarConfig = Field(default_factory=AvatarConfig)
-    openpets: OpenPetsConfig = Field(default_factory=OpenPetsConfig)
+    model_presets: dict[str, ModelPresetConfig] = Field(
+        default_factory=dict,
+        validation_alias=AliasChoices("modelPresets", "model_presets"),
+        serialization_alias="modelPresets",
+    )
+
+    def __init__(self, **values: Any) -> None:
+        if not type(self).__pydantic_complete__:
+            _resolve_tool_config_refs()
+        super().__init__(**values)
+
+    @model_validator(mode="after")
+    def _validate_model_preset(self) -> "Config":
+        if "default" in self.model_presets:
+            raise ValueError("model_preset name 'default' is reserved for agents.defaults")
+        name = self.agents.defaults.model_preset
+        if name and name != "default" and name not in self.model_presets:
+            raise ValueError(f"model_preset {name!r} not found in model_presets")
+        dream_name = self.agents.defaults.dream.model_override
+        if dream_name and dream_name != "default" and dream_name not in self.model_presets:
+            raise ValueError(f"Dream model preset {dream_name!r} not found in model_presets")
+        for fallback in self.agents.defaults.fallback_models:
+            if isinstance(fallback, str) and fallback not in self.model_presets:
+                raise ValueError(f"fallback_models entry {fallback!r} not found in model_presets")
+        return self
+
+    def resolve_default_preset(self) -> ModelPresetConfig:
+        """Return the implicit `default` preset from agents.defaults fields."""
+        d = self.agents.defaults
+        return ModelPresetConfig(
+            model=d.model, provider=d.provider, max_tokens=d.max_tokens,
+            context_window_tokens=d.context_window_tokens,
+            temperature=d.temperature, reasoning_effort=d.reasoning_effort,
+        )
+
+    def resolve_preset(self, name: str | None = None) -> ModelPresetConfig:
+        """Return effective model params from a named preset or the implicit default."""
+        name = self.agents.defaults.model_preset if name is None else name
+        if not name or name == "default":
+            return self.resolve_default_preset()
+        if name not in self.model_presets:
+            raise KeyError(f"model_preset {name!r} not found in model_presets")
+        return self.model_presets[name]
 
     @property
     def workspace_path(self) -> Path:

@@ -305,24 +305,6 @@ def _normalize_windows_stdio_command(
     return comspec, ["/d", "/c", command, *normalized_args], env
 
 
-def _should_propagate_cancelled_error(exc: asyncio.CancelledError) -> bool:
-    """Return True when a cancellation should escape this MCP compatibility layer."""
-    if "Cancelled via cancel scope" in str(exc):
-        return False
-    task = asyncio.current_task()
-    return task is not None and task.cancelling() > 0
-
-
-def _clear_current_task_cancellation() -> None:
-    """Clear swallowed cancellation state so later awaits can proceed."""
-    task = asyncio.current_task()
-    uncancel = getattr(task, "uncancel", None)
-    if task is None or not callable(uncancel):
-        return
-    while task.cancelling() > 0:
-        uncancel()
-
-
 def _extract_nullable_branch(options: Any) -> tuple[dict[str, Any], bool] | None:
     """Return the single non-null branch for nullable unions."""
     if not isinstance(options, list):
@@ -448,10 +430,24 @@ def _normalize_nullable_schema(schema: dict[str, Any]) -> dict[str, Any]:
     if isinstance(properties, dict):
         property_schemas = cast(dict[str, Any], properties)
         normalized["properties"] = {
-            name: _normalize_schema_for_openai(prop)
-            if isinstance(prop, dict)
-            else prop
-            for name, prop in normalized["properties"].items()
+            name: (
+                _normalize_nullable_schema(cast(dict[str, Any], prop))
+                if isinstance(prop, dict)
+                else prop
+            )
+            for name, prop in property_schemas.items()
+        }
+    items = normalized.get("items")
+    if isinstance(items, dict):
+        normalized["items"] = _normalize_nullable_schema(cast(dict[str, Any], items))
+    definitions = normalized.get("$defs")
+    if isinstance(definitions, dict):
+        definition_schemas = cast(dict[str, Any], definitions)
+        normalized["$defs"] = {
+            name: _normalize_nullable_schema(cast(dict[str, Any], definition))
+            if isinstance(definition, dict)
+            else definition
+            for name, definition in definition_schemas.items()
         }
 
     if normalized.get("type") == "object":
@@ -712,40 +708,278 @@ class MCPToolWrapper(_MCPWrapperBase):
                 save_dir="generated",
                 provider=f"mcp:{self._server_name}",
             )
-        except asyncio.TimeoutError:
-            logger.warning("MCP tool '{}' timed out after {}s", self._name, self._tool_timeout)
-            return f"(MCP tool call timed out after {self._tool_timeout}s)"
-        except asyncio.CancelledError as exc:
-            # MCP SDK's anyio cancel scopes can leak CancelledError on timeout/failure.
-            # Re-raise only if our task was externally cancelled (e.g. /stop).
-            if _should_propagate_cancelled_error(exc):
-                raise
-            _clear_current_task_cancellation()
-            logger.warning("MCP tool '{}' was cancelled by server/SDK", self._name)
-            return "(MCP tool call was cancelled)"
-        except Exception as exc:
-            logger.exception(
-                "MCP tool '{}' failed: {}: {}",
+        except (ArtifactError, OSError) as exc:
+            logger.warning(
+                "MCP tool '{}' returned an image that could not be stored: {}",
                 self._name,
                 exc,
             )
             return None
 
 
+class MCPResourceWrapper(_MCPWrapperBase):
+    """Wraps an MCP resource URI as a read-only nanobot Tool."""
+
+    _plugin_discoverable = False
+
+    def __init__(
+        self,
+        session: "ClientSession",
+        server_name: str,
+        resource_def: "Resource",
+        resource_timeout: int = 30,
+    ):
+        self._set_mcp_connection(session, server_name)
+        self._uri = resource_def.uri
+        self._name = _sanitize_mcp_tool_name(f"mcp_{server_name}_resource_{resource_def.name}")
+        desc = resource_def.description or resource_def.name
+        self._description = f"[MCP Resource] {desc}\nURI: {self._uri}"
+        self._parameters: dict[str, Any] = {
+            "type": "object",
+            "properties": {},
+            "required": [],
+        }
+        self._resource_timeout = resource_timeout
+
+    @property
+    def name(self) -> str:
+        return self._name
+
+    @property
+    def description(self) -> str:
+        return self._description
+
+    @property
+    def parameters(self) -> dict[str, Any]:
+        return self._parameters
+
+    @property
+    def read_only(self) -> bool:
+        return True
+
+    async def execute(self, **kwargs: Any) -> str:
+        from mcp import types
+
+        retried_transient = False
+        refreshed_session = False
+        while True:
+            try:
+                result = await asyncio.wait_for(
+                    self._session.read_resource(self._uri),
+                    timeout=self._resource_timeout,
+                )
+            except asyncio.TimeoutError:
+                logger.warning(
+                    "MCP resource '{}' timed out after {}s", self._name, self._resource_timeout
+                )
+                return f"(MCP resource read timed out after {self._resource_timeout}s)"
+            except asyncio.CancelledError:
+                if task_is_cancelling():
+                    raise
+                logger.warning("MCP resource '{}' was cancelled by server/SDK", self._name)
+                return "(MCP resource read was cancelled)"
+            except Exception as exc:
+                if await self._refresh_session_after_termination(
+                    exc,
+                    refreshed_session,
+                    "resource",
+                ):
+                    refreshed_session = True
+                    continue
+                if _is_transient(exc):
+                    if not retried_transient:
+                        retried_transient = True
+                        logger.warning(
+                            "MCP resource '{}' hit transient error ({}), retrying once...",
+                            self._name,
+                            type(exc).__name__,
+                        )
+                        await asyncio.sleep(1)
+                        continue
+                    logger.exception(
+                        "MCP resource '{}' failed after retry: {}",
+                        self._name,
+                        type(exc).__name__,
+                    )
+                    return f"(MCP resource read failed after retry: {type(exc).__name__})"
+                logger.exception(
+                    "MCP resource '{}' failed: {}: {}",
+                    self._name,
+                    type(exc).__name__,
+                    exc,
+                )
+                return f"(MCP resource read failed: {type(exc).__name__})"
+            else:
+                parts: list[str] = []
+                for block in result.contents:
+                    if isinstance(block, types.TextResourceContents):
+                        parts.append(block.text)
+                    elif isinstance(cast(object, block), types.BlobResourceContents):
+                        parts.append(f"[Binary resource: {len(block.blob)} bytes]")
+                    else:
+                        parts.append(str(block))
+                return "\n".join(parts) or "(no output)"
+
+
+class MCPPromptWrapper(_MCPWrapperBase):
+    """Wraps an MCP prompt as a read-only nanobot Tool."""
+
+    _plugin_discoverable = False
+
+    def __init__(
+        self,
+        session: "ClientSession",
+        server_name: str,
+        prompt_def: "Prompt",
+        prompt_timeout: int = 30,
+    ):
+        self._set_mcp_connection(session, server_name)
+        self._prompt_name = prompt_def.name
+        self._name = _sanitize_mcp_tool_name(f"mcp_{server_name}_prompt_{prompt_def.name}")
+        desc = prompt_def.description or prompt_def.name
+        self._description = (
+            f"[MCP Prompt] {desc}\n"
+            "Returns a filled prompt template that can be used as a workflow guide."
+        )
+        self._prompt_timeout = prompt_timeout
+
+        # Build parameters from prompt arguments
+        properties: dict[str, Any] = {}
+        required: list[str] = []
+        for arg in prompt_def.arguments or []:
+            prop: dict[str, Any] = {"type": "string"}
+            if getattr(arg, "description", None):
+                prop["description"] = arg.description
+            properties[arg.name] = prop
+            if arg.required:
+                required.append(arg.name)
+        self._parameters: dict[str, Any] = {
+            "type": "object",
+            "properties": properties,
+            "required": required,
+        }
+
+    @property
+    def name(self) -> str:
+        return self._name
+
+    @property
+    def description(self) -> str:
+        return self._description
+
+    @property
+    def parameters(self) -> dict[str, Any]:
+        return self._parameters
+
+    @property
+    def read_only(self) -> bool:
+        return True
+
+    async def execute(self, **kwargs: Any) -> str:
+        from mcp import types
+        from mcp.shared.exceptions import McpError
+
+        retried_transient = False
+        refreshed_session = False
+        while True:
+            try:
+                result = await asyncio.wait_for(
+                    self._session.get_prompt(self._prompt_name, arguments=kwargs),
+                    timeout=self._prompt_timeout,
+                )
+            except asyncio.TimeoutError:
+                logger.warning(
+                    "MCP prompt '{}' timed out after {}s", self._name, self._prompt_timeout
+                )
+                return f"(MCP prompt call timed out after {self._prompt_timeout}s)"
+            except asyncio.CancelledError:
+                if task_is_cancelling():
+                    raise
+                logger.warning("MCP prompt '{}' was cancelled by server/SDK", self._name)
+                return "(MCP prompt call was cancelled)"
+            except McpError as exc:
+                if await self._refresh_session_after_termination(
+                    exc,
+                    refreshed_session,
+                    "prompt",
+                ):
+                    refreshed_session = True
+                    continue
+                logger.exception(
+                    "MCP prompt '{}' failed: code={} message={}",
+                    self._name,
+                    exc.error.code,
+                    exc.error.message,
+                )
+                return f"(MCP prompt call failed: {exc.error.message} [code {exc.error.code}])"
+            except Exception as exc:
+                if await self._refresh_session_after_termination(
+                    exc,
+                    refreshed_session,
+                    "prompt",
+                ):
+                    refreshed_session = True
+                    continue
+                if _is_transient(exc):
+                    if not retried_transient:
+                        retried_transient = True
+                        logger.warning(
+                            "MCP prompt '{}' hit transient error ({}), retrying once...",
+                            self._name,
+                            type(exc).__name__,
+                        )
+                        await asyncio.sleep(1)
+                        continue
+                    logger.exception(
+                        "MCP prompt '{}' failed after retry: {}",
+                        self._name,
+                        type(exc).__name__,
+                    )
+                    return f"(MCP prompt call failed after retry: {type(exc).__name__})"
+                logger.exception(
+                    "MCP prompt '{}' failed: {}: {}",
+                    self._name,
+                    type(exc).__name__,
+                    exc,
+                )
+                return f"(MCP prompt call failed: {type(exc).__name__})"
+            else:
+                parts: list[str] = []
+                for message in result.messages:
+                    content = message.content
+                    if isinstance(content, types.TextContent):
+                        parts.append(content.text)
+                    elif isinstance(content, list):
+                        for block in content:
+                            if isinstance(block, types.TextContent):
+                                parts.append(block.text)
+                            else:
+                                parts.append(str(block))
+                    else:
+                        parts.append(str(content))
+                return "\n".join(parts) or "(no output)"
+
+
 async def connect_mcp_servers(
-    mcp_servers: dict, registry: ToolRegistry
-) -> dict[str, AsyncExitStack]:
-    """Connect to configured MCP servers and register their tools.
-    Returns a dict mapping server name to its AsyncExitStack for cleanup.
+    mcp_servers: "dict[str, MCPServerConfig]", registry: ToolRegistry
+) -> dict[str, MCPConnection]:
+    """Connect to configured MCP servers and register their tools, resources, prompts.
+
+    Returns one connection handle per server.  Each handle keeps the task that
+    entered the MCP SDK contexts alive so reconnect and shutdown can close
+    AnyIO cancel scopes from their owning task.
     """
     from mcp import ClientSession, StdioServerParameters
     from mcp.client.sse import sse_client
     from mcp.client.stdio import stdio_client
     from mcp.client.streamable_http import streamable_http_client
 
-    stacks: dict[str, AsyncExitStack] = {}
+    async def open_single_server(
+        name: str, cfg: "MCPServerConfig"
+    ) -> tuple[str, AsyncExitStack | None]:
+        server_stack = AsyncExitStack()
+        await server_stack.__aenter__()
 
-    for name, cfg in mcp_servers.items():
         try:
             transport_type = cfg.type
             if not transport_type:
@@ -757,9 +991,8 @@ async def connect_mcp_servers(
                     )
                 else:
                     logger.warning("MCP server '{}': no command or url configured, skipping", name)
-                    continue
-
-            stack = AsyncExitStack()
+                    await server_stack.aclose()
+                    return name, None
 
             if transport_type in {"sse", "streamableHttp"}:
                 ok, error = validate_url_target(cfg.url)
@@ -780,17 +1013,28 @@ async def connect_mcp_servers(
                     cfg.env or None,
                 )
                 params = StdioServerParameters(
-                    command=cfg.command, args=cfg.args, env=cfg.env or None,
+                    command=command,
+                    args=args,
+                    env=env,
                     cwd=cfg.cwd or None,
                 )
-                read, write = await stack.enter_async_context(stdio_client(params))
+                read, write = await server_stack.enter_async_context(stdio_client(params))
             elif transport_type == "sse":
+                if not await _probe_http_url(cfg.url):
+                    logger.warning("MCP server '{}': {} unreachable, skipping", name, _redact_url(cfg.url))
+                    await server_stack.aclose()
+                    return name, None
+
                 def httpx_client_factory(
                     headers: dict[str, str] | None = None,
                     timeout: httpx.Timeout | None = None,
                     auth: httpx.Auth | None = None,
                 ) -> httpx.AsyncClient:
-                    merged_headers = {**(cfg.headers or {}), **(headers or {})}
+                    merged_headers = {
+                        "Accept": "application/json, text/event-stream",
+                        **(cfg.headers or {}),
+                        **(headers or {}),
+                    }
                     return httpx.AsyncClient(
                         headers=merged_headers or None,
                         event_hooks={"request": [_validate_mcp_request_url]},
@@ -800,11 +1044,16 @@ async def connect_mcp_servers(
                         **_pinned_transport_kwargs(),
                     )
 
-                read, write = await stack.enter_async_context(
+                read, write = await server_stack.enter_async_context(
                     sse_client(cfg.url, httpx_client_factory=httpx_client_factory)
                 )
             elif transport_type == "streamableHttp":
-                http_client = await stack.enter_async_context(
+                if not await _probe_http_url(cfg.url):
+                    logger.warning("MCP server '{}': {} unreachable, skipping", name, _redact_url(cfg.url))
+                    await server_stack.aclose()
+                    return name, None
+
+                http_client = await server_stack.enter_async_context(
                     httpx.AsyncClient(
                         headers=cfg.headers or None,
                         event_hooks={"request": [_validate_mcp_request_url]},
@@ -813,14 +1062,16 @@ async def connect_mcp_servers(
                         **_pinned_transport_kwargs(),
                     )
                 )
-                read, write, _ = await stack.enter_async_context(
+                read, write, _ = await server_stack.enter_async_context(
                     streamable_http_client(cfg.url, http_client=http_client)
                 )
             else:
                 logger.warning("MCP server '{}': unknown transport type '{}'", name, transport_type)
-                continue
+                await server_stack.aclose()
+                return name, None
 
-            session = await stack.enter_async_context(ClientSession(read, write))
+            read = _filter_malformed_mcp_progress_notifications(read, name)
+            session = await server_stack.enter_async_context(ClientSession(read, write))
             await session.initialize()
 
             tools = await session.list_tools()
@@ -865,17 +1116,458 @@ async def connect_mcp_servers(
                         ", ".join(available_wrapped_names) or "(none)",
                     )
 
-            stacks[name] = stack
-            logger.info("MCP server '{}': connected, {} tools registered", name, registered_count)
-        except asyncio.CancelledError as exc:
-            if _should_propagate_cancelled_error(exc):
-                raise
-            _clear_current_task_cancellation()
-            logger.warning(
-                "MCP server '{}': connection was cancelled by server/SDK: {}",
-                name,
-                exc,
+            # Only register resources and prompts when no tool restriction is
+            # active.  enabledTools is a per-*tool* allowlist; resources and
+            # prompts have no equivalent name filter, so they must be skipped
+            # whenever the operator specified a tool subset.  An empty list
+            # (deny-all) or a list of specific tool names both indicate that
+            # the operator intended to restrict capabilities — registering
+            # unrestricted resource/prompt wrappers would violate that intent.
+            # The default ["*"] (allow-all) means no restriction was intended.
+            register_extras = allow_all_tools
+            if register_extras:
+                try:
+                    resources_result = await session.list_resources()
+                    for resource in resources_result.resources:
+                        wrapper = MCPResourceWrapper(
+                            session, name, resource, resource_timeout=cfg.tool_timeout
+                        )
+                        registry.register(wrapper)
+                        registered_count += 1
+                        logger.debug(
+                            "MCP: registered resource '{}' from server '{}'",
+                            wrapper.name,
+                            name,
+                        )
+                except Exception as e:
+                    logger.debug(
+                        "MCP server '{}': resources not supported or failed: {}", name, e
+                    )
+
+                try:
+                    prompts_result = await session.list_prompts()
+                    for prompt in prompts_result.prompts:
+                        wrapper = MCPPromptWrapper(
+                            session, name, prompt, prompt_timeout=cfg.tool_timeout
+                        )
+                        registry.register(wrapper)
+                        registered_count += 1
+                        logger.debug(
+                            "MCP: registered prompt '{}' from server '{}'",
+                            wrapper.name,
+                            name,
+                        )
+                except Exception as e:
+                    logger.debug(
+                        "MCP server '{}': prompts not supported or failed: {}", name, e
+                    )
+            else:
+                logger.info(
+                    "MCP server '{}': skipping resource/prompt registration "
+                    "(enabledTools does not include '*' — only tools allowed)",
+                    name,
+                )
+
+            logger.info(
+                "MCP server '{}': connected, {} capabilities registered", name, registered_count
             )
+            return name, server_stack
+
         except Exception as e:
-            logger.error("MCP server '{}': failed to connect: {}", name, e)
-    return stacks
+            hint = ""
+            text = str(e).lower()
+            if any(
+                marker in text
+                for marker in (
+                    "parse error",
+                    "invalid json",
+                    "unexpected token",
+                    "jsonrpc",
+                    "content-length",
+                )
+            ):
+                hint = (
+                    " Hint: this looks like stdio protocol pollution. Make sure the MCP server writes "
+                    "only JSON-RPC to stdout and sends logs/debug output to stderr instead."
+                )
+            logger.exception("MCP server '{}': failed to connect: {}", name, hint)
+            with suppress(Exception):
+                await server_stack.aclose()
+            return name, None
+
+    async def connect_single_server(
+        name: str, cfg: "MCPServerConfig"
+    ) -> tuple[str, MCPConnection | None]:
+        loop = asyncio.get_running_loop()
+        ready: asyncio.Future[bool] = loop.create_future()
+        close_requested = asyncio.Event()
+
+        async def own_connection() -> None:
+            stack: AsyncExitStack | None = None
+            try:
+                _, stack = await open_single_server(name, cfg)
+                if not ready.done():
+                    ready.set_result(stack is not None)
+                if stack is not None:
+                    await close_requested.wait()
+            except BaseException as exc:
+                if not ready.done():
+                    ready.set_exception(exc)
+                raise
+            finally:
+                if stack is not None:
+                    await stack.aclose()
+
+        owner = asyncio.create_task(own_connection(), name=f"mcp:{name}")
+        connection = _OwnedMCPConnection(owner, close_requested)
+        try:
+            connected = await ready
+        except BaseException:
+            close_requested.set()
+            owner.cancel()
+            with suppress(BaseException):
+                await asyncio.shield(owner)
+            raise
+        if not connected:
+            await connection.aclose()
+            return name, None
+        return name, connection
+
+    server_stacks: dict[str, MCPConnection] = {}
+
+    for name, cfg in mcp_servers.items():
+        try:
+            result = await connect_single_server(name, cfg)
+        except Exception as e:
+            logger.exception("MCP server '{}' connection failed: {}", name, e)
+            continue
+        if result[1] is not None:
+            server_stacks[result[0]] = result[1]
+
+    return server_stacks
+
+
+def session_extra(metadata: Mapping[str, Any] | None) -> dict[str, Any]:
+    """Return persisted session kwargs for MCP preset attachments."""
+    mcp_presets = metadata.get("mcp_presets") if isinstance(metadata, Mapping) else None
+    return {"mcp_presets": mcp_presets} if isinstance(mcp_presets, list) and mcp_presets else {}
+
+
+async def connect_missing_servers(state: Any, registry: ToolRegistry) -> None:
+    """Connect configured MCP servers that are not currently live."""
+    async with _reload_lock(state):
+        if getattr(state, "_mcp_closing", False):
+            return
+        missing_servers = {
+            name: cfg for name, cfg in state._mcp_servers.items() if name not in state._mcp_stacks
+        }
+        if state._mcp_connecting or not missing_servers:
+            return
+        state._mcp_connecting = True
+        try:
+            connected = await connect_mcp_servers(missing_servers, registry)
+            if getattr(state, "_mcp_closing", False):
+                for connection in connected.values():
+                    await connection.aclose()
+                return
+            state._mcp_stacks.update(connected)
+            _attach_reconnect_handlers(state, registry, connected)
+            if connected:
+                logger.info("MCP connected servers: {}", sorted(connected))
+            else:
+                logger.warning("No MCP servers connected successfully (will retry next message)")
+        except asyncio.CancelledError:
+            if task_is_cancelling():
+                raise
+            logger.warning("MCP connection cancelled (will retry next message)")
+        except BaseException as e:
+            logger.warning("Failed to connect MCP servers (will retry next message): {}", e)
+        finally:
+            state._mcp_connecting = False
+
+
+async def reload_servers(state: Any, registry: ToolRegistry) -> dict[str, Any]:
+    """Reconcile live MCP connections with the current config file."""
+    async with _reload_lock(state):
+        if getattr(state, "_mcp_closing", False):
+            return {
+                "ok": False,
+                "message": "MCP connections are shutting down.",
+                "requires_restart": True,
+            }
+        try:
+            from nanobot.config.loader import load_config, resolve_config_env_vars
+
+            config = resolve_config_env_vars(load_config())
+            next_servers = dict(config.tools.mcp_servers)
+        except Exception as exc:
+            logger.warning("MCP hot reload could not read config: {}", exc)
+            return {
+                "ok": False,
+                "message": "Could not reload MCP config. Restart nanobot to pick up changes.",
+                "requires_restart": True,
+                "error": str(exc),
+            }
+
+        current_servers = dict(state._mcp_servers)
+        current_names = set(current_servers)
+        next_names = set(next_servers)
+        removed = sorted(current_names - next_names)
+        added = sorted(next_names - current_names)
+        changed = sorted(
+            name
+            for name in current_names & next_names
+            if _server_signature(current_servers[name]) != _server_signature(next_servers[name])
+        )
+
+        tools_removed = 0
+        for name in [*removed, *changed]:
+            tools_removed += _unregister_server_tools(registry, name)
+            await _close_server(state, name)
+
+        state._mcp_servers = next_servers
+        retry_missing = sorted(
+            name
+            for name in next_names
+            if name not in state._mcp_stacks and name not in set(added) | set(changed)
+        )
+        to_connect_names = sorted(set(added) | set(changed) | set(retry_missing))
+        to_connect = {name: next_servers[name] for name in to_connect_names}
+        connected: dict[str, MCPConnection] = {}
+        if to_connect:
+            connected = await connect_mcp_servers(to_connect, registry)
+            if getattr(state, "_mcp_closing", False):
+                for connection in connected.values():
+                    await connection.aclose()
+                return {
+                    "ok": False,
+                    "message": "MCP connections are shutting down.",
+                    "requires_restart": True,
+                }
+            state._mcp_stacks.update(connected)
+            _attach_reconnect_handlers(state, registry, connected)
+
+        failed = sorted(set(to_connect) - set(connected))
+        unchanged = not removed and not added and not changed and not retry_missing
+        ok = not failed
+        if failed:
+            message = "MCP config reloaded, but some servers did not connect: " + ", ".join(failed)
+        elif unchanged:
+            message = "MCP config is already live."
+        elif retry_missing and not added and not changed and not removed:
+            message = "MCP connections refreshed without restarting nanobot."
+        else:
+            message = "MCP config reloaded without restarting nanobot."
+
+        logger.info(
+            "MCP hot reload: added={} changed={} removed={} retried={} connected={} failed={} tools_removed={}",
+            added,
+            changed,
+            removed,
+            retry_missing,
+            sorted(connected),
+            failed,
+            tools_removed,
+        )
+        return {
+            "ok": ok,
+            "message": message,
+            "added": added,
+            "changed": changed,
+            "removed": removed,
+            "retried": retry_missing,
+            "connected": sorted(state._mcp_stacks),
+            "configured": sorted(state._mcp_servers),
+            "failed": failed,
+            "tools_removed": tools_removed,
+            "requires_restart": False,
+        }
+
+
+async def request_mcp_reload(
+    bus: MessageBus,
+    *,
+    timeout: float = 15.0,
+) -> dict[str, Any]:
+    """Ask the running agent loop to reconcile live MCP connections."""
+    loop = asyncio.get_running_loop()
+    ack: asyncio.Future[dict[str, Any]] = loop.create_future()
+    await bus.publish_inbound(
+        InboundMessage(
+            channel="system",
+            sender_id="webui-settings",
+            chat_id="runtime",
+            content=RUNTIME_CONTROL_MCP_RELOAD,
+            metadata={
+                INBOUND_META_RUNTIME_CONTROL: RUNTIME_CONTROL_MCP_RELOAD,
+                RUNTIME_CONTROL_ACK: ack,
+            },
+        )
+    )
+    try:
+        result = await asyncio.wait_for(ack, timeout=timeout)
+    except asyncio.TimeoutError:
+        return {
+            "ok": False,
+            "message": "MCP hot reload timed out. Restart nanobot to pick up changes.",
+            "requires_restart": True,
+        }
+    return result if isinstance(cast(object, result), dict) else {
+        "ok": False,
+        "message": "MCP hot reload returned an unexpected response.",
+        "requires_restart": True,
+    }
+
+
+async def handle_runtime_control(state: Any, msg: InboundMessage, registry: ToolRegistry) -> bool:
+    metadata = msg.metadata if isinstance(cast(object, msg.metadata), dict) else {}
+    control = metadata.get(INBOUND_META_RUNTIME_CONTROL)
+    if control != RUNTIME_CONTROL_MCP_RELOAD:
+        return False
+
+    ack = metadata.get(RUNTIME_CONTROL_ACK)
+    try:
+        result = await reload_servers(state, registry)
+    except Exception as exc:
+        logger.exception("MCP hot reload failed")
+        result = {
+            "ok": False,
+            "message": "MCP hot reload failed. Restart nanobot to pick up changes.",
+            "requires_restart": True,
+            "error": str(exc),
+        }
+    if isinstance(ack, asyncio.Future) and not ack.done():
+        cast(asyncio.Future[dict[str, Any]], ack).set_result(result)
+    return True
+
+
+def _reload_lock(state: Any) -> asyncio.Lock:
+    try:
+        return _RELOAD_LOCKS[state]
+    except KeyError:
+        lock = asyncio.Lock()
+        _RELOAD_LOCKS[state] = lock
+        return lock
+
+
+def _attach_reconnect_handlers(
+    state: Any,
+    registry: ToolRegistry,
+    server_names: Mapping[str, Any] | set[str] | list[str] | tuple[str, ...],
+) -> None:
+    async def reconnect(server_name: str, tool_name: str, stale_tool: Tool) -> Tool | None:
+        return await _refresh_terminated_server(
+            state,
+            registry,
+            server_name,
+            tool_name,
+            stale_tool,
+        )
+
+    for server_name in server_names:
+        for tool_name in list(registry.tool_names):
+            tool = registry.get(tool_name)
+            if not _tool_belongs_to_server(tool, tool_name, server_name):
+                continue
+            if isinstance(tool, _MCPWrapperBase):
+                tool.set_reconnect_handler(reconnect)
+
+
+async def _refresh_terminated_server(
+    state: Any,
+    registry: ToolRegistry,
+    server_name: str,
+    tool_name: str,
+    stale_tool: Tool,
+) -> Tool | None:
+    async with _reload_lock(state):
+        if getattr(state, "_mcp_closing", False):
+            return None
+        cfg = state._mcp_servers.get(server_name)
+        if cfg is None:
+            logger.warning(
+                "MCP server '{}' session terminated but is no longer configured",
+                server_name,
+            )
+            return None
+
+        current_tool = registry.get(tool_name)
+        if (
+            current_tool is not None
+            and current_tool is not stale_tool
+            and server_name in state._mcp_stacks
+        ):
+            return current_tool
+
+        logger.warning("MCP server '{}' session terminated; refreshing connection", server_name)
+        _unregister_server_tools(registry, server_name)
+        await _close_server(state, server_name)
+
+        connected = await connect_mcp_servers({server_name: cfg}, registry)
+        if getattr(state, "_mcp_closing", False):
+            for connection in connected.values():
+                await connection.aclose()
+            return None
+        state._mcp_stacks.update(connected)
+        _attach_reconnect_handlers(state, registry, connected)
+        if server_name not in connected:
+            logger.warning("MCP server '{}' reconnect failed after session termination", server_name)
+            return None
+        return registry.get(tool_name)
+
+
+def _server_signature(cfg: Any) -> Any:
+    if hasattr(cfg, "model_dump"):
+        return cfg.model_dump(mode="json")
+    return cfg
+
+
+def _tool_prefix(server_name: str) -> str:
+    return _sanitize_name(f"mcp_{server_name}_")
+
+
+def _tool_belongs_to_server(tool: Tool | None, tool_name: str, server_name: str) -> bool:
+    if isinstance(tool, _MCPWrapperBase):
+        return getattr(tool, "_server_name", None) == server_name
+    return tool_name.startswith(_tool_prefix(server_name))
+
+
+def _unregister_server_tools(registry: ToolRegistry, server_name: str) -> int:
+    removed = 0
+    for tool_name in list(registry.tool_names):
+        tool = registry.get(tool_name)
+        if _tool_belongs_to_server(tool, tool_name, server_name):
+            registry.unregister(tool_name)
+            removed += 1
+    return removed
+
+
+async def _close_server(state: Any, server_name: str) -> None:
+    stack = state._mcp_stacks.pop(server_name, None)
+    if stack is None:
+        return
+    try:
+        await stack.aclose()
+    except asyncio.CancelledError:
+        if task_is_cancelling():
+            raise
+        logger.debug("MCP server '{}' cleanup error (can be ignored)", server_name)
+    except (RuntimeError, BaseExceptionGroup):
+        logger.debug("MCP server '{}' cleanup error (can be ignored)", server_name)
+
+
+async def close_mcp_servers(state: Any) -> None:
+    """Close every MCP connection while excluding reconnect and hot reload."""
+    state._mcp_closing = True
+    async with _reload_lock(state):
+        connections = list(state._mcp_stacks.items())
+        state._mcp_stacks.clear()
+        for name, connection in connections:
+            try:
+                await connection.aclose()
+            except asyncio.CancelledError:
+                if task_is_cancelling():
+                    raise
+                logger.debug("MCP server '{}' cleanup error (can be ignored)", name)
+            except (RuntimeError, BaseExceptionGroup):
+                logger.debug("MCP server '{}' cleanup error (can be ignored)", name)

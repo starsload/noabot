@@ -120,31 +120,10 @@ class Nanobot:
         elif model_preset is not None:
             config.agents.defaults.model_preset = model_preset
 
-        provider = _make_provider(config)
-        bus = MessageBus()
-        defaults = config.agents.defaults
-
-        loop = AgentLoop(
-            bus=bus,
-            provider=provider,
-            workspace=config.workspace_path,
-            model=defaults.model,
-            max_iterations=defaults.max_tool_iterations,
-            context_window_tokens=defaults.context_window_tokens,
-            context_block_limit=defaults.context_block_limit,
-            max_tool_result_chars=defaults.max_tool_result_chars,
-            provider_retry_mode=defaults.provider_retry_mode,
-            web_config=config.tools.web,
-            exec_config=config.tools.exec,
-            restrict_to_workspace=config.tools.restrict_to_workspace,
-            mcp_servers=config.tools.mcp_servers,
-            timezone=defaults.timezone,
-            unified_session=defaults.unified_session,
-            disabled_skills=defaults.disabled_skills,
-            session_ttl_minutes=defaults.session_ttl_minutes,
-            openpets_enabled=config.openpets.enabled,
-            openpets_cli_path=config.openpets.cli_path,
-            openpets_pet_name=config.openpets.pet_name,
+        loop = AgentLoop.from_config(
+            config,
+            image_generation_provider_configs=image_gen_provider_configs(config),
+            hook_factories=[create_file_edit_activity_hook],
         )
         return cls(loop, config=config)
 

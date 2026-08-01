@@ -31,17 +31,18 @@ from nanobot.agent.memory import Consolidator
 from nanobot.agent.model_runtime import ModelRuntimeResolver
 from nanobot.agent.runner import _MAX_INJECTIONS_PER_TURN, AgentRunner, AgentRunSpec
 from nanobot.agent.subagent import SubagentManager
-from nanobot.agent.tools.claude_code import ClaudeCodeTool
-from nanobot.agent.tools.codex import CodexTool
-from nanobot.agent.tools.cron import CronTool
-from nanobot.agent.tools.filesystem import EditFileTool, ListDirTool, ReadFileTool, WriteFileTool
+from nanobot.agent.tools.context import RequestContext, bind_request_context, reset_request_context
+from nanobot.agent.tools.exec_session import ExecSessionManager
+from nanobot.agent.tools.file_state import FileStateStore, bind_file_states, reset_file_states
 from nanobot.agent.tools.message import MessageTool
 from nanobot.agent.tools.registry import ToolRegistry
-from nanobot.agent.tools.search import GlobTool, GrepTool
-from nanobot.agent.tools.shell import ExecTool
-from nanobot.agent.tools.spawn import SpawnTool
-from nanobot.agent.tools.web import WebFetchTool, WebSearchTool
-from nanobot.agent.tools.windows_control import WindowsControlTool
+from nanobot.agent.tools.self import MyTool
+from nanobot.agent.turn_delivery import (
+    TurnDelivery,
+    TurnDeliveryFactory,
+)
+from nanobot.agent.turn_delivery import TurnRoute as TurnRoute
+from nanobot.agent.turn_hooks import AgentTurnHookSpec, build_agent_turn_hook
 from nanobot.bus.events import InboundMessage, OutboundMessage
 from nanobot.bus.outbound_events import StreamedResponseEvent
 from nanobot.bus.queue import MessageBus
@@ -93,8 +94,14 @@ from nanobot.utils.runtime import (
 )
 
 if TYPE_CHECKING:
-    from nanobot.agent.openpets_hook import OpenPetsHook
-    from nanobot.config.schema import ChannelsConfig, ExecToolConfig, WebToolsConfig
+    from nanobot.agent.tools.mcp import MCPConnection
+    from nanobot.config.schema import (
+        ChannelsConfig,
+        Config,
+        MCPServerConfig,
+        ProviderConfig,
+        ToolsConfig,
+    )
     from nanobot.cron.service import CronService
     from nanobot.triggers.local_store import LocalTriggerStore
 
@@ -241,13 +248,6 @@ class AgentLoop:
     _PROVIDER_STATE_CHECKPOINT_VERSION_KEY = "provider_state_checkpoint_version"
     _PROVIDER_STATE_CHECKPOINT_VERSION = "v1"
 
-    _CHAT_ONLY_ALLOWED_TOOLS = frozenset({"web_search", "web_fetch"})
-    _CHAT_ONLY_OPTIONAL_TOOLS = frozenset({"noah_local_painter"})
-    _AUTOMATION_KINDS = frozenset({"cron", "heartbeat"})
-    _AUTOMATION_BLOCKED_TOOLS = frozenset({
-        "spawn",
-    })
-
     def __init__(
         self,
         bus: MessageBus,
@@ -274,9 +274,22 @@ class AgentLoop:
         hook_factories: list[AgentTurnHookFactory] | None = None,
         unified_session: bool = False,
         disabled_skills: list[str] | None = None,
-        openpets_enabled: bool = False,
-        openpets_cli_path: str = "npx",
-        openpets_pet_name: str | None = None,
+        tools_config: ToolsConfig | None = None,
+        image_generation_provider_config: ProviderConfig | None = None,
+        image_generation_provider_configs: dict[str, ProviderConfig] | None = None,
+        provider_snapshot_loader: Callable[..., ProviderSnapshot] | None = None,
+        provider_signature: tuple[object, ...] | None = None,
+        model_presets: dict[str, ModelPresetConfig] | None = None,
+        preset_catalog_loader: preset_helpers.PresetCatalogLoader | None = None,
+        model_preset: str | None = None,
+        dream_model_preset: str | None = None,
+        preset_snapshot_loader: preset_helpers.PresetSnapshotLoader | None = None,
+        runtime_events: RuntimeEventBus | None = None,
+        turn_delivery_factory: TurnDeliveryFactory | None = None,
+        runtime_model_publisher: Callable[[str, str | None], None] | None = None,
+        restart_mode: str = "auto",
+        local_trigger_store: LocalTriggerStore | None = None,
+        idle_compact_check_interval_seconds: int = 0,
     ):
         from nanobot.config.schema import ToolsConfig
 
@@ -355,24 +368,7 @@ class AgentLoop:
         self._start_time = time.time()
         self._last_usage: dict[str, int] = {}
         self._extra_hooks: list[AgentHook] = hooks or []
-        self._openpets_hook: OpenPetsHook | None = None
-
-        # -- OpenPets desktop pet hook -----------------------------------------
-        if openpets_enabled:
-            try:
-                from nanobot.agent.openpets_hook import OpenPetsHook
-
-                op_hook = OpenPetsHook(
-                    pet_id=openpets_pet_name,
-                )
-                self._extra_hooks.append(op_hook)
-                self._openpets_hook = op_hook
-                logger.info(
-                    "OpenPets hook enabled (pet={})",
-                    openpets_pet_name or "default",
-                )
-            except Exception:
-                logger.exception("Failed to create OpenPets hook")
+        self._hook_factories: list[AgentTurnHookFactory] = hook_factories or []
 
         self.context = ContextBuilder(workspace, timezone=timezone, disabled_skills=disabled_skills)
         self.sessions = session_manager or SessionManager(workspace)
@@ -630,35 +626,22 @@ class AgentLoop:
             self.tools.register(
                 MyTool(runtime_state=self, modify_allowed=self.tools_config.my.allow_set)
             )
-        self.tools.register(WindowsControlTool(workspace=self.workspace))
-        self.tools.register(CodexTool(workspace=self.workspace))
-        self.tools.register(ClaudeCodeTool(workspace=self.workspace))
+            registered.append("my")
+
+        logger.info("Registered {} tools: {}", len(registered), registered)
 
     async def _connect_mcp(self) -> None:
         """Connect configured MCP servers."""
         await agent_context.connect_mcp(self, self.tools)
 
-        try:
-            self._mcp_stacks = await connect_mcp_servers(self._mcp_servers, self.tools)
-            if self._mcp_stacks:
-                self._mcp_connected = True
-            else:
-                logger.warning("No MCP servers connected successfully (will retry next message)")
-        except asyncio.CancelledError as exc:
-            logger.warning("MCP connection cancelled (will retry next message): {}", exc)
-            self._mcp_stacks.clear()
-            # Clear cancellation state so later awaits can proceed
-            task = asyncio.current_task()
-            if task:
-                uncancel = getattr(task, "uncancel", None)
-                if callable(uncancel):
-                    while task.cancelling() > 0:
-                        uncancel()
-        except BaseException as e:
-            logger.error("Failed to connect MCP servers (will retry next message): {}", e)
-            self._mcp_stacks.clear()
-        finally:
-            self._mcp_connecting = False
+    def register_runtime_context_provider(
+        self,
+        provider: RuntimeContextProvider,
+    ) -> Callable[[], None]:
+        """Register a per-turn context provider and return an unsubscribe callback."""
+        if provider in self._runtime_context_providers:
+            return lambda: None
+        self._runtime_context_providers.append(provider)
 
         def _unsubscribe() -> None:
             with suppress(ValueError):
@@ -820,128 +803,39 @@ class AgentLoop:
             return UNIFIED_SESSION_KEY
         return msg.session_key
 
-    def _is_owner(self, msg: InboundMessage) -> bool | None:
-        """Return whether the sender matches configured owner IDs.
-
-        Returns None if no owner_ids are configured (all users have access).
-        Returns True/False based on whether the sender matches an owner_id.
-        """
-        owner_ids = self.sessions._owner_ids
-        if not owner_ids:
-            return None
-
-        sender_id = str(msg.sender_id).strip()
-        candidates = {sender_id, f"{msg.channel}:{sender_id}"}
-        return any(candidate in owner_ids for candidate in candidates)
-
-    @staticmethod
-    def _is_trusted_local_message(msg: InboundMessage) -> bool:
-        """Return True for trusted local/internal control-plane messages."""
-        return msg.channel in {"cli", "system"}
-
-    def _has_full_capabilities(self, msg: InboundMessage) -> bool:
-        """Return whether the message may use tools, skills, and admin commands."""
-        if self._is_trusted_local_message(msg):
-            return True
-        return self._is_owner(msg) is True
-
-    @staticmethod
-    def _owner_only_message() -> str:
-        """Return a consistent denial message for restricted actions."""
-        return "This action is only available to the configured owner or from the local CLI."
-
-    def _resolve_conversation_type(self, msg: InboundMessage) -> str:
-        """Infer whether the current message is a direct, group, or thread conversation."""
-        metadata = msg.metadata or {}
-
-        if (
-            metadata.get("thread_id")
-            or metadata.get("message_thread_id")
-            or metadata.get("thread_root_event_id")
-        ):
-            return "thread"
-
-        chat_type = str(metadata.get("chat_type") or "").strip().lower()
-        if chat_type in {"private", "direct", "p2p", "single", "dm", "im"}:
-            return "direct"
-        if chat_type in {"group", "supergroup", "channel"}:
-            return "group"
-        if chat_type in {"thread", "forum"}:
-            return "thread"
-
-        channel_type = str(metadata.get("channel_type") or "").strip().lower()
-        if channel_type == "im":
-            return "direct"
-        if channel_type:
-            return "group"
-
-        # Fallback: DM's chat_id equals sender_id for most platforms
-        return "direct" if msg.chat_id == msg.sender_id else "group"
-
-    def _speaker_context_kwargs(self, msg: InboundMessage) -> dict[str, Any]:
-        """Build speaker metadata for prompt runtime context."""
-        metadata = msg.metadata or {}
-        return {
-            "sender_id": str(msg.sender_id),
-            "sender_name": str(metadata.get("sender_name") or "").strip() or None,
-            "sender_username": str(metadata.get("sender_username") or "").strip() or None,
-            "conversation_type": self._resolve_conversation_type(msg),
-            "is_owner": self._is_owner(msg),
-        }
-
-    def _capability_mode(self, msg: InboundMessage) -> str:
-        """Return the capability mode for the current message."""
-        if self._has_full_capabilities(msg):
-            return "full"
-        if self._is_internal_automation_message(msg):
-            return "automation"
-        return "chat_only"
-
-    def _automation_kind(self, msg: InboundMessage) -> str | None:
-        """Return trusted internal automation kind when present."""
-        metadata = msg.metadata or {}
-        raw = str(metadata.get("_internal_automation") or "").strip().lower()
-        if raw in self._AUTOMATION_KINDS:
-            return raw
-        return None
-
-    def _is_internal_automation_message(self, msg: InboundMessage) -> bool:
-        """Return True for internally-tagged cron/heartbeat executions."""
-        return self._automation_kind(msg) is not None
-
-    def _allowed_tool_names_for_message(self, msg: InboundMessage) -> set[str]:
-        """Return the allowlisted tool names for this message."""
-        registered_tools = set(self.tools.tool_names)
-        if self._has_full_capabilities(msg):
-            return registered_tools
-        if self._is_internal_automation_message(msg):
-            return registered_tools.difference(self._AUTOMATION_BLOCKED_TOOLS)
-
-        allowed = set(self._CHAT_ONLY_ALLOWED_TOOLS)
-        allowed.update(registered_tools.intersection(self._CHAT_ONLY_OPTIONAL_TOOLS))
-        return registered_tools.intersection(allowed)
-
-    def _skill_names_for_message(
+    def _remember_unified_session_route(
         self,
+        session: Session,
         msg: InboundMessage,
-        allowed_tool_names: set[str] | None = None,
-    ) -> list[str] | None:
-        """Return explicitly surfaced skills for the current message."""
-        if self._capability_mode(msg) != "chat_only":
-            return None
+        *,
+        is_user_turn: bool,
+    ) -> None:
+        """Remember the latest user-facing route for unified-session delivery."""
+        if (
+            not self._unified_session
+            or session.key != UNIFIED_SESSION_KEY
+            or not is_user_turn
+            or msg.channel in {"cli", "system"}
+            or msg.sender_id == "subagent"
+        ):
+            return
+        _, automation_metadata = automation_history_overrides(msg.metadata)
+        if automation_metadata:
+            return
+        remember_last_channel(session.metadata, msg.channel, msg.chat_id)
 
-        allowed = allowed_tool_names or self._allowed_tool_names_for_message(msg)
-        if "noah_local_painter" not in allowed:
-            return None
-
-        skill_path = self.workspace / "skills" / "noah-local-painter" / "SKILL.md"
-        if skill_path.exists():
-            return ["noah-local-painter"]
-        return None
-
-    def _is_owner_only_command(self, command: str) -> bool:
-        """Return whether a slash command requires full capabilities."""
-        return command in {"/restart", "/status", "/stop"}
+    @staticmethod
+    def _replay_token_budget(runtime: LLMRuntime) -> int:
+        """Derive a token budget for session history replay from the context window."""
+        if runtime.context_window_tokens <= 0:
+            return 0
+        max_output = runtime.generation.max_tokens
+        try:
+            reserved_output = int(max_output)
+        except (TypeError, ValueError):
+            reserved_output = 4096
+        budget = runtime.context_window_tokens - max(1, reserved_output) - 1024
+        return budget if budget > 0 else max(128, runtime.context_window_tokens // 2)
 
     async def _run_agent_loop(
         self,
@@ -1243,47 +1137,7 @@ class AgentLoop:
             await self._connect_mcp()
             logger.info("Agent loop started")
 
-        # OpenPets startup notification
-        if self._openpets_hook:
-            await self._openpets_hook.startup_notification()
-
-        while self._running:
-            try:
-                msg = await asyncio.wait_for(self.bus.consume_inbound(), timeout=1.0)
-            except asyncio.TimeoutError:
-                self.auto_compact.check_expired(
-                    self._schedule_background,
-                    active_session_keys=self._pending_queues.keys(),
-                )
-                continue
-            except asyncio.CancelledError:
-                # Preserve real task cancellation so shutdown can complete cleanly.
-                # Only ignore non-task CancelledError signals that may leak from integrations.
-                if not self._running or asyncio.current_task().cancelling():
-                    raise
-                continue
-            except Exception as e:
-                logger.warning("Error consuming inbound message: {}, continuing...", e)
-                continue
-
-            raw = msg.content.strip()
-            if self.commands.is_priority(raw):
-                ctx = CommandContext(msg=msg, session=None, key=msg.session_key, raw=raw, loop=self)
-                result = await self.commands.dispatch_priority(ctx)
-                if result:
-                    await self.bus.publish_outbound(result)
-                continue
-            effective_key = self._effective_session_key(msg)
-            # If this session already has an active pending queue (i.e. a task
-            # is processing this session), route the message there for mid-turn
-            # injection instead of creating a competing task.
-            if effective_key in self._pending_queues:
-                pending_msg = msg
-                if effective_key != msg.session_key:
-                    pending_msg = dataclasses.replace(
-                        msg,
-                        session_key_override=effective_key,
-                    )
+            while self._running:
                 try:
                     msg = await asyncio.wait_for(self.bus.consume_inbound(), timeout=1.0)
                 except asyncio.TimeoutError:
@@ -1539,143 +1393,37 @@ class AgentLoop:
             destination = (
                 msg.chat_id.split(":", 1) if ":" in msg.chat_id else ("cli", msg.chat_id)
             )
-            logger.info("Processing system message from {}", msg.sender_id)
-            key = f"{channel}:{chat_id}"
-            session = self.sessions.get_or_create(key)
-            if self._restore_runtime_checkpoint(session):
-                self.sessions.save(session)
-            if self._restore_pending_user_turn(session):
-                self.sessions.save(session)
-
-            session, pending = self.auto_compact.prepare_session(session, key)
-
-            await self.consolidator.maybe_consolidate_by_tokens(session)
-            self._set_tool_context(channel, chat_id, msg.metadata.get("message_id"))
-            history = session.get_history(max_messages=0)
-            current_role = "assistant" if msg.sender_id == "subagent" else "user"
-
-            messages = self.context.build_messages(
-                history=history,
-                current_message=msg.content, channel=channel, chat_id=chat_id,
-                session_summary=pending,
-                current_role=current_role,
-            )
-            final_content, _, all_msgs, _, _ = await self._run_agent_loop(
-                messages, session=session, channel=channel, chat_id=chat_id,
-                message_id=msg.metadata.get("message_id"),
-            )
-            self._save_turn(session, all_msgs, 1 + len(history))
-            self._clear_runtime_checkpoint(session)
-            self.sessions.save(session)
-            self._schedule_background(self.consolidator.maybe_consolidate_by_tokens(session))
-            return OutboundMessage(
-                channel=channel,
-                chat_id=chat_id,
-                content=final_content or "Background task completed.",
-            )
-
-        # Extract document text from media at the processing boundary so all
-        # channels benefit without format-specific logic in ContextBuilder.
-        if msg.media:
-            new_content, image_only = extract_documents(msg.content, msg.media)
-            msg = dataclasses.replace(msg, content=new_content, media=image_only)
-
-        preview = msg.content[:80] + "..." if len(msg.content) > 80 else msg.content
-        logger.info("Processing message from {}:{}: {}", msg.channel, msg.sender_id, preview)
-
-        key = session_key or msg.session_key
-        session = self.sessions.get_or_create(key)
-        if self._restore_runtime_checkpoint(session):
-            self.sessions.save(session)
-        if self._restore_pending_user_turn(session):
-            self.sessions.save(session)
-
-        session, pending = self.auto_compact.prepare_session(session, key)
-
-        # Slash commands
-        raw = msg.content.strip()
-        # Check owner-only commands before dispatch
-        if self._is_owner_only_command(raw) and not self._has_full_capabilities(msg):
-            return OutboundMessage(
-                channel=msg.channel,
-                chat_id=msg.chat_id,
-                content=self._owner_only_message(),
-                metadata={"render_as": "text"},
-            )
-        ctx = CommandContext(msg=msg, session=session, key=key, raw=raw, loop=self)
-        if result := await self.commands.dispatch(ctx):
-            return result
-
-        await self.consolidator.maybe_consolidate_by_tokens(session)
-
-        self._set_tool_context(msg.channel, msg.chat_id, msg.metadata.get("message_id"))
-        if message_tool := self.tools.get("message"):
-            if isinstance(message_tool, MessageTool):
-                message_tool.start_turn()
-
-        history = session.get_history(max_messages=0)
-
-        capability_mode = self._capability_mode(msg)
-        allowed_tool_names = self._allowed_tool_names_for_message(msg)
-        skill_names = self._skill_names_for_message(msg, allowed_tool_names)
-
-        initial_messages = self.context.build_messages(
-            history=history,
-            current_message=msg.content,
-            session_summary=pending,
-            media=msg.media if msg.media else None,
-            channel=msg.channel,
-            chat_id=msg.chat_id,
-            **self._speaker_context_kwargs(msg),
-            capability_mode=capability_mode,
-            skill_names=skill_names,
-            allowed_tool_names=sorted(allowed_tool_names),
-        )
-
-        async def _bus_progress(content: str, *, tool_hint: bool = False) -> None:
-            meta = dict(msg.metadata or {})
-            meta["_progress"] = True
-            meta["_tool_hint"] = tool_hint
-            await self.bus.publish_outbound(
-                OutboundMessage(
-                    channel=msg.channel,
-                    chat_id=msg.chat_id,
-                    content=content,
-                    metadata=meta,
-                )
-            )
-
-        # Persist the triggering user message immediately, before running the
-        # agent loop. If the process is killed mid-turn (OOM, SIGKILL, self-
-        # restart, etc.), the existing runtime_checkpoint preserves the
-        # in-flight assistant/tool state but NOT the user message itself, so
-        # the user's prompt is silently lost on recovery. Saving it up front
-        # makes recovery possible from the session log alone.
-        user_persisted_early = False
-        if isinstance(msg.content, str) and msg.content.strip():
-            # Build runtime context and speaker prefix for early persistence
-            runtime_ctx = self.context._build_runtime_context(
-                msg.channel,
-                msg.chat_id,
-                self.context.timezone,
-                sender_id=str(msg.sender_id),
-                sender_name=str((msg.metadata or {}).get("sender_name") or "").strip() or None,
-                sender_username=str((msg.metadata or {}).get("sender_username") or "").strip() or None,
-                conversation_type=self._resolve_conversation_type(msg),
-                is_owner=self._is_owner(msg),
-            )
-            merged_content = f"{runtime_ctx}\n\n{msg.content}"
-            runtime_meta, user_text = ContextBuilder.extract_runtime_metadata(merged_content)
-            prefix = ContextBuilder.build_historical_speaker_prefix(runtime_meta)
-            persisted_content = f"{prefix or ''}{user_text}".strip() if prefix else msg.content
-            session.add_message("user", persisted_content)
-            self._mark_pending_user_turn(session)
-            self.sessions.save(session)
-            user_persisted_early = True
-
-        final_content, _, all_msgs, stop_reason, had_injections = await self._run_agent_loop(
-            initial_messages,
-            on_progress=on_progress or _bus_progress,
+            key = session_key or msg.session_key_override or f"{destination[0]}:{destination[1]}"
+        else:
+            key = session_key or msg.session_key
+        if delivery is None:
+            delivery = self.turn_delivery_factory.create(msg, key)
+        elif delivery.session_key != key:
+            raise ValueError("turn delivery session does not match the processing session")
+        if on_stream is None:
+            on_stream = delivery.on_stream
+        if on_stream_end is None:
+            on_stream_end = delivery.on_stream_end
+        t0 = time.time()
+        ctx = TurnContext(
+            msg=msg,
+            session=None,
+            session_key=key,
+            turn_id=f"{key}:{time.time_ns()}",
+            runtime=runtime,
+            kind=kind,
+            delivery=delivery,
+            original_user_text=(
+                None
+                if kind is TurnKind.SYSTEM
+                or turn_continuation.internal_continuation_inbound(msg.metadata)
+                else msg.content
+            ),
+            turn_wall_started_at=t0,
+            visible_run_started_at=turn_continuation.internal_continuation_run_started_at(
+                msg.metadata,
+            ),
+            on_progress=on_progress,
             on_stream=on_stream,
             on_stream_end=on_stream_end,
             on_runtime_admitted=on_runtime_admitted,
@@ -2240,33 +1988,12 @@ class AgentLoop:
                         ]
                     entry["content"] = filtered
             elif role == "user":
-                if isinstance(content, str) and content.startswith(ContextBuilder._RUNTIME_CONTEXT_TAG):
-                    # Extract speaker metadata and build historical prefix for group/shared sessions
-                    runtime_meta, user_text = ContextBuilder.extract_runtime_metadata(content)
-                    prefix = ContextBuilder.build_historical_speaker_prefix(runtime_meta)
-                    if user_text.strip():
-                        entry["content"] = f"{prefix or ''}{user_text}".strip()
-                    else:
-                        continue
                 if isinstance(content, list):
-                    filtered = []
-                    runtime_meta: dict[str, str] = {}
-                    for c in content:
-                        if c.get("type") == "text" and isinstance(c.get("text"), str) and c["text"].startswith(ContextBuilder._RUNTIME_CONTEXT_TAG):
-                            runtime_meta, _ = ContextBuilder.extract_runtime_metadata(c["text"])
-                            continue  # Strip runtime context from multimodal messages
-                        # Replace image blocks with placeholders
-                        from nanobot.utils.helpers import replace_image_blocks_with_placeholders
-                        image_filtered, _ = replace_image_blocks_with_placeholders([c])
-                        filtered.extend(image_filtered)
+                    filtered = self._sanitize_persisted_blocks(
+                        cast(list[object], content),
+                    )
                     if not filtered:
                         continue
-                    prefix = ContextBuilder.build_historical_speaker_prefix(runtime_meta)
-                    if prefix:
-                        if filtered[0].get("type") == "text" and isinstance(filtered[0].get("text"), str):
-                            filtered[0]["text"] = prefix + filtered[0]["text"]
-                        else:
-                            filtered.insert(0, {"type": "text", "text": prefix.rstrip()})
                     entry["content"] = filtered
                 if isinstance(runtime_context_meta, dict):
                     entry[RUNTIME_CONTEXT_HISTORY_META] = runtime_context_meta
@@ -2474,8 +2201,15 @@ class AgentLoop:
         on_progress: Callable[..., Awaitable[None]] | None = None,
         on_stream: Callable[[str], Awaitable[None]] | None = None,
         on_stream_end: Callable[..., Awaitable[None]] | None = None,
-        sender_id: str = "user",
-        metadata: dict[str, Any] | None = None,
+        ephemeral: bool = False,
+        _run_extra_hooks_for_ephemeral: bool = False,
+        hooks: list[AgentHook] | None = None,
+        hook_factories: list[AgentTurnHookFactory] | None = None,
+        tools: ToolRegistry | None = None,
+        persist_user_message: bool = True,
+        runtime: LLMRuntime | None = None,
+        on_runtime_admitted: Callable[[LLMRuntime], Awaitable[None]] | None = None,
+        attributes: Mapping[str, Any] | None = None,
     ) -> OutboundMessage | None:
         """Process an external message directly and return the outbound payload."""
         if channel == "system":
@@ -2486,14 +2220,7 @@ class AgentLoop:
             metadata[turn_continuation.SKIP_USER_PERSIST_META] = True
         msg = InboundMessage(
             channel=channel, sender_id=sender_id, chat_id=chat_id,
-            content=content, media=media or [], metadata=metadata or {},
-        )
-        return await self._process_message(
-            msg,
-            session_key=session_key,
-            on_progress=on_progress,
-            on_stream=on_stream,
-            on_stream_end=on_stream_end,
+            content=content, media=media or [], metadata=metadata,
         )
         # Share the dispatch lock so direct calls serialize with bus turns.
         lock = self._get_session_lock(session_key)

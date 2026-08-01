@@ -1,7 +1,8 @@
 """Configuration loading utilities."""
 
-import html
 import json
+import os
+import re
 from pathlib import Path
 from typing import Any, cast, overload
 
@@ -55,17 +56,89 @@ def load_config(config_path: Path | None = None) -> Config:
 
     path = config_path or get_config_path()
 
-    if path.exists():
+    if not path.exists():
         try:
-            with open(path, encoding="utf-8-sig") as f:
-                data = json.load(f)
-            data = _migrate_config(data)
-            return Config.model_validate(data)
-        except (json.JSONDecodeError, ValueError, pydantic.ValidationError) as e:
-            logger.warning(f"Failed to load config from {path}: {e}")
-            logger.warning("Using default configuration.")
+            config = Config()
+        except SettingsError as exc:
+            raise ConfigLoadError(
+                path,
+                kind="invalid_schema",
+                summary=(
+                    "Environment-based configuration could not be parsed. "
+                    "Check that complex NANOBOT_* values use valid JSON."
+                ),
+            ) from exc
+        except ValidationError as exc:
+            raise ConfigLoadError(
+                path,
+                kind="invalid_schema",
+                summary="Environment-based configuration is invalid.",
+                issues=validation_issues(exc),
+            ) from exc
+        _apply_ssrf_whitelist(config)
+        return config
 
-    return Config()
+    try:
+        with path.open(encoding="utf-8") as handle:
+            data = json.load(handle)
+    except json.JSONDecodeError as exc:
+        raise ConfigLoadError(
+            path,
+            kind="invalid_json",
+            summary=(
+                f"JSON syntax error at line {exc.lineno}, column {exc.colno}: "
+                f"{_sentence(exc.msg)}"
+            ),
+        ) from exc
+    except UnicodeDecodeError as exc:
+        raise ConfigLoadError(
+            path,
+            kind="io_error",
+            summary="The file is not valid UTF-8.",
+        ) from exc
+    except OSError as exc:
+        detail = exc.strerror or type(exc).__name__
+        raise ConfigLoadError(
+            path,
+            kind="io_error",
+            summary=f"Unable to read the file: {_sentence(detail)}",
+        ) from exc
+
+    if not isinstance(data, dict):
+        root_type = type(data).__name__
+        raise ConfigLoadError(
+            path,
+            kind="invalid_root",
+            summary="The top level of config.json must be a JSON object.",
+            issues=(
+                ConfigIssue(
+                    path=(),
+                    message=f"Expected an object, but found {root_type}.",
+                ),
+            ),
+        )
+
+    data = _migrate_config(cast(dict[str, Any], data))
+    try:
+        config = Config.model_validate(data)
+    except ValidationError as exc:
+        issues = validation_issues(exc)
+        raise ConfigLoadError(
+            path,
+            kind="invalid_schema",
+            summary=f"Found {len(issues)} invalid setting(s).",
+            issues=issues,
+        ) from exc
+
+    _apply_ssrf_whitelist(config)
+    return config
+
+
+def _apply_ssrf_whitelist(config: Config) -> None:
+    """Apply SSRF whitelist from config to the network security module."""
+    from nanobot.security.network import configure_ssrf_whitelist
+
+    configure_ssrf_whitelist(config.tools.ssrf_whitelist)
 
 
 def save_config(config: Config, config_path: Path | None = None) -> None:
@@ -99,74 +172,211 @@ def save_config(config: Config, config_path: Path | None = None) -> None:
     _write_text_atomic(path, json.dumps(data, indent=2, ensure_ascii=False))
 
 
-def _normalize_mcp_arg(value: object) -> object:
-    """Normalize HTML-escaped or accidentally quoted MCP command arguments."""
+def merge_missing_defaults(existing: object, defaults: object) -> object:
+    """Recursively add missing defaults without replacing configured values."""
+    if not isinstance(existing, dict) or not isinstance(defaults, dict):
+        return cast(object, existing)
+
+    existing_dict = cast(dict[str, object], existing)
+    defaults_dict = cast(dict[str, object], defaults)
+    merged = dict(existing_dict)
+    for key, value in defaults_dict.items():
+        if key not in merged:
+            merged[key] = value
+        else:
+            merged[key] = merge_missing_defaults(merged[key], value)
+    return merged
+
+
+_ENV_REF_PATTERN = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}")
+
+
+def resolve_config_env_vars(
+    config: Config,
+    *,
+    config_path: Path | None = None,
+) -> Config:
+    """Return *config* with ``${VAR}`` env-var references resolved.
+
+    Walks in place so fields declared with ``exclude=True`` survive;
+    returns the same instance when no references are present.
+    Raises ``ConfigLoadError`` if a referenced variable is not set.
+    """
+    missing = tuple(_missing_env_issues(config))
+    if missing:
+        raise ConfigLoadError(
+            config_path or get_config_path(),
+            kind="missing_env",
+            summary=f"Found {len(missing)} missing environment variable reference(s).",
+            issues=missing,
+        )
+    return _resolve_in_place(config)
+
+
+@overload
+def resolve_env_refs(value: str) -> str: ...
+
+
+@overload
+def resolve_env_refs(value: object) -> object: ...
+
+
+def resolve_env_refs(value: object) -> object:
+    """Resolve ``${VAR}`` references in a single string, leniently.
+
+    Unlike :func:`resolve_config_env_vars` (which walks a whole ``Config`` and
+    raises on a missing variable), this resolves one value and returns an empty
+    string if any reference is unset. It is meant for individual, lazily consumed
+    fields — e.g. a transcription provider's ``api_key`` or ``api_base`` — so a
+    missing variable degrades to "not configured" instead of producing a partial
+    value. Non-string input is returned unchanged.
+    """
     if not isinstance(value, str):
         return value
+    names = _ENV_REF_PATTERN.findall(value)
+    if any(name not in os.environ for name in names):
+        return ""
+    return _ENV_REF_PATTERN.sub(lambda m: os.environ[m.group(1)], value)
 
-    normalized = html.unescape(value).strip()
-    if normalized.startswith('"') and normalized.count('"') == 1:
-        normalized = normalized[1:]
-    elif normalized.endswith('"') and normalized.count('"') == 1:
-        normalized = normalized[:-1]
-    elif len(normalized) >= 2 and normalized[0] == normalized[-1] == '"':
-        normalized = normalized[1:-1]
-    return normalized
+
+def _resolve_in_place(obj: Any) -> Any:
+    if isinstance(obj, str):
+        new = _ENV_REF_PATTERN.sub(_env_replace, obj)
+        return new if new != obj else obj
+    if isinstance(obj, BaseModel):
+        updates: dict[str, Any] = {}
+        for name in type(obj).model_fields:
+            old = getattr(obj, name)
+            new = _resolve_in_place(old)
+            if new is not old:
+                updates[name] = new
+        extras = obj.__pydantic_extra__
+        new_extras: dict[str, Any] | None = None
+        if extras:
+            resolved = {k: _resolve_in_place(v) for k, v in extras.items()}
+            if any(resolved[k] is not extras[k] for k in extras):
+                new_extras = resolved
+        if not updates and new_extras is None:
+            return obj
+        copy = obj.model_copy(update=updates) if updates else obj.model_copy()
+        if new_extras is not None:
+            copy.__pydantic_extra__ = new_extras
+        return copy
+    if isinstance(obj, dict):
+        object_dict = cast(dict[str, Any], obj)
+        resolved = {key: _resolve_in_place(value) for key, value in object_dict.items()}
+        return (
+            resolved
+            if any(resolved[key] is not object_dict[key] for key in object_dict)
+            else cast(object, obj)
+        )
+    if isinstance(obj, list):
+        object_list = cast(list[Any], obj)
+        resolved = [_resolve_in_place(value) for value in object_list]
+        return (
+            resolved
+            if any(new is not old for new, old in zip(resolved, object_list))
+            else cast(object, obj)
+        )
+    return obj
+
+
+def _missing_env_issues(
+    obj: Any,
+    path: tuple[str | int, ...] = (),
+) -> list[ConfigIssue]:
+    if isinstance(obj, str):
+        return [
+            ConfigIssue(
+                path=path,
+                message=f"Environment variable '{name}' is not set.",
+            )
+            for name in dict.fromkeys(_ENV_REF_PATTERN.findall(obj))
+            if name not in os.environ
+        ]
+    if isinstance(obj, BaseModel):
+        issues: list[ConfigIssue] = []
+        for name, field in type(obj).model_fields.items():
+            alias = field.serialization_alias or field.alias or name
+            part = alias
+            issues.extend(_missing_env_issues(getattr(obj, name), (*path, part)))
+        for name, value in (obj.__pydantic_extra__ or {}).items():
+            issues.extend(_missing_env_issues(value, (*path, name)))
+        return issues
+    if isinstance(obj, dict):
+        object_dict = cast(dict[str | int, Any], obj)
+        issues = []
+        for name, value in object_dict.items():
+            part = name
+            issues.extend(_missing_env_issues(value, (*path, part)))
+        return issues
+    if isinstance(obj, list):
+        issues = []
+        for index, value in enumerate(cast(list[Any], obj)):
+            issues.extend(_missing_env_issues(value, (*path, index)))
+        return issues
+    return []
+
+
+def _resolve_env_vars(obj: object) -> object:
+    """Recursively resolve ``${VAR}`` patterns in plain strings/dicts/lists."""
+    if isinstance(obj, str):
+        return _ENV_REF_PATTERN.sub(_env_replace, obj)
+    if isinstance(obj, dict):
+        return {
+            key: _resolve_env_vars(value)
+            for key, value in cast(dict[str, object], obj).items()
+        }
+    if isinstance(obj, list):
+        return [_resolve_env_vars(value) for value in cast(list[object], obj)]
+    return obj
+
+
+def _env_replace(match: re.Match[str]) -> str:
+    name = match.group(1)
+    value = os.environ.get(name)
+    if value is None:
+        raise ValueError(
+            f"Environment variable '{name}' referenced in config is not set"
+        )
+    return value
 
 
 def _migrate_config(data: dict[str, Any]) -> dict[str, Any]:
     """Migrate old config formats to current."""
-    agents = data.get("agents", {})
-    defaults = agents.get("defaults", {})
-
-    legacy_memory_window_present = (
-        "memoryWindow" in defaults or "memory_window" in defaults
-    )
-    context_window_present = (
-        "contextWindowTokens" in defaults or "context_window_tokens" in defaults
-    )
-    if legacy_memory_window_present and not context_window_present:
-        defaults["shouldWarnDeprecatedMemoryWindow"] = True
-
-    defaults.pop("memoryWindow", None)
-    defaults.pop("memory_window", None)
-
-    # Move tools.exec.restrictToWorkspace -> tools.restrictToWorkspace
-    tools = data.get("tools", {})
-    exec_cfg = tools.get("exec", {})
-    if "restrictToWorkspace" in exec_cfg and "restrictToWorkspace" not in tools:
+    # Move tools.exec.restrictToWorkspace → tools.restrictToWorkspace
+    tools_value = data.get("tools", {})
+    if not isinstance(tools_value, dict):
+        return data
+    tools = cast(dict[str, Any], tools_value)
+    exec_cfg = _as_config_object(tools.get("exec", {}))
+    if (
+        exec_cfg is not None
+        and "restrictToWorkspace" in exec_cfg
+        and "restrictToWorkspace" not in tools
+    ):
         tools["restrictToWorkspace"] = exec_cfg.pop("restrictToWorkspace")
 
-    channels = data.get("channels", {})
-    if "qqPersonal" in channels and "qq_personal" not in channels:
-        channels["qq_personal"] = channels.pop("qqPersonal")
+    # Move tools.myEnabled / tools.mySet → tools.my.{enable, allowSet}.
+    # The old flat keys shipped in the initial MyTool landing; wrapping them in a
+    # sub-config keeps `web` / `exec` / `my` symmetric and gives room to grow.
+    if "myEnabled" in tools or "mySet" in tools:
+        my_cfg = tools.get("my")
+        if my_cfg is None:
+            my_cfg = {}
+            tools["my"] = my_cfg
+        if not isinstance(my_cfg, dict):
+            return data
+        my_cfg = cast(dict[str, Any], my_cfg)
+        if "myEnabled" in tools and "enable" not in my_cfg:
+            my_cfg["enable"] = tools.pop("myEnabled")
+        else:
+            tools.pop("myEnabled", None)
+        if "mySet" in tools and "allowSet" not in my_cfg:
+            my_cfg["allowSet"] = tools.pop("mySet")
+        else:
+            tools.pop("mySet", None)
 
-    mcp_servers = tools.get("mcpServers", {})
-    for server_cfg in mcp_servers.values():
-        if isinstance(server_cfg, dict) and isinstance(server_cfg.get("args"), list):
-            server_cfg["args"] = [_normalize_mcp_arg(arg) for arg in server_cfg["args"]]
-
-    # Migrate legacy voice flat provider keys:
-    # {
-    #   "voice": {"sttProvider": "...", "ttsProvider": "..."}
-    # }
-    # -> {
-    #   "voice": {"stt": {"provider": "..."}, "tts": {"provider": "..."}}
-    # }
-    voice = data.get("voice")
-    if isinstance(voice, dict):
-        stt_provider = voice.pop("sttProvider", voice.pop("stt_provider", None))
-        tts_provider = voice.pop("ttsProvider", voice.pop("tts_provider", None))
-        if stt_provider:
-            stt_cfg = voice.get("stt", {})
-            if isinstance(stt_cfg, dict) and "provider" not in stt_cfg:
-                stt_cfg["provider"] = stt_provider
-                voice["stt"] = stt_cfg
-        if tts_provider:
-            tts_cfg = voice.get("tts", {})
-            if isinstance(tts_cfg, dict) and "provider" not in tts_cfg:
-                tts_cfg["provider"] = tts_provider
-                voice["tts"] = tts_cfg
     return data
 
 

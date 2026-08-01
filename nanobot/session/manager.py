@@ -3,8 +3,11 @@
 import base64
 import errno
 import json
-import shutil
-import threading
+import os
+import re
+from collections import OrderedDict
+from contextlib import suppress
+from copy import deepcopy
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -952,53 +955,82 @@ class JsonlSessionStore:
 class SessionManager:
     """Manage session identity, caching, retention, and persistence."""
 
-    Sessions are stored as JSONL files in the sessions directory.
-    Owner sessions are merged into a shared file (owner_shared.jsonl).
-    """
-
-    _OWNER_SHARED_KEY = "owner:shared"
-    _OWNER_SHARED_FILENAME = "owner_shared.jsonl"
-
-    def __init__(self, workspace: Path, owner_ids: set[str] | None = None):
+    def __init__(self, workspace: Path, *, store: SessionStore | None = None):
         self.workspace = workspace
-        self.sessions_dir = ensure_dir(self.workspace / "sessions")
-        self.legacy_sessions_dir = get_legacy_sessions_dir()
-        self._cache: dict[str, Session] = {}
-        self._owner_ids = owner_ids or set()
-        # threading.Lock works in both sync and async contexts for single-process safety
-        self._owner_write_lock = threading.Lock()
+        self._jsonl_store = JsonlSessionStore(workspace)
+        self._store: SessionStore = store if store is not None else self._jsonl_store
+        self.sessions_dir = self._jsonl_store.sessions_dir
+        self.legacy_sessions_dir = self._jsonl_store.legacy_sessions_dir
+        self._cache: OrderedDict[str, Session] = OrderedDict()
+        # Preserve identity for sessions held by active callers without retaining idle ones.
+        self._overflow_cache: WeakValueDictionary[str, Session] = WeakValueDictionary()
+        self._max_cached_sessions = SESSION_CACHE_MAX_SIZE
+        self._file_cap_archiver: Callable[..., None] | None = None
 
-    def is_owner_session(self, key: str) -> bool:
-        """Check if a session key belongs to the owner."""
-        # Direct owner:shared key (set by channel layer via session_key_override)
-        if key == self._OWNER_SHARED_KEY:
-            return True
-        if not self._owner_ids:
-            return False
-        # key format is typically "channel:chat_id"
-        candidates = {key}
-        if ":" in key:
-            channel, chat_id = key.split(":", 1)
-            candidates.add(chat_id)
-            candidates.add(f"{channel}:{chat_id}")
-        return any(c in self._owner_ids for c in candidates)
+    def _remember(self, session: Session) -> None:
+        """Keep recent sessions strongly cached without duplicating live objects."""
+        self._overflow_cache.pop(session.key, None)
+        self._cache[session.key] = session
+        self._cache.move_to_end(session.key)
+        while len(self._cache) > self._max_cached_sessions:
+            key, evicted = self._cache.popitem(last=False)
+            self._overflow_cache[key] = evicted
+
+    def _cached(self, key: str) -> Session | None:
+        session = self._cache.get(key)
+        if session is not None:
+            self._cache.move_to_end(key)
+            return session
+
+        session = self._overflow_cache.get(key)
+        if session is not None:
+            self._remember(session)
+        return session
+
+    def get_cached(self, key: str) -> Session | None:
+        """Return a cached session without creating or loading one from disk."""
+        return self._cached(key)
+
+    def set_file_cap_archiver(self, archiver: Callable[..., None]) -> None:
+        """Archive unconsolidated overflow whenever a session is persisted."""
+        self._file_cap_archiver = archiver
+
+    @staticmethod
+    def safe_key(key: str) -> str:
+        """Public helper used by HTTP handlers to map an arbitrary key to a stable filename stem."""
+        return JsonlSessionStore.safe_key(key)
+
+    @staticmethod
+    def _storage_key(key: str) -> str:
+        """Collision-resistant encoding for internal session storage filenames."""
+        return JsonlSessionStore.storage_key(key)
+
+    @staticmethod
+    def _decode_storage_key(stem: str) -> str | None:
+        """Reverse _storage_key(): decode a base64url (no-padding) stem back to the original key."""
+        return JsonlSessionStore.decode_storage_key(stem)
+
+    @staticmethod
+    def decode_storage_key(stem: str) -> str | None:
+        """Public decoder for components that inspect canonical session filenames."""
+        return SessionManager._decode_storage_key(stem)
+
+    @classmethod
+    def _session_key_from_path(cls, path: Path) -> str | None:
+        """Decode a session key only from a canonical collision-resistant filename."""
+        return JsonlSessionStore.session_key_from_path(path)
 
     def _get_session_path(self, key: str) -> Path:
-        """Get the file path for a session. Owner sessions route to shared file."""
-        if self.is_owner_session(key):
-            return self.sessions_dir / self._OWNER_SHARED_FILENAME
-        safe_key = safe_filename(key.replace(":", "_"))
-        return self.sessions_dir / f"{safe_key}.jsonl"
+        """Get the collision-resistant workspace path for a session."""
+        return self._jsonl_store.get_session_path(key)
+
+    def _get_legacy_lossy_path(self, key: str) -> Path:
+        """Previous workspace session path using lossy ':' to '_' replacement."""
+        return self._jsonl_store.get_legacy_lossy_path(key)
 
     def _get_legacy_session_path(self, key: str) -> Path:
         """Legacy global session path (~/.nanobot/sessions/)."""
         return self._jsonl_store.get_legacy_session_path(key)
-
-    def _resolve_cache_key(self, key: str) -> str:
-        """Return the cache key to use. Owner sessions all share one key."""
-        if self.is_owner_session(key):
-            return self._OWNER_SHARED_KEY
-        return key
 
     def get_or_create(self, key: str) -> Session:
         """
@@ -1010,15 +1042,15 @@ class SessionManager:
         Returns:
             The session.
         """
-        cache_key = self._resolve_cache_key(key)
-        if cache_key in self._cache:
-            return self._cache[cache_key]
+        session = self._cached(key)
+        if session is not None:
+            return session
 
         session = self._load(key)
         if session is None:
-            session = Session(key=cache_key)
+            session = Session(key=key)
 
-        self._cache[cache_key] = session
+        self._remember(session)
         return session
 
     def _load(self, key: str) -> Session | None:
@@ -1032,57 +1064,22 @@ class SessionManager:
     def _session_payload(session: Session) -> SessionPayload:
         return JsonlSessionStore.session_payload(session)
 
-            with open(path, encoding="utf-8") as f:
-                for line in f:
-                    line = line.strip()
-                    if not line:
-                        continue
-
-                    data = json.loads(line)
-
-                    if data.get("_type") == "metadata":
-                        metadata = data.get("metadata", {})
-                        created_at = datetime.fromisoformat(data["created_at"]) if data.get("created_at") else None
-                        updated_at = datetime.fromisoformat(data["updated_at"]) if data.get("updated_at") else None
-                        last_consolidated = data.get("last_consolidated", 0)
-                    else:
-                        messages.append(data)
-
-            # For owner sessions, use a consistent key so cache works across channels
-            effective_key = self._OWNER_SHARED_KEY if self.is_owner_session(key) else key
-
-            return Session(
-                key=effective_key,
-                messages=messages,
-                created_at=created_at or datetime.now(),
-                updated_at=updated_at or datetime.now(),
-                metadata=metadata,
-                last_consolidated=last_consolidated
+    def save(self, session: Session, *, fsync: bool = False) -> None:
+        """Persist a session and retain it in the cache."""
+        archiver = self._file_cap_archiver
+        if archiver is not None:
+            session.enforce_file_cap(
+                on_archive=lambda messages: archiver(
+                    messages,
+                    session_key=session.key,
+                )
             )
 
-    def save(self, session: Session, channel: str | None = None) -> None:
-        """Save a session to disk. For owner sessions, uses a write lock."""
-        path = self._get_session_path(session.key)
+        self._store.save(session, fsync=fsync)
+        self._remember(session)
 
-        def _do_save():
-            with open(path, "w", encoding="utf-8") as f:
-                metadata_line = {
-                    "_type": "metadata",
-                    "key": self._OWNER_SHARED_KEY if self.is_owner_session(session.key) else session.key,
-                    "created_at": session.created_at.isoformat(),
-                    "updated_at": session.updated_at.isoformat(),
-                    "metadata": session.metadata,
-                    "last_consolidated": session.last_consolidated
-                }
-                f.write(json.dumps(metadata_line, ensure_ascii=False) + "\n")
-                for msg in session.messages:
-                    f.write(json.dumps(msg, ensure_ascii=False) + "\n")
-
-        if self.is_owner_session(session.key):
-            with self._owner_write_lock:
-                _do_save()
-        else:
-            _do_save()
+    def flush_all(self) -> int:
+        """Re-save every cached session with fsync for durable shutdown.
 
         Returns the number of sessions flushed.  Errors on individual
         sessions are logged but do not prevent other sessions from being
@@ -1101,8 +1098,77 @@ class SessionManager:
 
     def invalidate(self, key: str) -> None:
         """Remove a session from the in-memory cache."""
-        cache_key = self._resolve_cache_key(key)
-        self._cache.pop(cache_key, None)
+        self._cache.pop(key, None)
+        self._overflow_cache.pop(key, None)
+
+    def delete_session(self, key: str) -> bool:
+        """Delete a persisted session and invalidate its cache entry."""
+        self.invalidate(key)
+        return self._store.delete(key)
+
+    def fork_session_before_user_index(
+        self,
+        source_key: str,
+        target_key: str,
+        before_user_index: int,
+    ) -> Session | None:
+        """Create *target_key* from *source_key* before a global user-message index.
+
+        ``before_user_index`` is zero-based over user messages in the full session:
+        ``0`` means "before the first user message", ``1`` means "before the
+        second user message", and so on. A value equal to the total user-message
+        count copies the full session prefix. WebUI assistant-reply forks pass
+        the next user index so the selected completed assistant turn is included.
+        """
+        if before_user_index < 0:
+            return None
+        source = self._cached(source_key) or self._load(source_key)
+        if source is None:
+            return None
+
+        copied: list[dict[str, Any]] = []
+        user_index = 0
+        found_target = False
+        for message in source.messages:
+            if message.get("role") == "user":
+                if user_index == before_user_index:
+                    found_target = True
+                    break
+                user_index += 1
+            copied.append(public_history_message(message))
+        if user_index == before_user_index:
+            found_target = True
+        if not found_target:
+            return None
+
+        metadata = deepcopy(source.metadata)
+        for key in _FORK_VOLATILE_METADATA_KEYS:
+            metadata.pop(key, None)
+
+        last_consolidated = min(source.last_consolidated, len(copied))
+        if source.last_consolidated > len(copied):
+            metadata.pop("_last_summary", None)
+            last_consolidated = 0
+
+        now = datetime.now()
+        target = Session(
+            key=target_key,
+            messages=copied,
+            created_at=now,
+            updated_at=now,
+            metadata=metadata,
+            last_consolidated=last_consolidated,
+        )
+        self.save(target, fsync=True)
+        return target
+
+    def read_session_file(self, key: str) -> dict[str, Any] | None:
+        """Read a session without populating the cache."""
+        return cast(dict[str, Any] | None, self._store.read(key))
+
+    def read_session_metadata(self, key: str) -> dict[str, Any] | None:
+        """Read session metadata without loading the transcript."""
+        return cast(dict[str, Any] | None, self._store.read_metadata(key))
 
     def list_sessions(self) -> list[dict[str, Any]]:
         return cast(list[dict[str, Any]], self._store.list_sessions())

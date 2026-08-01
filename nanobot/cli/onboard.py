@@ -32,8 +32,8 @@ from nanobot.cli.models import (
     get_model_context_limit,
     get_model_suggestions,
 )
-from nanobot.config.loader import get_config_path, load_config
-from nanobot.config.schema import Config, get_channel_section
+from nanobot.config.loader import get_config_path, load_config, resolve_config_env_vars
+from nanobot.config.schema import Config, ModelPresetConfig
 
 console = Console()
 
@@ -1550,7 +1550,7 @@ def _show_summary(config: Config) -> None:
     # Channels
     channel_rows: list[tuple[str, str]] = []
     for name, display in _get_channel_names().items():
-        channel = get_channel_section(config.channels, name)
+        channel = getattr(config.channels, name, None)
         if channel:
             enabled = (
                 cast(dict[str, Any], channel).get("enabled", False)

@@ -44,11 +44,6 @@ class BaseChannel(ABC):
         self.logger = logger.bind(channel=self.name)
         self.bus = bus
         self._running = False
-        self._runtime_config: Any | None = None
-
-    def set_runtime_config(self, runtime_config: Any) -> None:
-        """Inject root runtime configuration when a channel needs global settings."""
-        self._runtime_config = runtime_config
 
     async def transcribe_audio(self, file_path: str | Path) -> str:
         """Transcribe an audio file via Whisper (OpenAI or Groq). Returns empty string on failure."""
@@ -232,44 +227,6 @@ class BaseChannel(ABC):
             return True
         return False
 
-    def _get_owner_ids(self) -> set[str]:
-        """Get owner_ids from runtime config (agents.identity.owner_ids)."""
-        if self._runtime_config is None:
-            return set()
-        identity = getattr(self._runtime_config, "agents", None)
-        if identity is None:
-            return set()
-        identity_cfg = getattr(identity, "identity", None)
-        if identity_cfg is None:
-            return set()
-        return set(identity_cfg.owner_ids or [])
-
-    def _get_merge_owner_in_group(self) -> bool:
-        """Get merge_owner_in_group config from this channel's config."""
-        cfg = self.config
-        if isinstance(cfg, dict):
-            # Check both snake_case and camelCase
-            return cfg.get("merge_owner_in_group", cfg.get("mergeOwnerInGroup", False))
-        # For pydantic models, check both formats
-        return getattr(cfg, "merge_owner_in_group", getattr(cfg, "mergeOwnerInGroup", False))
-
-    def _is_group_context(self, chat_id: str, sender_id: str, metadata: dict[str, Any] | None) -> bool:
-        """Determine if the current context is a group conversation (not a DM).
-
-        Uses metadata hints (conversation_type, guild_id, group_id) or
-        infers from chat_id != sender_id for platforms where DM chat_id equals sender_id.
-        """
-        if metadata:
-            # Check explicit conversation_type marker
-            conv_type = metadata.get("conversation_type", "").lower()
-            if conv_type in {"group", "guild", "channel", "room", "thread"}:
-                return True
-            # Check platform-specific group identifiers
-            if any(metadata.get(k) for k in ("guild_id", "group_id", "room_id", "team_id")):
-                return True
-        # Fallback: for many platforms, DM's chat_id equals sender_id
-        return chat_id != sender_id
-
     async def _handle_message(
         self,
         sender_id: str,
@@ -319,23 +276,6 @@ class BaseChannel(ABC):
                     sender_id,
                 )
             return
-
-        # Auto-merge owner's group messages into shared owner session if configured
-        if session_key is None:
-            owner_ids = self._get_owner_ids()
-            if owner_ids:
-                # Build candidate set similar to SessionManager.is_owner_session
-                candidates = {str(sender_id), f"{self.name}:{sender_id}"}
-                is_owner = any(c in owner_ids for c in candidates)
-                is_group = self._is_group_context(chat_id, sender_id, metadata)
-                merge_enabled = self._get_merge_owner_in_group()
-                # logger.info(
-                #     "{}: owner merge check - sender={}, owner_ids={}, candidates={}, is_owner={}, is_group={}, merge_enabled={}",
-                #     self.name, sender_id, owner_ids, candidates, is_owner, is_group, merge_enabled
-                # )
-                if is_owner and is_group and merge_enabled:
-                    session_key = "owner:shared"
-                    logger.info("{}: merging owner {} into shared session", self.name, sender_id)
 
         meta = metadata or {}
         if self.supports_streaming:

@@ -20,7 +20,6 @@ from nanobot.bus.queue import MessageBus
 from nanobot.channels.base import BaseChannel
 from nanobot.config.paths import get_runtime_subdir
 from nanobot.config.schema import Base
-from pydantic import ConfigDict, Field
 
 try:
     import socketio
@@ -233,7 +232,6 @@ class MochatGroupRule(Base):
 class MochatConfig(Base):
     """Mochat channel configuration."""
 
-    model_config = ConfigDict(extra="allow")  # Accept merge_owner_in_group and other extra fields
     enabled: bool = False
     base_url: str = "https://mochat.io"
     socket_url: str = ""

@@ -1,8 +1,6 @@
 """Utility functions for nanobot."""
 
 import base64
-import binascii
-import io
 import json
 import os
 import re
@@ -19,24 +17,147 @@ from typing import Any, TypeVar, cast, overload
 import tiktoken
 from loguru import logger
 
-try:
-    from PIL import Image, ImageOps
-except ImportError:  # pragma: no cover - Pillow is optional at import time
-    Image = None
-    ImageOps = None
-
-if Image is not None:
-    _RESAMPLING_LANCZOS = getattr(Image, "Resampling", Image).LANCZOS
-else:  # pragma: no cover - Pillow unavailable
-    _RESAMPLING_LANCZOS = None
+_TOOLS_TOKEN_CACHE_MAX_ENTRIES = 64
+_TOOLS_TOKEN_CACHE: dict[int, tuple[tuple[int, ...], dict[bool, int]]] = {}
+_T = TypeVar("_T")
 
 
-LLM_INLINE_IMAGE_MAX_BYTES = 7_500_000
-LLM_INLINE_IMAGE_MAX_EDGE = 2048
-LLM_INLINE_IMAGE_MIN_EDGE = 512
-LLM_INLINE_IMAGE_DEFAULT_JPEG_QUALITY = 85
-LLM_INLINE_IMAGE_MIN_JPEG_QUALITY = 55
-ESTIMATED_TOKENS_PER_INLINE_IMAGE = 1024
+@overload
+def sanitize_surrogates(text: str) -> str: ...
+
+
+@overload
+def sanitize_surrogates(text: _T) -> _T: ...
+
+
+def sanitize_surrogates(text: Any) -> Any:
+    """Reconstruct surrogate pairs and replace unpaired surrogates.
+
+    Lone UTF-16 surrogate code points (``U+D800``..``U+DFFF``) cannot be
+    encoded as UTF-8 and cause ``UnicodeEncodeError`` when the message is
+    serialized for an HTTP request body. This helper round-trips through
+    UTF-16 to reconstruct genuine surrogate pairs (produced e.g. by Windows
+    console input for emoji) and substitutes lone surrogates with
+    ``U+FFFD``.
+
+    Non-string inputs are returned unchanged so this helper is safe to call
+    on arbitrary message payload leaves.
+    """
+    if not isinstance(text, str):
+        return text
+    # Fast path: no surrogate code points → return the original object so
+    # callers can rely on identity to detect an actual mutation.
+    for ch in text:
+        cp = ord(ch)
+        if 0xD800 <= cp <= 0xDFFF:
+            break
+    else:
+        return text
+    return text.encode("utf-16-le", errors="surrogatepass").decode(
+        "utf-16-le", errors="replace"
+    )
+
+
+def sanitize_surrogates_deep(value: Any) -> Any:
+    """Recursively apply :func:`sanitize_surrogates` to every string leaf.
+
+    Lists and dicts are rebuilt only when a nested string actually changes,
+    so the common case (no surrogates present) returns the original object
+    without allocations.
+    """
+    if isinstance(value, str):
+        cleaned = sanitize_surrogates(value)
+        return cleaned
+    if isinstance(value, list):
+        result_list: list[Any] = []
+        mutated = False
+        for item in cast(list[Any], value):
+            new_item = sanitize_surrogates_deep(item)
+            if new_item is not item:
+                mutated = True
+            result_list.append(new_item)
+        return result_list if mutated else cast(Any, value)
+    if isinstance(value, dict):
+        result_dict: dict[Any, Any] = {}
+        mutated = False
+        for key, item in cast(dict[Any, Any], value).items():
+            new_item = sanitize_surrogates_deep(item)
+            if new_item is not item:
+                mutated = True
+            result_dict[key] = new_item
+        return result_dict if mutated else cast(Any, value)
+    if isinstance(value, tuple):
+        tuple_value = cast(tuple[Any, ...], value)
+        result_tuple = tuple(sanitize_surrogates_deep(item) for item in tuple_value)
+        return (
+            result_tuple
+            if any(a is not b for a, b in zip(result_tuple, tuple_value))
+            else cast(Any, value)
+        )
+    return value
+
+
+@lru_cache(maxsize=1)
+def _get_token_encoding() -> Any:
+    return tiktoken.get_encoding("cl100k_base")
+
+
+def _cache_tools_token_count(
+    tools_id: int,
+    fingerprint: tuple[int, ...],
+    counts: dict[bool, int],
+) -> None:
+    if (
+        tools_id not in _TOOLS_TOKEN_CACHE
+        and len(_TOOLS_TOKEN_CACHE) >= _TOOLS_TOKEN_CACHE_MAX_ENTRIES
+    ):
+        _TOOLS_TOKEN_CACHE.pop(next(iter(_TOOLS_TOKEN_CACHE)))
+    _TOOLS_TOKEN_CACHE[tools_id] = (fingerprint, counts)
+
+
+def _estimate_tools_tokens(
+    enc: Any,
+    tools: list[dict[str, Any]],
+    *,
+    leading_separator: bool,
+) -> int:
+    """Estimate stable tool definition tokens without re-encoding every loop."""
+    # ToolRegistry keeps the returned definitions list alive until the registry changes.
+    tools_id = id(tools)
+    fingerprint = tuple(id(tool) for tool in tools)
+    cached = _TOOLS_TOKEN_CACHE.get(tools_id)
+    if cached and cached[0] == fingerprint:
+        token_count = cached[1].get(leading_separator)
+        if token_count is not None:
+            return token_count
+        counts = cached[1]
+    else:
+        counts = {}
+
+    rendered = json.dumps(tools, ensure_ascii=False)
+    if leading_separator:
+        rendered = "\n" + rendered
+    token_count = len(enc.encode(rendered))
+    counts[leading_separator] = token_count
+    _cache_tools_token_count(tools_id, fingerprint, counts)
+    return token_count
+
+
+def _tag_regex(tags: tuple[str, ...]) -> str:
+    return rf"(?:{'|'.join(re.escape(tag) for tag in tags)})"
+
+
+_THINKING_TAGS = ("think", "thinking", "thought")
+_THINKING_TAG = _tag_regex(_THINKING_TAGS)
+_INLINE_SELF_CLOSING_THINKING_TAG = r"(?:thinking)"
+_THINKING_TAG_PREFIX = "|".join(
+    sorted(
+        {re.escape(tag[:i]) for tag in _THINKING_TAGS for i in range(1, len(tag) + 1)},
+        key=len,
+        reverse=True,
+    )
+)
+_PARTIAL_THINKING_TAG = rf"</?(?:{_THINKING_TAG_PREFIX})>?"
 
 
 def strip_think(text: str) -> str:
@@ -204,278 +325,15 @@ def detect_image_mime(data: bytes) -> str | None:
     return None
 
 
-def prepare_image_for_llm(
-    raw: bytes,
-    mime: str | None = None,
-    *,
-    max_bytes: int = LLM_INLINE_IMAGE_MAX_BYTES,
-    max_edge: int = LLM_INLINE_IMAGE_MAX_EDGE,
-) -> tuple[bytes, str]:
-    """Normalize an image for inline LLM transport.
-
-    We keep images under a conservative byte budget so the base64 data URI
-    stays below provider limits, and we bound the maximum edge length so large
-    screenshots do not balloon token/transport cost.
-    """
-    detected_mime = mime or detect_image_mime(raw) or "application/octet-stream"
-    if not detected_mime.startswith("image/") or Image is None:
-        return raw, detected_mime
-
-    try:
-        with Image.open(io.BytesIO(raw)) as opened:
-            image = opened.copy()
-    except Exception:
-        return raw, detected_mime
-
-    if ImageOps is not None:
-        try:
-            image = ImageOps.exif_transpose(image)
-        except Exception:
-            pass
-
-    width, height = image.size
-    if width <= 0 or height <= 0:
-        return raw, detected_mime
-    if len(raw) <= max_bytes and max(width, height) <= max_edge:
-        return raw, detected_mime
-
-    image.load()
-    best_bytes = raw
-    best_mime = detected_mime
-    current_edge = min(max(width, height), max_edge)
-    quality = LLM_INLINE_IMAGE_DEFAULT_JPEG_QUALITY
-
-    while True:
-        resized = _resize_image_to_edge(image, current_edge)
-        candidates = _encode_image_candidates(
-            resized,
-            detected_mime,
-            quality=quality,
-        )
-        if candidates:
-            encoded_bytes, encoded_mime = min(candidates, key=lambda item: len(item[0]))
-            if len(encoded_bytes) < len(best_bytes):
-                best_bytes = encoded_bytes
-                best_mime = encoded_mime
-            if len(encoded_bytes) <= max_bytes:
-                return encoded_bytes, encoded_mime
-
-        if current_edge <= LLM_INLINE_IMAGE_MIN_EDGE and quality <= LLM_INLINE_IMAGE_MIN_JPEG_QUALITY:
-            return best_bytes, best_mime
-
-        if current_edge > LLM_INLINE_IMAGE_MIN_EDGE:
-            current_edge = max(int(current_edge * 0.85), LLM_INLINE_IMAGE_MIN_EDGE)
-        if quality > LLM_INLINE_IMAGE_MIN_JPEG_QUALITY:
-            quality = max(quality - 5, LLM_INLINE_IMAGE_MIN_JPEG_QUALITY)
-
-
-def normalize_message_image_blocks_for_llm(
-    messages: list[dict[str, Any]],
-    *,
-    max_bytes: int = LLM_INLINE_IMAGE_MAX_BYTES,
-    max_edge: int = LLM_INLINE_IMAGE_MAX_EDGE,
+def build_image_content_blocks(
+    raw: bytes, mime: str, path: str, label: str
 ) -> list[dict[str, Any]]:
-    """Rewrite inline data-uri images in messages to fit LLM transport limits."""
-    changed = False
-    normalized_messages: list[dict[str, Any]] = []
-
-    for message in messages:
-        content = message.get("content")
-        if not isinstance(content, list):
-            normalized_messages.append(message)
-            continue
-
-        normalized_content: list[Any] = []
-        content_changed = False
-        for block in content:
-            normalized_block = _normalize_message_image_block(
-                block,
-                max_bytes=max_bytes,
-                max_edge=max_edge,
-            )
-            if normalized_block is not block:
-                content_changed = True
-            normalized_content.append(normalized_block)
-
-        if content_changed:
-            normalized_messages.append({**message, "content": normalized_content})
-            changed = True
-        else:
-            normalized_messages.append(message)
-
-    return normalized_messages if changed else messages
-
-
-def _normalize_message_image_block(
-    block: Any,
-    *,
-    max_bytes: int,
-    max_edge: int,
-) -> Any:
-    if not isinstance(block, dict):
-        return block
-
-    block_type = block.get("type")
-    if block_type == "image_url":
-        image_url = block.get("image_url") or {}
-        url = image_url.get("url")
-        if not isinstance(url, str):
-            return block
-        normalized = _normalize_data_uri_image(url, max_bytes=max_bytes, max_edge=max_edge)
-        if normalized is None or normalized == url:
-            return block
-        return {
-            **block,
-            "image_url": {**image_url, "url": normalized},
-        }
-
-    if block_type == "input_image":
-        url = block.get("image_url")
-        if not isinstance(url, str):
-            return block
-        normalized = _normalize_data_uri_image(url, max_bytes=max_bytes, max_edge=max_edge)
-        if normalized is None or normalized == url:
-            return block
-        return {
-            **block,
-            "image_url": normalized,
-        }
-
-    return block
-
-
-def image_block_placeholder(block: dict[str, Any]) -> str | None:
-    """Return a compact text placeholder for a multimodal image block."""
-    if not isinstance(block, dict):
-        return None
-
-    block_type = block.get("type")
-    if block_type not in {"image_url", "input_image"}:
-        return None
-
-    path = (block.get("_meta") or {}).get("path", "")
-    if path:
-        return f"[image: {path}]"
-    return "[image]"
-
-
-def replace_image_blocks_with_placeholders(content: list[Any]) -> tuple[list[Any], bool]:
-    """Replace multimodal image blocks with lightweight text placeholders."""
-    replaced = False
-    normalized: list[Any] = []
-    for part in content:
-        if isinstance(part, dict):
-            placeholder = image_block_placeholder(part)
-            if placeholder is not None:
-                normalized.append({"type": "text", "text": placeholder})
-                replaced = True
-                continue
-        normalized.append(part)
-    return normalized, replaced
-
-
-def _normalize_data_uri_image(
-    url: str,
-    *,
-    max_bytes: int,
-    max_edge: int,
-) -> str | None:
-    match = re.match(r"^data:(image/[\w.+-]+);base64,(.+)$", url, re.DOTALL)
-    if not match:
-        return None
-
-    try:
-        raw = base64.b64decode(match.group(2), validate=True)
-    except (ValueError, binascii.Error):
-        return None
-
-    normalized_raw, normalized_mime = prepare_image_for_llm(
-        raw,
-        match.group(1),
-        max_bytes=max_bytes,
-        max_edge=max_edge,
-    )
-    if normalized_raw == raw and normalized_mime == match.group(1):
-        return url
-
-    encoded = base64.b64encode(normalized_raw).decode()
-    return f"data:{normalized_mime};base64,{encoded}"
-
-
-def _resize_image_to_edge(image: Any, max_edge: int) -> Any:
-    width, height = image.size
-    if max(width, height) <= max_edge:
-        return image.copy()
-    scale = max_edge / float(max(width, height))
-    new_size = (
-        max(1, int(round(width * scale))),
-        max(1, int(round(height * scale))),
-    )
-    return image.resize(new_size, _RESAMPLING_LANCZOS)
-
-
-def _encode_image_candidates(
-    image: Any,
-    source_mime: str,
-    *,
-    quality: int,
-) -> list[tuple[bytes, str]]:
-    candidates: list[tuple[bytes, str]] = []
-    has_alpha = image.mode in {"RGBA", "LA"} or ("transparency" in image.info)
-
-    if source_mime in {"image/png", "image/gif", "image/webp"} and has_alpha:
-        png_bytes = _encode_image(image, fmt="PNG")
-        if png_bytes is not None:
-            candidates.append((png_bytes, "image/png"))
-
-    if source_mime == "image/png" and not has_alpha:
-        png_bytes = _encode_image(image, fmt="PNG")
-        if png_bytes is not None:
-            candidates.append((png_bytes, "image/png"))
-
-    jpeg_ready = image
-    if jpeg_ready.mode not in {"RGB", "L"}:
-        rgba = image.convert("RGBA")
-        background = Image.new("RGBA", rgba.size, color="white")
-        jpeg_ready = Image.alpha_composite(background, rgba).convert("RGB")
-    elif jpeg_ready.mode == "L":
-        jpeg_ready = jpeg_ready.convert("RGB")
-
-    jpeg_bytes = _encode_image(jpeg_ready, fmt="JPEG", quality=quality)
-    if jpeg_bytes is not None:
-        candidates.append((jpeg_bytes, "image/jpeg"))
-
-    return candidates
-
-
-def _encode_image(image: Any, *, fmt: str, quality: int | None = None) -> bytes | None:
-    buffer = io.BytesIO()
-    try:
-        if fmt == "PNG":
-            image.save(buffer, format="PNG", optimize=True)
-        elif fmt == "JPEG":
-            image.save(
-                buffer,
-                format="JPEG",
-                quality=quality or LLM_INLINE_IMAGE_DEFAULT_JPEG_QUALITY,
-                optimize=True,
-                progressive=True,
-            )
-        else:
-            return None
-    except Exception:
-        return None
-    return buffer.getvalue()
-
-
-def build_image_content_blocks(raw: bytes, mime: str, path: str, label: str) -> list[dict[str, Any]]:
     """Build native image blocks plus a short text label."""
-    normalized_raw, normalized_mime = prepare_image_for_llm(raw, mime)
-    b64 = base64.b64encode(normalized_raw).decode()
+    b64 = base64.b64encode(raw).decode()
     return [
         {
             "type": "image_url",
-            "image_url": {"url": f"data:{normalized_mime};base64,{b64}"},
+            "image_url": {"url": f"data:{mime};base64,{b64}"},
             "_meta": {"path": path},
         },
         {"type": "text", "text": label},
@@ -879,78 +737,24 @@ def estimate_prompt_tokens(
     messages: list[dict[str, Any]],
     tools: list[dict[str, Any]] | None = None,
 ) -> int:
-    """Estimate prompt tokens with tiktoken.
-
-    Counts all fields that providers send to the LLM: content, tool_calls,
-    reasoning_content, tool_call_id, name, plus per-message framing overhead.
-    """
-    try:
-        enc = tiktoken.get_encoding("cl100k_base")
-        parts: list[str] = []
-        image_count = 0
-        for msg in messages:
-            content = msg.get("content")
-            if isinstance(content, str):
-                parts.append(content)
-            elif isinstance(content, list):
-                for part in content:
-                    if isinstance(part, dict):
-                        if part.get("type") == "text":
-                            txt = part.get("text", "")
-                            if txt:
-                                parts.append(txt)
-                            continue
-                        placeholder = image_block_placeholder(part)
-                        if placeholder:
-                            parts.append(placeholder)
-                            image_count += 1
-
-            tc = msg.get("tool_calls")
-            if tc:
-                parts.append(json.dumps(tc, ensure_ascii=False))
-
-            rc = msg.get("reasoning_content")
-            if isinstance(rc, str) and rc:
-                parts.append(rc)
-
-            for key in ("name", "tool_call_id"):
-                value = msg.get(key)
-                if isinstance(value, str) and value:
-                    parts.append(value)
-
-        if tools:
-            parts.append(json.dumps(tools, ensure_ascii=False))
-
-        per_message_overhead = len(messages) * 4
-        return (
-            len(enc.encode("\n".join(parts)))
-            + per_message_overhead
-            + image_count * ESTIMATED_TOKENS_PER_INLINE_IMAGE
-        )
-    except Exception:
-        return 0
+    """Estimate prompt tokens with tiktoken and a conservative byte fallback."""
+    estimated, _ = _estimate_prompt_tokens_with_source(messages, tools)
+    return estimated
 
 
 def estimate_message_tokens(message: dict[str, Any]) -> int:
     """Estimate prompt tokens contributed by one persisted message."""
     content = message.get("content")
     parts: list[str] = []
-    image_count = 0
     if isinstance(content, str):
         parts.append(content)
     elif isinstance(content, list):
-        for part in content:
-            if isinstance(part, dict):
-                if part.get("type") == "text":
-                    text = part.get("text", "")
-                    if text:
-                        parts.append(text)
-                    continue
-                placeholder = image_block_placeholder(part)
-                if placeholder:
-                    parts.append(placeholder)
-                    image_count += 1
-                    continue
+        for raw_part in cast(list[object], content):
+            part = cast(dict[str, Any], raw_part) if isinstance(raw_part, dict) else None
+            if part is not None and part.get("type") == "text":
+                text = part.get("text", "")
+                if isinstance(text, str) and text:
+                    parts.append(text)
             else:
                 parts.append(json.dumps(raw_part, ensure_ascii=False))
     elif content is not None:
@@ -969,12 +773,12 @@ def estimate_message_tokens(message: dict[str, Any]) -> int:
 
     payload = "\n".join(parts)
     if not payload:
-        return max(4, image_count * ESTIMATED_TOKENS_PER_INLINE_IMAGE)
+        return 4
     try:
-        enc = tiktoken.get_encoding("cl100k_base")
-        return max(4, len(enc.encode(payload)) + 4 + image_count * ESTIMATED_TOKENS_PER_INLINE_IMAGE)
+        enc = _get_token_encoding()
+        return max(4, len(enc.encode(payload)) + 4)
     except Exception:
-        return max(4, len(payload) // 4 + 4 + image_count * ESTIMATED_TOKENS_PER_INLINE_IMAGE)
+        return max(4, len(payload.encode("utf-8")) + 4)
 
 
 def estimate_prompt_tokens_chain(
