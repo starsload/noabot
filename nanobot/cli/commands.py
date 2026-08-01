@@ -357,6 +357,9 @@ def serve(
             session_manager=session_manager,
             image_generation_provider_configs=image_gen_provider_configs(runtime_config),
             hook_factories=[create_file_edit_activity_hook],
+            openpets_enabled=runtime_config.openpets.enabled,
+            openpets_pet_name=runtime_config.openpets.pet_name,
+            openpets_say_max_length=runtime_config.openpets.say_max_length,
         )
     except ValueError as exc:
         console.print(f"[red]Error: {exc}[/red]")

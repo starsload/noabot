@@ -124,6 +124,9 @@ class Nanobot:
             config,
             image_generation_provider_configs=image_gen_provider_configs(config),
             hook_factories=[create_file_edit_activity_hook],
+            openpets_enabled=config.openpets.enabled,
+            openpets_pet_name=config.openpets.pet_name,
+            openpets_say_max_length=config.openpets.say_max_length,
         )
         return cls(loop, config=config)
 

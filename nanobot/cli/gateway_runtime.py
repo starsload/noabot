@@ -347,6 +347,9 @@ def _run_gateway(
         hooks=[TokenUsageHook(timezone_name=config.agents.defaults.timezone)],
         local_trigger_store=trigger_store,
         hook_factories=[create_file_edit_activity_hook],
+        openpets_enabled=config.openpets.enabled,
+        openpets_pet_name=config.openpets.pet_name,
+        openpets_say_max_length=config.openpets.say_max_length,
     )
     def _schedule_webui_background(awaitable: Awaitable[None]) -> None:
         agent.schedule_background(cast(Coroutine[Any, Any, None], awaitable))

@@ -31,6 +31,7 @@ from nanobot.agent.cron_turns import CronTurnCoordinator
 from nanobot.agent.hook import AgentHook, AgentTurnHookFactory
 from nanobot.agent.memory import Consolidator
 from nanobot.agent.model_runtime import ModelRuntimeResolver
+from nanobot.agent.openpets_hook import OpenPetsHook
 from nanobot.agent.runner import _MAX_INJECTIONS_PER_TURN, AgentRunner, AgentRunSpec
 from nanobot.agent.subagent import SubagentManager
 from nanobot.agent.tools.claude_code import CCDelegateTool, CCResumeTool, CCStatusTool
@@ -296,6 +297,9 @@ class AgentLoop:
         restart_mode: str = "auto",
         local_trigger_store: LocalTriggerStore | None = None,
         idle_compact_check_interval_seconds: int = 0,
+        openpets_enabled: bool = False,
+        openpets_pet_name: str | None = None,
+        openpets_say_max_length: int = 60,
     ):
         from nanobot.config.schema import ToolsConfig
 
@@ -375,6 +379,18 @@ class AgentLoop:
         self._last_usage: dict[str, int] = {}
         self._extra_hooks: list[AgentHook] = hooks or []
         self._hook_factories: list[AgentTurnHookFactory] = hook_factories or []
+
+        # -- OpenPets desktop pet hook -----------------------------------------
+        self._openpets_hook: OpenPetsHook | None = None
+        if openpets_enabled:
+            try:
+                self._openpets_hook = OpenPetsHook(
+                    pet_id=openpets_pet_name,
+                    say_max_length=openpets_say_max_length,
+                )
+                self._extra_hooks.append(self._openpets_hook)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("OpenPets hook init failed: {}", exc)
 
         self.context = ContextBuilder(workspace, timezone=timezone, disabled_skills=disabled_skills)
         self.sessions = session_manager or SessionManager(workspace)

@@ -408,6 +408,15 @@ class ToolsConfig(Base):
     ssrf_whitelist: list[str] = Field(default_factory=list)  # CIDR ranges to exempt from SSRF blocking (e.g. ["100.64.0.0/10"] for Tailscale)
 
 
+class OpenPetsConfig(Base):
+    """OpenPets desktop pet integration."""
+
+    enabled: bool = False
+    cli_path: str = "npx"
+    pet_name: str | None = None
+    say_max_length: int = 60
+
+
 class Config(BaseSettings):
     """Root configuration for nanobot."""
 
@@ -418,6 +427,7 @@ class Config(BaseSettings):
     api: ApiConfig = Field(default_factory=ApiConfig)
     gateway: GatewayConfig = Field(default_factory=GatewayConfig)
     tools: ToolsConfig = Field(default_factory=ToolsConfig)
+    openpets: OpenPetsConfig = Field(default_factory=OpenPetsConfig)
     model_presets: dict[str, ModelPresetConfig] = Field(
         default_factory=dict,
         validation_alias=AliasChoices("modelPresets", "model_presets"),
