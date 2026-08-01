@@ -39,6 +39,7 @@ from nanobot.agent.tools.file_state import FileStateStore, bind_file_states, res
 from nanobot.agent.tools.message import MessageTool
 from nanobot.agent.tools.noah_local_painter import NoahLocalPainterTool
 from nanobot.agent.tools.registry import ToolRegistry
+from nanobot.agent.tools.windows_control import WindowsControlTool
 from nanobot.agent.tools.self import MyTool
 from nanobot.agent.turn_delivery import (
     TurnDelivery,
@@ -643,6 +644,10 @@ class AgentLoop:
             NoahLocalPainterTool(workspace=self.workspace, send_callback=self.bus.publish_outbound)
         )
         registered.append("noah_local_painter")
+
+        # Windows control tool needs workspace — manual registration
+        self.tools.register(WindowsControlTool(workspace=self.workspace))
+        registered.append("windows_control")
 
         logger.info("Registered {} tools: {}", len(registered), registered)
 
