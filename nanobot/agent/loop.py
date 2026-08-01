@@ -24,6 +24,7 @@ from nanobot.agent import context as agent_context
 from nanobot.agent import model_presets as preset_helpers
 from nanobot.agent.autocompact import AutoCompact
 from nanobot.agent.automation_turns import publish_next_deferred_turn
+from nanobot.agent.claude_code_jobs import ClaudeCodeJobManager
 from nanobot.agent.codex_jobs import CodexJobManager
 from nanobot.agent.context import ContextBuilder
 from nanobot.agent.cron_turns import CronTurnCoordinator
@@ -32,6 +33,7 @@ from nanobot.agent.memory import Consolidator
 from nanobot.agent.model_runtime import ModelRuntimeResolver
 from nanobot.agent.runner import _MAX_INJECTIONS_PER_TURN, AgentRunner, AgentRunSpec
 from nanobot.agent.subagent import SubagentManager
+from nanobot.agent.tools.claude_code import CCDelegateTool, CCResumeTool, CCStatusTool
 from nanobot.agent.tools.codex import CodexDelegateTool, CodexResumeTool, CodexStatusTool
 from nanobot.agent.tools.context import RequestContext, bind_request_context, reset_request_context
 from nanobot.agent.tools.exec_session import ExecSessionManager
@@ -379,6 +381,7 @@ class AgentLoop:
         self.sessions.set_file_cap_archiver(self.context.memory.raw_archive)
         self.tools = ToolRegistry()
         self.codex_jobs = CodexJobManager(workspace=workspace, bus=bus)
+        self.claude_code_jobs = ClaudeCodeJobManager(workspace=workspace, bus=bus)
         # One file-read/write tracker per logical session. The tool registry is
         # shared by this loop, so tools resolve the active state via contextvars.
         self._file_state_store = FileStateStore()
@@ -638,6 +641,12 @@ class AgentLoop:
         self.tools.register(CodexStatusTool(manager=self.codex_jobs))
         self.tools.register(CodexResumeTool(manager=self.codex_jobs))
         registered.extend(("codex_delegate", "codex_status", "codex_resume"))
+
+        # Claude Code job tools need the shared ClaudeCodeJobManager — manual registration
+        self.tools.register(CCDelegateTool(manager=self.claude_code_jobs))
+        self.tools.register(CCStatusTool(manager=self.claude_code_jobs))
+        self.tools.register(CCResumeTool(manager=self.claude_code_jobs))
+        registered.extend(("cc_delegate", "cc_status", "cc_resume"))
 
         # Noah local painter tool needs workspace + bus — manual registration
         self.tools.register(
@@ -1156,6 +1165,7 @@ class AgentLoop:
         self._running = True
         try:
             await self.codex_jobs.restore_pending_jobs()
+            await self.claude_code_jobs.restore_pending_jobs()
             await self._connect_mcp()
             logger.info("Agent loop started")
 
@@ -1369,6 +1379,7 @@ class AgentLoop:
             self.subagents.close,
             self._exec_session_manager.close_all,
             self.codex_jobs.close,
+            self.claude_code_jobs.close,
             lambda: agent_context.close_mcp(self),
         )
         for cleanup in cleanup_steps:
