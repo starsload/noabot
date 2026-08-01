@@ -632,6 +632,9 @@ def gateway(
         unified_session=config.agents.defaults.unified_session,
         disabled_skills=config.agents.defaults.disabled_skills,
         session_ttl_minutes=config.agents.defaults.session_ttl_minutes,
+        openpets_enabled=config.openpets.enabled,
+        openpets_cli_path=config.openpets.cli_path,
+        openpets_pet_name=config.openpets.pet_name,
     )
 
     # Set cron callback (needs agent)
@@ -669,15 +672,16 @@ def gateway(
             return response
 
         if job.payload.deliver and job.payload.to and response:
+            from nanobot.bus.events import OutboundMessage
+            response_text = response.content if isinstance(response, OutboundMessage) else str(response)
             should_notify = await evaluate_response(
-                response, job.payload.message, provider, agent.model,
+                response_text, job.payload.message, provider, agent.model,
             )
             if should_notify:
-                from nanobot.bus.events import OutboundMessage
                 await bus.publish_outbound(OutboundMessage(
                     channel=job.payload.channel or "cli",
                     chat_id=job.payload.to,
-                    content=response,
+                    content=response_text,
                 ))
         return response
     cron.on_job = on_cron_job
@@ -704,12 +708,13 @@ def gateway(
     # Create heartbeat service
     async def on_heartbeat_execute(tasks: str) -> str:
         """Phase 2: execute heartbeat tasks through the full agent loop."""
+        from nanobot.bus.events import OutboundMessage
         channel, chat_id = _pick_heartbeat_target()
 
         async def _silent(*_args, **_kwargs):
             pass
 
-        return await agent.process_direct(
+        result = await agent.process_direct(
             tasks,
             session_key="heartbeat",
             channel=channel,
@@ -718,6 +723,7 @@ def gateway(
             sender_id="heartbeat",
             metadata={"_internal_automation": "heartbeat"},
         )
+        return result.content if isinstance(result, OutboundMessage) else ""
 
     async def on_heartbeat_notify(response: str) -> None:
         """Deliver a heartbeat response to the user's channel."""
@@ -828,6 +834,9 @@ def agent(
         mcp_servers=config.tools.mcp_servers,
         channels_config=config.channels,
         owner_ids=config.agents.identity.owner_ids,
+        openpets_enabled=config.openpets.enabled,
+        openpets_cli_path=config.openpets.cli_path,
+        openpets_pet_name=config.openpets.pet_name,
     )
 
     # Shared reference for progress callbacks

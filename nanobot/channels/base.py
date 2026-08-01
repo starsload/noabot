@@ -212,10 +212,10 @@ class BaseChannel(ABC):
                 is_owner = any(c in owner_ids for c in candidates)
                 is_group = self._is_group_context(chat_id, sender_id, metadata)
                 merge_enabled = self._get_merge_owner_in_group()
-                logger.info(
-                    "{}: owner merge check - sender={}, owner_ids={}, candidates={}, is_owner={}, is_group={}, merge_enabled={}",
-                    self.name, sender_id, owner_ids, candidates, is_owner, is_group, merge_enabled
-                )
+                # logger.info(
+                #     "{}: owner merge check - sender={}, owner_ids={}, candidates={}, is_owner={}, is_group={}, merge_enabled={}",
+                #     self.name, sender_id, owner_ids, candidates, is_owner, is_group, merge_enabled
+                # )
                 if is_owner and is_group and merge_enabled:
                     session_key = "owner:shared"
                     logger.info("{}: merging owner {} into shared session", self.name, sender_id)

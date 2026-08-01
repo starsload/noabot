@@ -78,6 +78,7 @@ class QQPersonalConfig(Base):
     reconnect_delay_s: int = 5
     download_chunk_size: int = 1024 * 256
     download_max_bytes: int = 1024 * 1024 * 200
+    merge_owner_in_group: bool = False  # 合并owner的群聊消息到共享session
 
 
 class QQPersonalChannel(BaseChannel):
@@ -199,9 +200,11 @@ class QQPersonalChannel(BaseChannel):
         metadata: dict[str, Any] | None = None,
         session_key: str | None = None,
     ) -> None:
-        """Bypass allow_from for group chats while preserving base behavior for private chats."""
+        """Handle group and private messages with owner differentiation."""
         meta = metadata or {}
         is_group = meta.get("chat_type") == "group" or meta.get("is_group") is True
+
+        # Private chats: use base class logic (allow_from check + owner merge)
         if not is_group:
             await super()._handle_message(
                 sender_id=sender_id,
@@ -212,6 +215,25 @@ class QQPersonalChannel(BaseChannel):
                 session_key=session_key,
             )
             return
+
+        # Group chats: owner differentiation based on QQ号
+        # Only set session_key for owner merge; non-owner keeps default session_key (qq_personal:{chat_id})
+        if session_key is None:
+            owner_ids = self._get_owner_ids()
+            if owner_ids:
+                # sender_id is the QQ号, owner_ids format is "qq_personal:QQ号"
+                candidates = {str(sender_id), f"{self.name}:{sender_id}"}
+                is_owner = any(c in owner_ids for c in candidates)
+                merge_enabled = self._get_merge_owner_in_group()
+
+                if is_owner and merge_enabled:
+                    # Owner in group: merge to shared session
+                    session_key = "owner:shared"
+                    logger.info(
+                        "{}: owner {} in group {}, merging to shared session",
+                        self.name, sender_id, chat_id,
+                    )
+                # Non-owner: keep default session_key (no override needed)
 
         if self.supports_streaming:
             meta = {**meta, "_wants_stream": True}

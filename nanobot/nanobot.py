@@ -84,6 +84,9 @@ class Nanobot:
             unified_session=defaults.unified_session,
             disabled_skills=defaults.disabled_skills,
             session_ttl_minutes=defaults.session_ttl_minutes,
+            openpets_enabled=config.openpets.enabled,
+            openpets_cli_path=config.openpets.cli_path,
+            openpets_pet_name=config.openpets.pet_name,
         )
         return cls(loop)
 

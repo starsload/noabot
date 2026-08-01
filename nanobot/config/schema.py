@@ -270,6 +270,15 @@ class AvatarConfig(Base):
     motion_hotkeys: dict[str, str] = Field(default_factory=dict)
 
 
+class OpenPetsConfig(Base):
+    """OpenPets desktop pet integration."""
+
+    enabled: bool = False
+    cli_path: str = "npx"  # CLI command (usually "npx")
+    pet_name: str | None = None  # Pet name (None = default pet)
+    say_max_length: int = 60  # Max chars for speech bubbles
+
+
 class Config(BaseSettings):
     """Root configuration for nanobot."""
 
@@ -280,6 +289,7 @@ class Config(BaseSettings):
     tools: ToolsConfig = Field(default_factory=ToolsConfig)
     voice: VoiceConfig = Field(default_factory=VoiceConfig)
     avatar: AvatarConfig = Field(default_factory=AvatarConfig)
+    openpets: OpenPetsConfig = Field(default_factory=OpenPetsConfig)
 
     @property
     def workspace_path(self) -> Path:

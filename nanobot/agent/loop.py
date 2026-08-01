@@ -20,6 +20,8 @@ from nanobot.agent.memory import Consolidator, Dream
 from nanobot.agent.runner import _MAX_INJECTIONS_PER_TURN, AgentRunner, AgentRunSpec
 from nanobot.agent.skills import BUILTIN_SKILLS_DIR
 from nanobot.agent.subagent import SubagentManager
+from nanobot.agent.tools.claude_code import ClaudeCodeTool
+from nanobot.agent.tools.codex import CodexTool
 from nanobot.agent.tools.cron import CronTool
 from nanobot.agent.tools.filesystem import EditFileTool, ListDirTool, ReadFileTool, WriteFileTool
 from nanobot.agent.tools.message import MessageTool
@@ -29,6 +31,7 @@ from nanobot.agent.tools.search import GlobTool, GrepTool
 from nanobot.agent.tools.shell import ExecTool
 from nanobot.agent.tools.spawn import SpawnTool
 from nanobot.agent.tools.web import WebFetchTool, WebSearchTool
+from nanobot.agent.tools.windows_control import WindowsControlTool
 from nanobot.bus.events import InboundMessage, OutboundMessage
 from nanobot.bus.queue import MessageBus
 from nanobot.command import CommandContext, CommandRouter, register_builtin_commands
@@ -41,6 +44,7 @@ from nanobot.utils.helpers import truncate_text as truncate_text_fn
 from nanobot.utils.runtime import EMPTY_FINAL_RESPONSE_MESSAGE
 
 if TYPE_CHECKING:
+    from nanobot.agent.openpets_hook import OpenPetsHook
     from nanobot.config.schema import ChannelsConfig, ExecToolConfig, WebToolsConfig
     from nanobot.cron.service import CronService
 
@@ -133,6 +137,13 @@ class AgentLoop:
     _RUNTIME_CHECKPOINT_KEY = "runtime_checkpoint"
     _PENDING_USER_TURN_KEY = "pending_user_turn"
 
+    _CHAT_ONLY_ALLOWED_TOOLS = frozenset({"web_search", "web_fetch"})
+    _CHAT_ONLY_OPTIONAL_TOOLS = frozenset({"noah_local_painter"})
+    _AUTOMATION_KINDS = frozenset({"cron", "heartbeat"})
+    _AUTOMATION_BLOCKED_TOOLS = frozenset({
+        "spawn",
+    })
+
     def __init__(
         self,
         bus: MessageBus,
@@ -156,6 +167,9 @@ class AgentLoop:
         hooks: list[AgentHook] | None = None,
         unified_session: bool = False,
         disabled_skills: list[str] | None = None,
+        openpets_enabled: bool = False,
+        openpets_cli_path: str = "npx",
+        openpets_pet_name: str | None = None,
     ):
         from nanobot.config.schema import ExecToolConfig, WebToolsConfig
 
@@ -187,6 +201,24 @@ class AgentLoop:
         self._start_time = time.time()
         self._last_usage: dict[str, int] = {}
         self._extra_hooks: list[AgentHook] = hooks or []
+        self._openpets_hook: OpenPetsHook | None = None
+
+        # -- OpenPets desktop pet hook -----------------------------------------
+        if openpets_enabled:
+            try:
+                from nanobot.agent.openpets_hook import OpenPetsHook
+
+                op_hook = OpenPetsHook(
+                    pet_id=openpets_pet_name,
+                )
+                self._extra_hooks.append(op_hook)
+                self._openpets_hook = op_hook
+                logger.info(
+                    "OpenPets hook enabled (pet={})",
+                    openpets_pet_name or "default",
+                )
+            except Exception:
+                logger.exception("Failed to create OpenPets hook")
 
         self.context = ContextBuilder(workspace, timezone=timezone, disabled_skills=disabled_skills)
         self.sessions = session_manager or SessionManager(workspace)
@@ -283,6 +315,9 @@ class AgentLoop:
             self.tools.register(
                 CronTool(self.cron_service, default_timezone=self.context.timezone or "UTC")
             )
+        self.tools.register(WindowsControlTool(workspace=self.workspace))
+        self.tools.register(CodexTool(workspace=self.workspace))
+        self.tools.register(ClaudeCodeTool(workspace=self.workspace))
 
     async def _connect_mcp(self) -> None:
         """Connect to configured MCP servers (one-time, lazy)."""
@@ -342,25 +377,128 @@ class AgentLoop:
             return UNIFIED_SESSION_KEY
         return msg.session_key
 
-    def _has_full_capabilities(self, msg: InboundMessage) -> bool:
-        """Check if the sender has full capabilities (owner privileges).
+    def _is_owner(self, msg: InboundMessage) -> bool | None:
+        """Return whether the sender matches configured owner IDs.
 
-        Commands like /restart, /stop, /status require owner privileges.
-        If no owner_ids are configured, all users have full capabilities.
+        Returns None if no owner_ids are configured (all users have access).
+        Returns True/False based on whether the sender matches an owner_id.
         """
         owner_ids = self.sessions._owner_ids
         if not owner_ids:
-            return True
-        # Check sender_id and session_key against owner_ids
-        candidates = {msg.sender_id, msg.session_key}
-        if ":" in msg.session_key:
-            _, chat_id = msg.session_key.split(":", 1)
-            candidates.add(chat_id)
-        return any(c in owner_ids for c in candidates)
+            return None
 
-    def _owner_only_message(self) -> str:
-        """Return the error message for non-owners trying to use owner-only commands."""
-        return "Only the owner can use this command."
+        sender_id = str(msg.sender_id).strip()
+        candidates = {sender_id, f"{msg.channel}:{sender_id}"}
+        return any(candidate in owner_ids for candidate in candidates)
+
+    @staticmethod
+    def _is_trusted_local_message(msg: InboundMessage) -> bool:
+        """Return True for trusted local/internal control-plane messages."""
+        return msg.channel in {"cli", "system"}
+
+    def _has_full_capabilities(self, msg: InboundMessage) -> bool:
+        """Return whether the message may use tools, skills, and admin commands."""
+        if self._is_trusted_local_message(msg):
+            return True
+        return self._is_owner(msg) is True
+
+    @staticmethod
+    def _owner_only_message() -> str:
+        """Return a consistent denial message for restricted actions."""
+        return "This action is only available to the configured owner or from the local CLI."
+
+    def _resolve_conversation_type(self, msg: InboundMessage) -> str:
+        """Infer whether the current message is a direct, group, or thread conversation."""
+        metadata = msg.metadata or {}
+
+        if (
+            metadata.get("thread_id")
+            or metadata.get("message_thread_id")
+            or metadata.get("thread_root_event_id")
+        ):
+            return "thread"
+
+        chat_type = str(metadata.get("chat_type") or "").strip().lower()
+        if chat_type in {"private", "direct", "p2p", "single", "dm", "im"}:
+            return "direct"
+        if chat_type in {"group", "supergroup", "channel"}:
+            return "group"
+        if chat_type in {"thread", "forum"}:
+            return "thread"
+
+        channel_type = str(metadata.get("channel_type") or "").strip().lower()
+        if channel_type == "im":
+            return "direct"
+        if channel_type:
+            return "group"
+
+        # Fallback: DM's chat_id equals sender_id for most platforms
+        return "direct" if msg.chat_id == msg.sender_id else "group"
+
+    def _speaker_context_kwargs(self, msg: InboundMessage) -> dict[str, Any]:
+        """Build speaker metadata for prompt runtime context."""
+        metadata = msg.metadata or {}
+        return {
+            "sender_id": str(msg.sender_id),
+            "sender_name": str(metadata.get("sender_name") or "").strip() or None,
+            "sender_username": str(metadata.get("sender_username") or "").strip() or None,
+            "conversation_type": self._resolve_conversation_type(msg),
+            "is_owner": self._is_owner(msg),
+        }
+
+    def _capability_mode(self, msg: InboundMessage) -> str:
+        """Return the capability mode for the current message."""
+        if self._has_full_capabilities(msg):
+            return "full"
+        if self._is_internal_automation_message(msg):
+            return "automation"
+        return "chat_only"
+
+    def _automation_kind(self, msg: InboundMessage) -> str | None:
+        """Return trusted internal automation kind when present."""
+        metadata = msg.metadata or {}
+        raw = str(metadata.get("_internal_automation") or "").strip().lower()
+        if raw in self._AUTOMATION_KINDS:
+            return raw
+        return None
+
+    def _is_internal_automation_message(self, msg: InboundMessage) -> bool:
+        """Return True for internally-tagged cron/heartbeat executions."""
+        return self._automation_kind(msg) is not None
+
+    def _allowed_tool_names_for_message(self, msg: InboundMessage) -> set[str]:
+        """Return the allowlisted tool names for this message."""
+        registered_tools = set(self.tools.tool_names)
+        if self._has_full_capabilities(msg):
+            return registered_tools
+        if self._is_internal_automation_message(msg):
+            return registered_tools.difference(self._AUTOMATION_BLOCKED_TOOLS)
+
+        allowed = set(self._CHAT_ONLY_ALLOWED_TOOLS)
+        allowed.update(registered_tools.intersection(self._CHAT_ONLY_OPTIONAL_TOOLS))
+        return registered_tools.intersection(allowed)
+
+    def _skill_names_for_message(
+        self,
+        msg: InboundMessage,
+        allowed_tool_names: set[str] | None = None,
+    ) -> list[str] | None:
+        """Return explicitly surfaced skills for the current message."""
+        if self._capability_mode(msg) != "chat_only":
+            return None
+
+        allowed = allowed_tool_names or self._allowed_tool_names_for_message(msg)
+        if "noah_local_painter" not in allowed:
+            return None
+
+        skill_path = self.workspace / "skills" / "noah-local-painter" / "SKILL.md"
+        if skill_path.exists():
+            return ["noah-local-painter"]
+        return None
+
+    def _is_owner_only_command(self, command: str) -> bool:
+        """Return whether a slash command requires full capabilities."""
+        return command in {"/restart", "/status", "/stop"}
 
     async def _run_agent_loop(
         self,
@@ -460,6 +598,10 @@ class AgentLoop:
         self._running = True
         await self._connect_mcp()
         logger.info("Agent loop started")
+
+        # OpenPets startup notification
+        if self._openpets_hook:
+            await self._openpets_hook.startup_notification()
 
         while self._running:
             try:
@@ -703,6 +845,14 @@ class AgentLoop:
 
         # Slash commands
         raw = msg.content.strip()
+        # Check owner-only commands before dispatch
+        if self._is_owner_only_command(raw) and not self._has_full_capabilities(msg):
+            return OutboundMessage(
+                channel=msg.channel,
+                chat_id=msg.chat_id,
+                content=self._owner_only_message(),
+                metadata={"render_as": "text"},
+            )
         ctx = CommandContext(msg=msg, session=session, key=key, raw=raw, loop=self)
         if result := await self.commands.dispatch(ctx):
             return result
@@ -716,6 +866,10 @@ class AgentLoop:
 
         history = session.get_history(max_messages=0)
 
+        capability_mode = self._capability_mode(msg)
+        allowed_tool_names = self._allowed_tool_names_for_message(msg)
+        skill_names = self._skill_names_for_message(msg, allowed_tool_names)
+
         initial_messages = self.context.build_messages(
             history=history,
             current_message=msg.content,
@@ -723,6 +877,10 @@ class AgentLoop:
             media=msg.media if msg.media else None,
             channel=msg.channel,
             chat_id=msg.chat_id,
+            **self._speaker_context_kwargs(msg),
+            capability_mode=capability_mode,
+            skill_names=skill_names,
+            allowed_tool_names=sorted(allowed_tool_names),
         )
 
         async def _bus_progress(content: str, *, tool_hint: bool = False) -> None:
@@ -746,7 +904,22 @@ class AgentLoop:
         # makes recovery possible from the session log alone.
         user_persisted_early = False
         if isinstance(msg.content, str) and msg.content.strip():
-            session.add_message("user", msg.content)
+            # Build runtime context and speaker prefix for early persistence
+            runtime_ctx = self.context._build_runtime_context(
+                msg.channel,
+                msg.chat_id,
+                self.context.timezone,
+                sender_id=str(msg.sender_id),
+                sender_name=str((msg.metadata or {}).get("sender_name") or "").strip() or None,
+                sender_username=str((msg.metadata or {}).get("sender_username") or "").strip() or None,
+                conversation_type=self._resolve_conversation_type(msg),
+                is_owner=self._is_owner(msg),
+            )
+            merged_content = f"{runtime_ctx}\n\n{msg.content}"
+            runtime_meta, user_text = ContextBuilder.extract_runtime_metadata(merged_content)
+            prefix = ContextBuilder.build_historical_speaker_prefix(runtime_meta)
+            persisted_content = f"{prefix or ''}{user_text}".strip() if prefix else msg.content
+            session.add_message("user", persisted_content)
             self._mark_pending_user_turn(session)
             self.sessions.save(session)
             user_persisted_early = True
@@ -856,27 +1029,32 @@ class AgentLoop:
                     entry["content"] = filtered
             elif role == "user":
                 if isinstance(content, str) and content.startswith(ContextBuilder._RUNTIME_CONTEXT_TAG):
-                    # Strip the entire runtime-context block (including any session summary).
-                    # The block is bounded by _RUNTIME_CONTEXT_TAG and _RUNTIME_CONTEXT_END.
-                    end_marker = ContextBuilder._RUNTIME_CONTEXT_END
-                    end_pos = content.find(end_marker)
-                    if end_pos >= 0:
-                        after = content[end_pos + len(end_marker):].lstrip("\n")
-                        if after:
-                            entry["content"] = after
-                        else:
-                            continue
+                    # Extract speaker metadata and build historical prefix for group/shared sessions
+                    runtime_meta, user_text = ContextBuilder.extract_runtime_metadata(content)
+                    prefix = ContextBuilder.build_historical_speaker_prefix(runtime_meta)
+                    if user_text.strip():
+                        entry["content"] = f"{prefix or ''}{user_text}".strip()
                     else:
-                        # Fallback: no end marker found, strip the tag prefix
-                        after_tag = content[len(ContextBuilder._RUNTIME_CONTEXT_TAG):].lstrip("\n")
-                        if after_tag.strip():
-                            entry["content"] = after_tag
-                        else:
-                            continue
+                        continue
                 if isinstance(content, list):
-                    filtered = self._sanitize_persisted_blocks(content, drop_runtime=True)
+                    filtered = []
+                    runtime_meta: dict[str, str] = {}
+                    for c in content:
+                        if c.get("type") == "text" and isinstance(c.get("text"), str) and c["text"].startswith(ContextBuilder._RUNTIME_CONTEXT_TAG):
+                            runtime_meta, _ = ContextBuilder.extract_runtime_metadata(c["text"])
+                            continue  # Strip runtime context from multimodal messages
+                        # Replace image blocks with placeholders
+                        from nanobot.utils.helpers import replace_image_blocks_with_placeholders
+                        image_filtered, _ = replace_image_blocks_with_placeholders([c])
+                        filtered.extend(image_filtered)
                     if not filtered:
                         continue
+                    prefix = ContextBuilder.build_historical_speaker_prefix(runtime_meta)
+                    if prefix:
+                        if filtered[0].get("type") == "text" and isinstance(filtered[0].get("text"), str):
+                            filtered[0]["text"] = prefix + filtered[0]["text"]
+                        else:
+                            filtered.insert(0, {"type": "text", "text": prefix.rstrip()})
                     entry["content"] = filtered
             entry.setdefault("timestamp", datetime.now().isoformat())
             session.messages.append(entry)

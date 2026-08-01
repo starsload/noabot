@@ -174,3 +174,25 @@ class CCResumeTool(_CCToolBase):
             origin_chat_id=self._origin_chat_id,
             session_key=self._session_key,
         )
+
+
+class ClaudeCodeTool(Tool):
+    """Placeholder tool for Claude Code integration (requires manager for full functionality)."""
+
+    def __init__(self, workspace: Any):
+        self._workspace = workspace
+
+    @property
+    def name(self) -> str:
+        return "claude_code"
+
+    @property
+    def description(self) -> str:
+        return "Claude Code CLI integration (placeholder - not yet configured)."
+
+    @property
+    def parameters(self) -> dict[str, Any]:
+        return {"type": "object", "properties": {}}
+
+    async def execute(self, **kwargs: Any) -> str:
+        return "Claude Code tool is not fully configured. A job manager is required for delegation."

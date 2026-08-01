@@ -6,6 +6,7 @@ import hashlib
 import uuid
 from typing import Any
 
+import httpx
 import json_repair
 from openai import AsyncOpenAI
 
@@ -200,10 +201,19 @@ class CustomProvider(LLMProvider):
             "x-session-affinity": uuid.uuid4().hex,
             **(extra_headers or {}),
         }
+        # Force IPv4: many regional Aliyun MaaS endpoints (e.g.
+        # token-plan.cn-beijing.maas.aliyuncs.com) expose AAAA records whose
+        # IPv6 path is unreachable on the host network, and httpx's
+        # happy-eyeballs does not fall back to IPv4 — surfacing as
+        # APIConnectionError ("Connection refused") that nanobot then keeps
+        # retrying as "LLM transient error". Pinning to 0.0.0.0 forces IPv4.
         self._client = AsyncOpenAI(
             api_key=api_key,
             base_url=api_base,
             default_headers=default_headers,
+            http_client=httpx.AsyncClient(
+                transport=httpx.AsyncHTTPTransport(local_address="0.0.0.0"),
+            ),
         )
 
     async def chat(
