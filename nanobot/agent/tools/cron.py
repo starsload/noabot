@@ -1,6 +1,10 @@
 """Cron tool for scheduling reminders and tasks."""
 
-from contextvars import ContextVar
+# pyright: reportIncompatibleMethodOverride=false
+
+from __future__ import annotations
+
+from contextvars import ContextVar, Token
 from datetime import datetime
 from typing import Any
 
@@ -15,20 +19,36 @@ class CronTool(Tool):
     def __init__(self, cron_service: CronService, default_timezone: str = "UTC"):
         self._cron = cron_service
         self._default_timezone = default_timezone
-        self._channel = ""
-        self._chat_id = ""
         self._in_cron_context: ContextVar[bool] = ContextVar("cron_in_context", default=False)
 
-    def set_context(self, channel: str, chat_id: str) -> None:
-        """Set the current session context for delivery."""
-        self._channel = channel
-        self._chat_id = chat_id
+    @classmethod
+    def enabled(cls, ctx: ToolContext) -> bool:
+        return ctx.cron_service is not None
 
-    def set_cron_context(self, active: bool):
+    @classmethod
+    def create(cls, ctx: ToolContext) -> Tool:
+        cron_service = ctx.cron_service
+        if cron_service is None:
+            raise RuntimeError("CronTool requires an initialized cron service")
+        return cls(cron_service=cron_service, default_timezone=ctx.timezone)
+
+    @staticmethod
+    def _request_route() -> tuple[str, str, str, dict[str, Any]]:
+        """Return routing from the authoritative request snapshot."""
+        ctx = current_request_context()
+        if ctx is None:
+            return "", "", "", {}
+        raw_key = f"{ctx.channel}:{ctx.chat_id}" if ctx.channel and ctx.chat_id else ""
+        session_key = (
+            raw_key if ctx.session_key == UNIFIED_SESSION_KEY else (ctx.session_key or "")
+        )
+        return session_key, ctx.channel or "", ctx.chat_id or "", dict(ctx.metadata or {})
+
+    def set_cron_context(self, active: bool) -> Token[bool]:
         """Mark whether the tool is executing inside a cron job callback."""
         return self._in_cron_context.set(active)
 
-    def reset_cron_context(self, token) -> None:
+    def reset_cron_context(self, token: Token[bool]) -> None:
         """Restore previous cron context."""
         self._in_cron_context.reset(token)
 
@@ -39,7 +59,7 @@ class CronTool(Tool):
         try:
             ZoneInfo(tz)
         except (KeyError, Exception):
-            return f"Error: unknown timezone '{tz}'"
+            return ToolResult.error(f"Error: unknown timezone '{tz}'")
         return None
 
     def _display_timezone(self, schedule: CronSchedule) -> str:
@@ -130,11 +150,18 @@ class CronTool(Tool):
         at: str | None,
     ) -> str:
         if not message:
-            return "Error: message is required for add"
-        if not self._channel or not self._chat_id:
-            return "Error: no session context (channel/chat_id)"
+            return ToolResult.error(
+                "Error: cron action='add' requires a non-empty 'message' parameter "
+                "describing what to do when the job triggers "
+                "(e.g. the reminder text). Retry including message=\"...\"."
+            )
+        session_key, origin_channel, origin_chat_id, origin_metadata = self._request_route()
+        if not session_key:
+            return ToolResult.error("Error: scheduled cron jobs must be created from a chat session")
+        if not origin_channel or not origin_chat_id:
+            return ToolResult.error("Error: scheduled cron jobs must be created from a chat session")
         if tz and not cron_expr:
-            return "Error: tz can only be used with cron_expr"
+            return ToolResult.error("Error: tz can only be used with cron_expr")
         if tz:
             if err := self._validate_timezone(tz):
                 return err
@@ -154,7 +181,7 @@ class CronTool(Tool):
             try:
                 dt = datetime.fromisoformat(at)
             except ValueError:
-                return f"Error: invalid ISO datetime format '{at}'. Expected format: YYYY-MM-DDTHH:MM:SS"
+                return ToolResult.error(f"Error: invalid ISO datetime format '{at}'. Expected format: YYYY-MM-DDTHH:MM:SS")
             if dt.tzinfo is None:
                 if err := self._validate_timezone(self._default_timezone):
                     return err
@@ -163,7 +190,7 @@ class CronTool(Tool):
             schedule = CronSchedule(kind="at", at_ms=at_ms)
             delete_after = True
         else:
-            return "Error: either every_seconds, cron_expr, or at is required"
+            return ToolResult.error("Error: either every_seconds, cron_expr, or at is required")
 
         job = self._cron.add_job(
             name=message[:30],
@@ -173,6 +200,10 @@ class CronTool(Tool):
             channel=self._channel,
             to=self._chat_id,
             delete_after_run=delete_after,
+            session_key=session_key,
+            origin_channel=origin_channel,
+            origin_chat_id=origin_chat_id,
+            origin_metadata=origin_metadata,
         )
         return f"Created job '{job.name}' (id: {job.id})"
 
@@ -214,7 +245,7 @@ class CronTool(Tool):
         jobs = self._cron.list_jobs()
         if not jobs:
             return "No scheduled jobs."
-        lines = []
+        lines: list[str] = []
         for j in jobs:
             timing = self._format_timing(j.schedule)
             parts = [f"- {j.name} (id: {j.id}, {timing})"]

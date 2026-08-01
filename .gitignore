@@ -1,4 +1,5 @@
 .worktrees/
+.worktree/
 .assets
 .docs
 .env

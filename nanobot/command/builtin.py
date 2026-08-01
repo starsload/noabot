@@ -4,11 +4,16 @@ from __future__ import annotations
 
 import asyncio
 import os
+import subprocess
 import sys
+import time
+from contextlib import suppress
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Any, Literal, cast
 
 from nanobot import __version__
 from nanobot.bus.events import OutboundMessage
-from nanobot.command.router import CommandContext, CommandRouter
+from nanobot.command.router import CommandContext, CommandRouter, normalize_command_text
 from nanobot.utils.helpers import build_status_content
 
 
@@ -32,14 +37,26 @@ async def cmd_stop(ctx: CommandContext) -> OutboundMessage:
 
 
 async def cmd_restart(ctx: CommandContext) -> OutboundMessage:
-    """Restart the process in-place via os.execv."""
+    """Restart the process."""
     msg = ctx.msg
     if not ctx.loop._has_full_capabilities(msg):
         return OutboundMessage(channel=msg.channel, chat_id=msg.chat_id, content=ctx.loop._owner_only_message())
 
     async def _do_restart():
         await asyncio.sleep(1)
-        os.execv(sys.executable, [sys.executable, "-m", "nanobot"] + sys.argv[1:])
+        argv = [sys.executable, "-m", "nanobot"] + sys.argv[1:]
+        mode = ctx.loop.restart_mode or "auto"
+        if mode == "auto":
+            mode = "spawn" if sys.platform == "win32" else "exec"
+        if mode == "exec":
+            os.execv(sys.executable, argv)
+            return
+        if mode == "spawn":
+            kwargs: dict[str, Any] = {}
+            if sys.platform == "win32":
+                kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
+            subprocess.Popen(argv, **kwargs)
+        os._exit(0)
 
     asyncio.create_task(_do_restart())
     return OutboundMessage(channel=msg.channel, chat_id=msg.chat_id, content="Restarting...")
@@ -56,6 +73,7 @@ async def cmd_status(ctx: CommandContext) -> OutboundMessage:
             metadata={"render_as": "text"},
         )
     session = ctx.session or loop.sessions.get_or_create(ctx.key)
+    runtime = ctx.runtime or loop.runtime_for_session(session)
     ctx_est = 0
     try:
         ctx_est, _ = loop.memory_consolidator.estimate_session_prompt_tokens(session)
@@ -67,9 +85,9 @@ async def cmd_status(ctx: CommandContext) -> OutboundMessage:
         channel=ctx.msg.channel,
         chat_id=ctx.msg.chat_id,
         content=build_status_content(
-            version=__version__, model=loop.model,
-            start_time=loop._start_time, last_usage=loop._last_usage,
-            context_window_tokens=loop.context_window_tokens,
+            version=__version__, model=runtime.model,
+            start_time=loop._start_time, last_usage=loop._last_usage,  # pyright: ignore[reportPrivateUsage]
+            context_window_tokens=runtime.context_window_tokens,
             session_msg_count=len(session.get_history(max_messages=0)),
             context_tokens_estimate=ctx_est,
         ),
@@ -78,10 +96,14 @@ async def cmd_status(ctx: CommandContext) -> OutboundMessage:
 
 
 async def cmd_new(ctx: CommandContext) -> OutboundMessage:
-    """Start a fresh session."""
+    """Stop active task and start a fresh session."""
     loop = ctx.loop
+    await loop._cancel_active_tasks(ctx.key)  # pyright: ignore[reportPrivateUsage]
     session = ctx.session or loop.sessions.get_or_create(ctx.key)
     snapshot = session.messages[session.last_consolidated:]
+    runtime = None
+    if snapshot:
+        runtime = ctx.runtime or loop.runtime_for_session(session)
     session.clear()
     loop.sessions.save(session, channel=ctx.msg.channel)
     loop.sessions.invalidate(session.key)
@@ -124,3 +146,5 @@ def register_builtin_commands(router: CommandRouter) -> None:
     router.exact("/new", cmd_new)
     router.exact("/status", cmd_status)
     router.exact("/help", cmd_help)
+    router.exact("/pairing", cmd_pairing)
+    router.prefix("/pairing ", cmd_pairing)

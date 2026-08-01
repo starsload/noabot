@@ -1,8 +1,15 @@
-"""Tests for channel plugin discovery, merging, and config compatibility."""
+"""Tests for channel package discovery, management, and config behavior."""
 
 from __future__ import annotations
 
 import asyncio
+import json
+import subprocess
+import sys
+import tomllib
+from dataclasses import replace
+from importlib.metadata import PackageNotFoundError
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
@@ -10,8 +17,22 @@ import pytest
 from typer.testing import CliRunner
 
 from nanobot.bus.events import OutboundMessage
+from nanobot.bus.outbound_events import (
+    StreamDeltaEvent,
+    StreamedResponseEvent,
+    StreamEndEvent,
+    outbound_message_for_event,
+)
 from nanobot.bus.queue import MessageBus
 from nanobot.channels.base import BaseChannel
+from nanobot.channels.contracts import (
+    ChannelFieldSpec,
+    ChannelInstanceSpec,
+    ChannelManagementSpec,
+    ChannelSetupSpec,
+    SetupRequirement,
+    channel_default_config,
+)
 from nanobot.channels.manager import ChannelManager
 from nanobot.cli.commands import app
 from nanobot.config.schema import ChannelsConfig, Config
@@ -42,10 +63,40 @@ class _FakePlugin(BaseChannel):
         return True
 
 
-class _FakeTelegram(BaseChannel):
-    """Plugin that tries to shadow built-in telegram."""
-    name = "telegram"
-    display_name = "Fake Telegram"
+class _SetupPlugin(_FakePlugin):
+    name = "setupplugin"
+    display_name = "Setup Plugin"
+
+    @staticmethod
+    def _validate_setup(values, _context):
+        token = str(values.get("token") or "")
+        return {
+            "status": "connected" if token.startswith("plugin-") else "invalid",
+            "checks": [{
+                "id": "plugin",
+                "label": "Plugin validation",
+                "status": "pass" if token.startswith("plugin-") else "fail",
+            }],
+        }
+
+
+class _FakeLine(_FakePlugin):
+    name = "line"
+    display_name = "Line"
+
+
+class _FakeMultiChannel(BaseChannel):
+    name = "multi"
+    display_name = "Multi"
+
+    @classmethod
+    def default_config(cls) -> dict:
+        return {
+            "instanceId": "default",
+            "name": "nanobot",
+            "enabled": False,
+            "token": "",
+        }
 
     async def start(self) -> None:
         pass
@@ -102,113 +153,942 @@ def test_channels_config_getattr_returns_extra():
     assert section["enabled"] is True
 
 
-def test_channels_config_builtin_fields_removed():
+def test_channels_config_has_no_per_channel_fields():
     """After decoupling, ChannelsConfig has no explicit channel fields."""
     cfg = ChannelsConfig()
     assert not hasattr(cfg, "telegram")
     assert cfg.send_progress is True
-    assert cfg.send_tool_hints is False
+    assert cfg.send_tool_hints is True
+    assert cfg.extract_document_text is True
+
+    opted_out = ChannelsConfig.model_validate({
+        "sendToolHints": False,
+        "extractDocumentText": False,
+    })
+    assert opted_out.send_tool_hints is False
+    assert opted_out.extract_document_text is False
+
+
+@pytest.mark.parametrize(
+    "name",
+    ["websocket", "telegram", "discord", "slack", "email", "feishu", "matrix", "weixin", "whatsapp"],
+)
+def test_special_setup_validation_is_owned_by_channel_package(name: str):
+    plugin = load_channel_package(name)
+
+    assert plugin is not None
+    assert plugin.setup is not None
+    assert plugin.setup.validator is not None
+    assert plugin.setup.validator.__module__ == f"nanobot.channels.{name}.validation"
+
+
+@pytest.mark.parametrize("name", ["feishu", "weixin"])
+def test_interactive_connector_is_owned_by_channel_package(name: str):
+    plugin = load_channel_package(name)
+
+    assert plugin is not None
+    assert plugin.connector is not None
+    assert plugin.connector.startswith(f"nanobot.channels.{name}.")
+    assert plugin.load_connector().__class__.__module__ == f"nanobot.channels.{name}.connect"
+
+
+def test_descriptor_defaults_cover_onboarding_fields_without_runtime_import():
+    qq = load_channel_package("qq")
+    email = load_channel_package("email")
+
+    assert qq is not None
+    assert email is not None
+    assert channel_default_config(qq)["msgFormat"] == "plain"
+    assert channel_default_config(email)["imapPort"] == 993
+    assert channel_default_config(email)["smtpPort"] == 587
+
+
+def test_channel_manager_delegates_instance_expansion_to_channel(monkeypatch: pytest.MonkeyPatch):
+    _stub_channel_registry(monkeypatch, _channel_plugin(_FakeMultiChannel))
+
+    cfg = Config.model_validate({
+        "channels": {
+            "multi": {
+                "enabled": True,
+                "instances": [
+                    {
+                        "id": "default",
+                        "enabled": True,
+                        "token": "default",
+                    },
+                    {
+                        "id": "product",
+                        "enabled": True,
+                        "token": "product",
+                    },
+                    {
+                        "id": "off",
+                        "enabled": False,
+                        "token": "off",
+                    },
+                ]
+            }
+        }
+    })
+
+    manager = ChannelManager(cfg, MessageBus())
+
+    assert set(manager.channels) == {"multi", "multi.product"}
+    assert manager.channels["multi"].name == "multi"
+    assert manager.channels["multi.product"].name == "multi.product"
+
+
+def test_channel_manager_loads_descriptor_but_not_disabled_runtime(monkeypatch):
+    load_calls: list[str] = []
+    plugin = ChannelPlugin(
+        name="fakeplugin",
+        display_name="Fake Plugin",
+        runtime="missing.fakeplugin.runtime:FakePlugin",
+    )
+    config = Config.model_validate({
+        "channels": {
+            "fakeplugin": {
+                "enabled": False,
+                "instances": [{"enabled": True}],
+            }
+        }
+    })
+
+    monkeypatch.setattr(
+        "nanobot.channels.registry._channel_package_names",
+        lambda: ["fakeplugin"],
+    )
+    monkeypatch.setattr(
+        "nanobot.channels.registry.load_channel_package",
+        lambda _name: load_calls.append("descriptor") or plugin,
+    )
+
+    manager = ChannelManager(config, MessageBus())
+
+    assert manager.channels == {}
+    assert load_calls == ["descriptor"]
+
+
+def test_feature_payload_uses_unified_instance_activation(monkeypatch):
+    from nanobot.optional_features import optional_features_payload
+
+    config = Config.model_validate({
+        "channels": {
+            "multi": {
+                "enabled": False,
+                "instances": [{"id": "default", "enabled": True}],
+            }
+        }
+    })
+    _stub_channel_registry(monkeypatch, _channel_plugin(_FakeMultiChannel))
+    monkeypatch.setattr("nanobot.optional_features.optional_dependency_groups", lambda: {})
+
+    payload = optional_features_payload(config=config)
+
+    assert payload["features"][0]["enabled"] is True
+    assert payload["features"][0]["ready"] is True
+    assert payload["features"][0]["status"] == "enabled"
+    assert payload["enabled_count"] == 1
+
+
+def test_multi_plugin_action_defaults_to_default_instance(
+    monkeypatch,
+    tmp_path,
+):
+    from nanobot.config import loader
+    from nanobot.webui.nanobot_features_api import nanobot_features_action
+
+    class _ManagedMultiPlugin(_FakeMultiChannel):
+        name = "managedmulti"
+
+    config_path = tmp_path / "config.json"
+    config_path.write_text(
+        json.dumps({
+            "channels": {
+                "managedmulti": {
+                    "enabled": True,
+                    "instances": [
+                        {"id": "default", "enabled": True, "token": "default"},
+                        {"id": "product", "enabled": True, "token": "product"},
+                    ],
+                }
+            }
+        }),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(loader, "_current_config_path", config_path)
+    _stub_channel_registry(
+        monkeypatch,
+        _channel_plugin(_ManagedMultiPlugin, management=_fake_multi_management()),
+    )
+    monkeypatch.setattr("nanobot.optional_features.optional_dependency_groups", lambda: {})
+
+    disabled = nanobot_features_action("disable", {"name": ["managedmulti"]})
+    saved = json.loads(config_path.read_text(encoding="utf-8"))["channels"]["managedmulti"]
+    assert saved["enabled"] is True
+    assert [item["enabled"] for item in saved["instances"]] == [False, True]
+    assert disabled["features"][0]["enabled"] is True
+
+    enabled = nanobot_features_action("enable", {"name": ["managedmulti"]})
+    saved = json.loads(config_path.read_text(encoding="utf-8"))["channels"]["managedmulti"]
+    assert saved["enabled"] is True
+    assert [item["enabled"] for item in saved["instances"]] == [True, True]
+    assert enabled["features"][0]["enabled"] is True
+
+    explicit = nanobot_features_action(
+        "disable",
+        {"name": ["managedmulti"], "instance_id": ["default"]},
+    )
+    saved = json.loads(config_path.read_text(encoding="utf-8"))["channels"]["managedmulti"]
+    assert saved["enabled"] is True
+    assert [item["enabled"] for item in saved["instances"]] == [False, True]
+    assert explicit["features"][0]["enabled"] is True
+
+
+async def test_single_channel_enable_applies_defaults_before_hot_reload(
+    monkeypatch,
+    tmp_path,
+):
+    from nanobot.config import loader
+    from nanobot.webui.nanobot_features_api import nanobot_features_action
+
+    class _SingleDefaultsPlugin(_FakePlugin):
+        name = "singleplugin"
+
+        @classmethod
+        def default_config(cls):
+            return {
+                "enabled": False,
+                "endpoint": "https://plugin.example/api",
+                "retries": 3,
+            }
+
+        def __init__(self, config, bus):
+            super().__init__(config, bus)
+            self.endpoint = config["endpoint"]
+            self.retries = config["retries"]
+
+    config_path = tmp_path / "config.json"
+    config_path.write_text(
+        json.dumps({"channels": {"singleplugin": {"enabled": False}}}),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(loader, "_current_config_path", config_path)
+    _stub_channel_registry(monkeypatch, _channel_plugin(_SingleDefaultsPlugin))
+    monkeypatch.setattr("nanobot.optional_features.optional_dependency_groups", lambda: {})
+    manager = ChannelManager(
+        Config.model_validate({"channels": {"singleplugin": {"enabled": False}}}),
+        MessageBus(),
+    )
+
+    payload = nanobot_features_action("enable", {"name": ["singleplugin"]})
+    hot_reload = await manager.apply_channel_feature_action("enable", "singleplugin")
+
+    saved = json.loads(config_path.read_text(encoding="utf-8"))["channels"]["singleplugin"]
+    assert saved == {
+        "enabled": True,
+        "endpoint": "https://plugin.example/api",
+        "retries": 3,
+    }
+    assert payload["features"][0]["enabled"] is True
+    assert hot_reload["ok"] is True
+    assert hot_reload["requires_restart"] is False
+    assert set(manager.channels) == {"singleplugin"}
+    assert manager.channels["singleplugin"].endpoint == "https://plugin.example/api"
+    assert manager.channels["singleplugin"].retries == 3
+
+
+def test_channel_manager_preserves_single_instance_plugin_owned_instances(monkeypatch):
+    _stub_channel_registry(monkeypatch, _channel_plugin(_FakePlugin))
+    config = Config.model_validate({
+        "channels": {
+            "fakeplugin": {
+                "enabled": True,
+                "instances": ["plugin-owned-value"],
+            }
+        }
+    })
+
+    manager = ChannelManager(config, MessageBus())
+
+    assert set(manager.channels) == {"fakeplugin"}
+    assert manager.channels["fakeplugin"].config["instances"] == ["plugin-owned-value"]
 
 
 # ---------------------------------------------------------------------------
-# discover_plugins
+# Channel package discovery
 # ---------------------------------------------------------------------------
 
-_EP_TARGET = "importlib.metadata.entry_points"
-
-
-def test_discover_plugins_loads_entry_points():
+def test_discover_plugins_loads_package_descriptors():
     from nanobot.channels.registry import discover_plugins
 
-    ep = _make_entry_point("line", _FakePlugin)
-    with patch(_EP_TARGET, return_value=[ep]):
+    plugin = _channel_plugin(_FakeLine)
+    with (
+        patch("nanobot.channels.registry._channel_package_names", return_value=["line"]),
+        patch("nanobot.channels.registry.load_channel_package", return_value=plugin),
+    ):
         result = discover_plugins()
 
     assert "line" in result
-    assert result["line"] is _FakePlugin
+    assert isinstance(result["line"], ChannelPlugin)
+
+
+def test_plugin_setup_contract_drives_feature_payload(monkeypatch: pytest.MonkeyPatch):
+    from nanobot.optional_features import optional_features_payload
+
+    config = Config.model_validate({
+        "channels": {
+            "setupplugin": {
+                "enabled": False,
+                "token": "plugin-secret",
+                "region": "eu",
+            }
+        }
+    })
+    _stub_channel_registry(
+        monkeypatch,
+        _channel_plugin(_SetupPlugin, setup=_SETUP_PLUGIN_SPEC),
+    )
+    monkeypatch.setattr("nanobot.optional_features.optional_dependency_groups", lambda: {})
+
+    payload = optional_features_payload(config=config)
+
+    feature = payload["features"][0]
+    assert feature["configured"] is True
+    assert feature["setup"] == {
+        "fields": [
+            {
+                "key": "channels.setupplugin.token",
+                "field": "token",
+                "kind": "secret",
+                "choices": [],
+                "required": True,
+            },
+            {
+                "key": "channels.setupplugin.region",
+                "field": "region",
+                "kind": "enum",
+                "choices": ["eu", "us"],
+                "required": False,
+            },
+        ],
+        "official_url": "https://plugin.example/setup",
+    }
+    assert feature["configured_fields"] == [
+        "channels.setupplugin.token",
+        "channels.setupplugin.region",
+    ]
+    assert feature["config_values"] == {"channels.setupplugin.region": "eu"}
+
+
+def test_plugin_contract_error_is_isolated_in_feature_payload(monkeypatch):
+    from nanobot.optional_features import optional_features_payload
+
+    class _BrokenPlugin(_FakePlugin):
+        name = "broken"
+        display_name = "Broken"
+
+    def broken_instance_specs(section, *, enabled_only=True):
+        raise ValueError("malformed plugin instance config")
+
+    config = Config.model_validate({
+        "channels": {
+            "broken": {"enabled": True},
+            "setupplugin": {"enabled": False, "token": "plugin-secret"},
+        }
+    })
+    _stub_channel_registry(
+        monkeypatch,
+        _channel_plugin(
+            _BrokenPlugin,
+            management=ChannelManagementSpec(
+                multi_instance=True,
+                instance_specs=broken_instance_specs,
+                update_instance_config=lambda section, values, *, instance_id="default": values,
+            ),
+        ),
+        _channel_plugin(_SetupPlugin, setup=_SETUP_PLUGIN_SPEC),
+    )
+    monkeypatch.setattr("nanobot.optional_features.optional_dependency_groups", lambda: {})
+
+    payload = optional_features_payload(config=config)
+
+    features = {feature["name"]: feature for feature in payload["features"]}
+    assert features["broken"] == {
+        "name": "broken",
+        "display_name": "Broken",
+        "type": "channel",
+        "capabilities": [],
+        "settings_visible": True,
+        "setup": {"fields": []},
+        "enabled": False,
+        "configured": False,
+        "installed": True,
+        "ready": False,
+        "status": "invalid_config",
+        "install_supported": True,
+        "requires_restart": True,
+        "error": "Channel configuration could not be inspected.",
+    }
+    assert features["setupplugin"]["configured"] is True
+
+
+def test_plugin_setup_contract_drives_save_and_validation(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+):
+    from nanobot.channels.validation import validate_channel_config
+    from nanobot.config import loader
+    from nanobot.webui.settings_routes import WebUISettingsRouter
+
+    config_path = tmp_path / "config.json"
+    save_config(Config(), config_path)
+    monkeypatch.setattr(loader, "_current_config_path", config_path)
+    _stub_channel_registry(
+        monkeypatch,
+        _channel_plugin(_SetupPlugin, setup=_SETUP_PLUGIN_SPEC),
+    )
+    router = object.__new__(WebUISettingsRouter)
+
+    saved = router._save_channel_config_values(
+        "setupplugin",
+        {
+            "channels.setupplugin.token": "plugin-secret",
+            "channels.setupplugin.region": "eu",
+        },
+    )
+    validation = validate_channel_config("setupplugin")
+
+    assert saved == [
+        "channels.setupplugin.token",
+        "channels.setupplugin.region",
+    ]
+    assert load_config(config_path).channels.setupplugin["token"] == "plugin-secret"
+    assert validation["status"] == "connected"
+    assert validation["checks"][0]["id"] == "plugin"
+
+
+def test_generic_plugin_validation_enforces_composite_requirements(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    from nanobot.channels.validation import validate_channel_config
+    from nanobot.config import loader
+
+    class _CompositeSetupPlugin(_FakePlugin):
+        name = "compositeplugin"
+
+    setup_spec = ChannelSetupSpec(
+        fields={
+            "password": ChannelFieldSpec(kind="secret"),
+            "accessToken": ChannelFieldSpec(kind="secret"),
+            "deviceId": ChannelFieldSpec(),
+        },
+        required=(
+            SetupRequirement.one_of(
+                ("password",),
+                ("accessToken", "deviceId"),
+            ),
+        ),
+    )
+
+    config_path = tmp_path / "config.json"
+    save_config(Config(), config_path)
+    monkeypatch.setattr(loader, "_current_config_path", config_path)
+    _stub_channel_registry(
+        monkeypatch,
+        _channel_plugin(_CompositeSetupPlugin, setup=setup_spec),
+    )
+
+    missing = validate_channel_config("compositeplugin")
+    partial = validate_channel_config(
+        "compositeplugin",
+        {"channels.compositeplugin.accessToken": "token"},
+    )
+    complete = validate_channel_config(
+        "compositeplugin",
+        {
+            "channels.compositeplugin.accessToken": "token",
+            "channels.compositeplugin.deviceId": "DEVICE",
+        },
+    )
+
+    assert missing["status"] == "needs_setup"
+    assert missing["can_enable"] is False
+    assert "password" in missing["missing_fields"]
+    assert partial["status"] == "needs_setup"
+    assert partial["can_enable"] is False
+    assert "deviceId" in partial["missing_fields"]
+    assert complete["status"] == "configured"
+    assert complete["can_enable"] is True
+
+
+def test_webui_save_rejects_duplicate_feishu_ids_without_writing(monkeypatch, tmp_path):
+    from nanobot.config import loader
+    from nanobot.webui.settings_api import WebUISettingsError
+    from nanobot.webui.settings_routes import WebUISettingsRouter
+
+    config_path = tmp_path / "config.json"
+    config_path.write_text(
+        json.dumps({
+            "channels": {
+                "feishu": {
+                    "instances": [
+                        {"id": "default", "enabled": True, "appId": "A"},
+                        {"id": "default", "enabled": False, "appId": "B"},
+                    ]
+                }
+            }
+        }),
+        encoding="utf-8",
+    )
+    before = config_path.read_text(encoding="utf-8")
+    monkeypatch.setattr(loader, "_current_config_path", config_path)
+    router = object.__new__(WebUISettingsRouter)
+
+    with pytest.raises(WebUISettingsError, match="duplicate Feishu instance id 'default'") as error:
+        router._save_channel_config_values(
+            "feishu",
+            {"channels.feishu.appId": "updated"},
+        )
+
+    assert error.value.status == 400
+    assert config_path.read_text(encoding="utf-8") == before
+
+
+def test_discover_plugins_skips_names_outside_enabled_set():
+    from nanobot.channels.registry import discover_plugins
+
+    loaded: list[str] = []
+
+    def _load_disabled(_name: str):
+        loaded.append("disabled")
+        return _channel_plugin(_FakePlugin)
+
+    with (
+        patch("nanobot.channels.registry._channel_package_names", return_value=["disabled"]),
+        patch("nanobot.channels.registry.load_channel_package", side_effect=_load_disabled),
+    ):
+        result = discover_plugins({"enabled"})
+
+    assert result == {}
+    assert loaded == []
+
+
+def test_channel_manifest_rejects_invalid_dependency_metadata():
+    with pytest.raises(TypeError, match="tuple of requirements"):
+        ChannelPlugin(
+            name="broken",
+            display_name="Broken",
+            runtime="broken.runtime:BrokenChannel",
+            dependencies=["broken-sdk>=1"],  # type: ignore[arg-type]
+        )
+    with pytest.raises(ValueError, match="valid requirement"):
+        ChannelPlugin(
+            name="broken",
+            display_name="Broken",
+            runtime="broken.runtime:BrokenChannel",
+            dependencies=("not a requirement ???",),
+        )
 
 
 def test_discover_plugins_handles_load_error():
     from nanobot.channels.registry import discover_plugins
 
-    def _boom():
+    def _boom(_name: str):
         raise RuntimeError("broken")
 
-    ep = SimpleNamespace(name="broken", load=_boom)
-    with patch(_EP_TARGET, return_value=[ep]):
+    with (
+        patch("nanobot.channels.registry._channel_package_names", return_value=["broken"]),
+        patch("nanobot.channels.registry.load_channel_package", side_effect=_boom),
+    ):
         result = discover_plugins()
 
     assert "broken" not in result
 
 
 # ---------------------------------------------------------------------------
-# discover_all — merge & priority
+# Runtime discovery
 # ---------------------------------------------------------------------------
 
-def test_discover_all_includes_builtins():
-    from nanobot.channels.registry import discover_all, discover_channel_names
+def test_discover_all_includes_available_channel_packages():
+    from nanobot.channels.registry import discover_all, discover_plugins
 
-    with patch(_EP_TARGET, return_value=[]):
-        result = discover_all()
+    result = discover_all()
 
     # discover_all() only returns channels that are actually available (dependencies installed)
-    # discover_channel_names() returns all built-in channel names
+    # discover_plugins() returns all channel package descriptors
     # So we check that all actually loaded channels are in the result
     for name in result:
-        assert name in discover_channel_names()
+        assert name in discover_plugins()
 
 
-def test_discover_all_includes_external_plugin():
-    from nanobot.channels.registry import discover_all
+def test_discover_plugins_excludes_internal_helpers():
+    from nanobot.channels.registry import discover_plugins
 
-    ep = _make_entry_point("line", _FakePlugin)
-    with patch(_EP_TARGET, return_value=[ep]):
-        result = discover_all()
+    names = discover_plugins()
 
-    assert "line" in result
-    assert result["line"] is _FakePlugin
+    assert "_feishu_ws" not in names
+    assert "_setup" not in names
+    assert "setup" not in names
+    assert "_feishu_instances" not in names
 
 
-def test_discover_all_builtin_shadows_plugin():
-    from nanobot.channels.registry import discover_all
+def test_discover_enabled_imports_only_enabled_packages():
+    from nanobot.channels.registry import discover_enabled
 
-    ep = _make_entry_point("telegram", _FakeTelegram)
-    with patch(_EP_TARGET, return_value=[ep]):
-        result = discover_all()
+    class _EnabledPlugin(_FakePlugin):
+        name = "enabled"
 
-    assert "telegram" in result
-    assert result["telegram"] is not _FakeTelegram
+    plugins = {
+        "enabled": _channel_plugin(_EnabledPlugin),
+        "disabled": ChannelPlugin(
+            name="disabled",
+            display_name="Disabled",
+            runtime="missing.disabled.runtime:DisabledPlugin",
+        ),
+    }
+
+    result = discover_enabled({"enabled"}, _plugins=plugins)
+
+    assert result == {"enabled": _EnabledPlugin}
+
+
+def test_discover_enabled_warns_for_enabled_package_import_errors():
+    from nanobot.channels.registry import discover_enabled
+
+    plugin = ChannelPlugin(
+        name="matrix",
+        display_name="Matrix",
+        runtime="missing.matrix.runtime:MatrixChannel",
+    )
+    with patch("nanobot.channels.registry.logger.warning") as warning:
+        result = discover_enabled(
+            {"matrix"},
+            _plugins={"matrix": plugin},
+            warn_import_errors=True,
+        )
+
+    assert result == {}
+    warning.assert_called_once()
+    assert warning.call_args.args[0] == "Enabled channel '{}' runtime is not available: {}"
+    assert warning.call_args.args[1] == "matrix"
+    assert "missing" in str(warning.call_args.args[2])
 
 
 # ---------------------------------------------------------------------------
-# Manager _init_channels with dict config (plugin scenario)
+# Manager _init_channels with dict config
 # ---------------------------------------------------------------------------
 
-@pytest.mark.asyncio
-async def test_manager_loads_plugin_from_dict_config():
-    """ChannelManager should instantiate a plugin channel from a raw dict config."""
+def test_manager_loads_plugin_from_dict_config(monkeypatch):
+    """ChannelManager should instantiate a channel package from a raw dict config."""
     from nanobot.channels.manager import ChannelManager
 
-    fake_config = SimpleNamespace(
-        channels=ChannelsConfig.model_validate({
+    fake_config = Config.model_validate({
+        "channels": {
             "fakeplugin": {"enabled": True, "allowFrom": ["*"]},
-        }),
-        providers=SimpleNamespace(groq=SimpleNamespace(api_key="")),
-    )
+        }
+    })
+    _stub_channel_registry(monkeypatch, _channel_plugin(_FakePlugin))
 
-    with patch(
-        "nanobot.channels.registry.discover_all",
-        return_value={"fakeplugin": _FakePlugin},
-    ):
-        mgr = ChannelManager.__new__(ChannelManager)
-        mgr.config = fake_config
-        mgr.bus = MessageBus()
-        mgr.channels = {}
-        mgr._dispatch_task = None
-        mgr._init_channels()
+    mgr = ChannelManager(fake_config, MessageBus())
 
     assert "fakeplugin" in mgr.channels
     assert isinstance(mgr.channels["fakeplugin"], _FakePlugin)
+
+
+def test_manager_installs_manifest_dependencies_before_loading_enabled_channel(monkeypatch):
+    from nanobot.optional_features import InstallResult
+
+    plugin = _channel_plugin(
+        _FakePlugin,
+        dependencies=("fake-sdk>=1",),
+    )
+    _stub_channel_registry(monkeypatch, plugin)
+    installed = False
+    installs: list[tuple[str, list[str]]] = []
+
+    def extra_installed(_name: str, _dependencies: list[str] | None) -> bool:
+        return installed
+
+    def install_extra(name: str, dependencies: list[str], *, runner):
+        nonlocal installed
+        installs.append((name, dependencies))
+        installed = True
+        return InstallResult(True, name, ["pip"])
+
+    monkeypatch.setattr("nanobot.optional_features.extra_installed", extra_installed)
+    monkeypatch.setattr("nanobot.optional_features.install_extra", install_extra)
+    config = Config.model_validate({
+        "channels": {
+            "websocket": {"enabled": False},
+            "fakeplugin": {"enabled": True},
+        }
+    })
+
+    manager = ChannelManager(config, MessageBus())
+
+    assert installs == [("fakeplugin", ["fake-sdk>=1"])]
+    assert "fakeplugin" in manager.channels
+
+
+def test_manager_reports_dependency_install_failure_as_runtime_failure(monkeypatch):
+    from nanobot.optional_features import InstallResult
+
+    plugin = _channel_plugin(
+        _FakePlugin,
+        dependencies=("fake-sdk>=1",),
+    )
+    _stub_channel_registry(monkeypatch, plugin)
+    monkeypatch.setattr(
+        "nanobot.optional_features.extra_installed",
+        lambda _name, _dependencies: False,
+    )
+    monkeypatch.setattr(
+        "nanobot.optional_features.install_extra",
+        lambda name, _dependencies, *, runner: InstallResult(False, name, ["pip"]),
+    )
+    config = Config.model_validate({
+        "channels": {
+            "websocket": {"enabled": False},
+            "fakeplugin": {"enabled": True},
+        }
+    })
+
+    manager = ChannelManager(config, MessageBus())
+
+    assert manager.channels == {}
+    assert manager.get_status()["fakeplugin"] == {
+        "enabled": True,
+        "running": False,
+        "state": "failed",
+        "owner": "fakeplugin",
+        "instance_id": "default",
+        "error": "Channel dependencies could not be installed. Check gateway logs.",
+    }
+
+
+def test_manager_loads_websocket_from_default_config():
+    from nanobot.channels.manager import ChannelManager
+
+    class _FakeWebSocket(_FakePlugin):
+        name = "websocket"
+        display_name = "WebSocket"
+
+        def __init__(self, config, bus, *, gateway):
+            super().__init__(config, bus)
+            self.gateway = gateway
+
+        @classmethod
+        def default_config(cls):
+            return {"enabled": True, "host": "127.0.0.1"}
+
+    plugin = _channel_plugin(_FakeWebSocket, default_enabled=True)
+    with patch("nanobot.channels.registry.discover_plugins", return_value={"websocket": plugin}):
+        mgr = ChannelManager(Config(), MessageBus(), webui_static_dist=False)
+
+    assert "websocket" in mgr.channels
+    assert mgr.channels["websocket"].config["enabled"] is True
+    assert mgr.channels["websocket"].config["host"] == "127.0.0.1"
+
+
+def test_manager_respects_explicitly_disabled_websocket_config():
+    from nanobot.channels.manager import ChannelManager
+
+    config = Config.model_validate({"channels": {"websocket": {"enabled": False}}})
+    plugin = ChannelPlugin(
+        name="websocket",
+        display_name="WebSocket",
+        runtime="missing.websocket.runtime:WebSocketChannel",
+        default_enabled=True,
+    )
+    with patch("nanobot.channels.registry.discover_plugins", return_value={"websocket": plugin}):
+        mgr = ChannelManager(config, MessageBus(), webui_static_dist=False)
+
+    assert "websocket" not in mgr.channels
+
+
+@pytest.mark.asyncio
+async def test_base_channel_reads_current_transcription_config_each_call(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """BaseChannel.transcribe_audio resolves config at call time, not manager init time."""
+    from nanobot.providers import transcription as transcription_mod
+
+    config_path = tmp_path / "config.json"
+    config = Config()
+    config.transcription.provider = "openai"
+    config.transcription.model = "whisper-custom"
+    config.transcription.language = "en"
+    config.providers.openai.api_key = "openai-key"
+    config.providers.openai.api_base = "http://openai.local/v1/audio/transcriptions"
+    save_config(config, config_path)
+    monkeypatch.setattr("nanobot.config.loader._current_config_path", config_path)
+
+    channel = _FakePlugin({"enabled": True, "allowFrom": ["*"]}, MessageBus())
+
+    calls: list[dict[str, object]] = []
+
+    class _StubOpenAI:
+        def __init__(self, api_key=None, api_base=None, language=None, model=None):
+            calls.append({
+                "provider": "openai",
+                "api_key": api_key,
+                "api_base": api_base,
+                "language": language,
+                "model": model,
+            })
+
+        async def transcribe(self, file_path):
+            return "openai-ok"
+
+    class _StubGroq:
+        def __init__(self, api_key=None, api_base=None, language=None, model=None):
+            calls.append({
+                "provider": "groq",
+                "api_key": api_key,
+                "api_base": api_base,
+                "language": language,
+                "model": model,
+            })
+
+        async def transcribe(self, file_path):
+            return "groq-ok"
+
+    with (
+        patch.object(transcription_mod, "OpenAITranscriptionProvider", _StubOpenAI),
+        patch.object(transcription_mod, "GroqTranscriptionProvider", _StubGroq),
+    ):
+        assert await channel.transcribe_audio("/tmp/does-not-matter.wav") == "openai-ok"
+
+        config.transcription.provider = "groq"
+        config.transcription.model = "whisper-large-v3-turbo"
+        config.transcription.language = "ko"
+        config.providers.groq.api_key = "groq-key"
+        config.providers.groq.api_base = "http://groq.local/v1/audio/transcriptions"
+        save_config(config, config_path)
+
+        assert await channel.transcribe_audio("/tmp/does-not-matter.wav") == "groq-ok"
+
+    assert calls == [
+        {
+            "provider": "openai",
+            "api_key": "openai-key",
+            "api_base": "http://openai.local/v1/audio/transcriptions",
+            "language": "en",
+            "model": "whisper-custom",
+        },
+        {
+            "provider": "groq",
+            "api_key": "groq-key",
+            "api_base": "http://groq.local/v1/audio/transcriptions",
+            "language": "ko",
+            "model": "whisper-large-v3-turbo",
+        },
+    ]
+
+
+@pytest.mark.asyncio
+async def test_base_channel_respects_disabled_transcription_config(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    config_path = tmp_path / "config.json"
+    config = Config()
+    config.transcription.enabled = False
+    config.providers.groq.api_key = "groq-key"
+    save_config(config, config_path)
+    monkeypatch.setattr("nanobot.config.loader._current_config_path", config_path)
+
+    channel = _FakePlugin({"enabled": True, "allowFrom": ["*"]}, MessageBus())
+
+    with patch("nanobot.providers.transcription.GroqTranscriptionProvider") as provider:
+        assert await channel.transcribe_audio("/tmp/does-not-matter.wav") == ""
+    provider.assert_not_called()
+
+
+def test_openai_transcription_provider_honors_api_base_argument():
+    from nanobot.providers.transcription import OpenAITranscriptionProvider
+
+    default = OpenAITranscriptionProvider(api_key="k")
+    assert default.api_url == "https://api.openai.com/v1/audio/transcriptions"
+
+    custom = OpenAITranscriptionProvider(
+        api_key="k", api_base="http://override/v1/audio/transcriptions"
+    )
+    assert custom.api_url == "http://override/v1/audio/transcriptions"
+
+
+# ---------------------------------------------------------------------------
+# Transcription provider HTTP tests
+# ---------------------------------------------------------------------------
+
+
+class _StubResponse:
+    status_code = 200
+
+    def raise_for_status(self):
+        return None
+
+    def json(self):
+        return {"text": "hello"}
+
+
+def _stub_async_client(captured: dict[str, object]):
+    """Return an httpx.AsyncClient stub that records POST calls into *captured*."""
+    class _AsyncClient:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+        async def post(self, url, headers=None, files=None, timeout=None):
+            captured["files"] = files
+            return _StubResponse()
+
+    return _AsyncClient()
+
+
+@pytest.mark.parametrize(
+    "provider_cls,language",
+    [(_GroqProvider, "ko"), (_OpenAIProvider, "en")],
+    ids=["groq", "openai"],
+)
+@pytest.mark.asyncio
+async def test_transcription_provider_includes_language(tmp_path, provider_cls, language):
+    """Provider must include the 'language' field in multipart body when set."""
+    audio = tmp_path / "sample.wav"
+    audio.write_bytes(b"audio")
+    captured: dict[str, object] = {}
+
+    with patch("nanobot.providers.transcription.httpx.AsyncClient", return_value=_stub_async_client(captured)):
+        provider = provider_cls(api_key="k", language=language)
+        result = await provider.transcribe(audio)
+
+    assert result == "hello"
+    assert captured["files"]["language"] == (None, language)
+
+
+@pytest.mark.parametrize(
+    "provider_cls",
+    [_GroqProvider, _OpenAIProvider],
+    ids=["groq", "openai"],
+)
+@pytest.mark.asyncio
+async def test_transcription_provider_omits_language_when_none(tmp_path, provider_cls):
+    """When language is not set, the 'language' key must be absent from the multipart body."""
+    audio = tmp_path / "sample.wav"
+    audio.write_bytes(b"audio")
+    captured: dict[str, object] = {}
+
+    with patch("nanobot.providers.transcription.httpx.AsyncClient", return_value=_stub_async_client(captured)):
+        provider = provider_cls(api_key="k")
+        result = await provider.transcribe(audio)
+
+    assert result == "hello"
+    assert "language" not in captured["files"]
 
 
 def test_channels_login_uses_discovered_plugin_class(monkeypatch):
@@ -221,6 +1101,7 @@ def test_channels_login_uses_discovered_plugin_class(monkeypatch):
         async def login(self, force: bool = False) -> bool:
             seen["force"] = force
             seen["config"] = self.config
+            seen["bus"] = self.bus
             return True
 
     monkeypatch.setattr("nanobot.config.loader.load_config", lambda: Config())
@@ -233,10 +1114,11 @@ def test_channels_login_uses_discovered_plugin_class(monkeypatch):
 
     assert result.exit_code == 0
     assert seen["force"] is True
+    assert isinstance(seen["bus"], MessageBus)
 
 
 @pytest.mark.asyncio
-async def test_manager_skips_disabled_plugin():
+async def test_manager_skips_disabled_channel_package(monkeypatch):
     fake_config = SimpleNamespace(
         channels=ChannelsConfig.model_validate({
             "fakeplugin": {"enabled": False},
@@ -244,16 +1126,13 @@ async def test_manager_skips_disabled_plugin():
         providers=SimpleNamespace(groq=SimpleNamespace(api_key="")),
     )
 
-    with patch(
-        "nanobot.channels.registry.discover_all",
-        return_value={"fakeplugin": _FakePlugin},
-    ):
-        mgr = ChannelManager.__new__(ChannelManager)
-        mgr.config = fake_config
-        mgr.bus = MessageBus()
-        mgr.channels = {}
-        mgr._dispatch_task = None
-        mgr._init_channels()
+    _stub_channel_registry(monkeypatch, _channel_plugin(_FakePlugin))
+    mgr = ChannelManager.__new__(ChannelManager)
+    mgr.config = fake_config
+    mgr.bus = MessageBus()
+    mgr.channels = {}
+    mgr._dispatch_task = None
+    mgr._init_channels()
 
     assert "fakeplugin" not in mgr.channels
 
@@ -353,24 +1232,24 @@ async def test_manager_loads_plugin_from_camel_case_extra_key():
 
 
 # ---------------------------------------------------------------------------
-# Built-in channel default_config() and dict->Pydantic conversion
+# Channel default_config() and dict-to-Pydantic conversion
 # ---------------------------------------------------------------------------
 
-def test_builtin_channel_default_config():
-    """Built-in channels expose default_config() returning a dict with 'enabled': False."""
-    from nanobot.channels.telegram import TelegramChannel
-    cfg = TelegramChannel.default_config()
+def test_channel_default_config():
+    """Channels expose default_config() returning a dict with 'enabled': False."""
+    from nanobot.channels.dingtalk.runtime import DingTalkChannel
+    cfg = DingTalkChannel.default_config()
     assert isinstance(cfg, dict)
     assert cfg["enabled"] is False
-    assert "token" in cfg
+    assert "clientId" in cfg
 
 
-def test_builtin_channel_init_from_dict():
-    """Built-in channels accept a raw dict and convert to Pydantic internally."""
-    from nanobot.channels.telegram import TelegramChannel
+def test_channel_init_from_dict():
+    """Channels accept a raw dict and convert to Pydantic internally."""
+    from nanobot.channels.dingtalk.runtime import DingTalkChannel
     bus = MessageBus()
-    ch = TelegramChannel({"enabled": False, "token": "test-tok", "allowFrom": ["*"]}, bus)
-    assert ch.config.token == "test-tok"
+    ch = DingTalkChannel({"enabled": False, "clientId": "test-id", "allowFrom": ["*"]}, bus)
+    assert ch.config.client_id == "test-id"
     assert ch.config.allow_from == ["*"]
 
 
@@ -403,6 +1282,24 @@ def test_channels_config_send_max_retries_upper_bound():
     # Value above upper bound should be rejected
     with pytest.raises(ValidationError):
         ChannelsConfig(send_max_retries=11)
+
+
+def test_channels_config_transcription_language_pattern():
+    """transcription_language must match ISO-639 format (2-3 lowercase letters) or be None."""
+    from pydantic import ValidationError
+
+    # Valid values
+    assert ChannelsConfig(transcription_language="en").transcription_language == "en"
+    assert ChannelsConfig(transcription_language="kor").transcription_language == "kor"
+    assert ChannelsConfig(transcription_language=None).transcription_language is None
+
+    # Invalid values
+    with pytest.raises(ValidationError):
+        ChannelsConfig(transcription_language="EN")       # uppercase
+    with pytest.raises(ValidationError):
+        ChannelsConfig(transcription_language="english")   # full word
+    with pytest.raises(ValidationError):
+        ChannelsConfig(transcription_language="en-US")     # BCP 47 tag
 
 
 # ---------------------------------------------------------------------------
@@ -528,8 +1425,8 @@ async def test_send_with_retry_no_retry_when_max_is_zero():
 
 @pytest.mark.asyncio
 async def test_send_with_retry_calls_send_delta():
-    """_send_with_retry should call send_delta when metadata has _stream_delta."""
-    send_delta_called = False
+    """_send_with_retry should call send_delta for stream delta events."""
+    calls: list[tuple[str, str, str | None, bool, bool, bool]] = []
 
     class _StreamingChannel(BaseChannel):
         name = "streaming"
@@ -544,9 +1441,18 @@ async def test_send_with_retry_calls_send_delta():
         async def send(self, msg: OutboundMessage) -> None:
             pass  # Should not be called
 
-        async def send_delta(self, chat_id: str, delta: str, metadata: dict | None = None) -> None:
-            nonlocal send_delta_called
-            send_delta_called = True
+        async def send_delta(
+            self,
+            chat_id: str,
+            delta: str,
+            metadata: dict | None = None,
+            *,
+            stream_id: str | None = None,
+            stream_end: bool = False,
+            resuming: bool = False,
+            merge_next: bool = False,
+        ) -> None:
+            calls.append((chat_id, delta, stream_id, stream_end, resuming, merge_next))
 
     fake_config = SimpleNamespace(
         channels=ChannelsConfig(send_max_retries=3),
@@ -559,18 +1465,33 @@ async def test_send_with_retry_calls_send_delta():
     mgr.channels = {"streaming": _StreamingChannel(fake_config, mgr.bus)}
     mgr._dispatch_task = None
 
-    msg = OutboundMessage(
-        channel="streaming", chat_id="123", content="test delta",
-        metadata={"_stream_delta": True}
+    msg = outbound_message_for_event(
+        channel="streaming",
+        chat_id="123",
+        event=StreamDeltaEvent(content="test delta", stream_id="s1"),
     )
     await mgr._send_with_retry(mgr.channels["streaming"], msg)
+    end = outbound_message_for_event(
+        channel="streaming",
+        chat_id="123",
+        event=StreamEndEvent(
+            content="",
+            stream_id="s1",
+            resuming=True,
+            merge_next=True,
+        ),
+    )
+    await mgr._send_with_retry(mgr.channels["streaming"], end)
 
-    assert send_delta_called is True
+    assert calls == [
+        ("123", "test delta", "s1", False, False, False),
+        ("123", "", "s1", True, True, True),
+    ]
 
 
 @pytest.mark.asyncio
 async def test_send_with_retry_skips_send_when_streamed():
-    """_send_with_retry should not call send when metadata has _streamed flag."""
+    """_send_with_retry should not call send for streamed response events."""
     send_called = False
     send_delta_called = False
 
@@ -588,7 +1509,16 @@ async def test_send_with_retry_skips_send_when_streamed():
             nonlocal send_called
             send_called = True
 
-        async def send_delta(self, chat_id: str, delta: str, metadata: dict | None = None) -> None:
+        async def send_delta(
+            self,
+            chat_id: str,
+            delta: str,
+            metadata: dict | None = None,
+            *,
+            stream_id: str | None = None,
+            stream_end: bool = False,
+            resuming: bool = False,
+        ) -> None:
             nonlocal send_delta_called
             send_delta_called = True
 
@@ -603,15 +1533,60 @@ async def test_send_with_retry_skips_send_when_streamed():
     mgr.channels = {"streamed": _StreamedChannel(fake_config, mgr.bus)}
     mgr._dispatch_task = None
 
-    # _streamed means message was already sent via send_delta, so skip send
-    msg = OutboundMessage(
-        channel="streamed", chat_id="123", content="test",
-        metadata={"_streamed": True}
+    msg = outbound_message_for_event(
+        channel="streamed",
+        chat_id="123",
+        event=StreamedResponseEvent(),
+        content="test",
     )
     await mgr._send_with_retry(mgr.channels["streamed"], msg)
 
     assert send_called is False
     assert send_delta_called is False
+
+
+def test_outbound_duplicate_suppression_is_scoped_to_origin_message() -> None:
+    fake_config = SimpleNamespace(
+        channels=ChannelsConfig(send_max_retries=3),
+        providers=SimpleNamespace(groq=SimpleNamespace(api_key="")),
+    )
+
+    mgr = ChannelManager.__new__(ChannelManager)
+    mgr.config = fake_config
+    mgr.bus = MessageBus()
+    mgr.channels = {}
+    mgr._dispatch_task = None
+    mgr._origin_reply_fingerprints = {}
+
+    first = OutboundMessage(
+        channel="feishu",
+        chat_id="chat123",
+        content="Done",
+        metadata={"message_id": "msg-1"},
+    )
+    duplicate = OutboundMessage(
+        channel="feishu",
+        chat_id="chat123",
+        content="  Done  ",
+        metadata={"origin_message_id": "msg-1"},
+    )
+    separate_turn = OutboundMessage(
+        channel="feishu",
+        chat_id="chat123",
+        content="Done",
+        metadata={"message_id": "msg-2"},
+    )
+    new_origin_content = OutboundMessage(
+        channel="feishu",
+        chat_id="chat123",
+        content="Done with extra details",
+        metadata={"origin_message_id": "msg-1"},
+    )
+
+    assert mgr._should_suppress_outbound(first) is False
+    assert mgr._should_suppress_outbound(duplicate) is True
+    assert mgr._should_suppress_outbound(separate_turn) is False
+    assert mgr._should_suppress_outbound(new_origin_content) is False
 
 
 @pytest.mark.asyncio
@@ -736,8 +1711,8 @@ class _StartableChannel(BaseChannel):
 
 
 @pytest.mark.asyncio
-async def test_validate_allow_from_raises_on_empty_list():
-    """_validate_allow_from should raise SystemExit when allow_from is empty list."""
+async def test_validate_allow_from_allows_empty_list():
+    """Empty allow_from is valid now — pairing store handles unapproved senders."""
     fake_config = SimpleNamespace(
         channels=ChannelsConfig(),
         providers=SimpleNamespace(groq=SimpleNamespace(api_key="")),
@@ -748,10 +1723,10 @@ async def test_validate_allow_from_raises_on_empty_list():
     mgr.channels = {"test": _ChannelWithAllowFrom(fake_config, None, [])}
     mgr._dispatch_task = None
 
-    with pytest.raises(SystemExit) as exc_info:
-        mgr._validate_allow_from()
-
-    assert "empty allowFrom" in str(exc_info.value)
+    # Should not raise — empty list defers to pairing store
+    mgr._validate_allow_from()
+    assert list(mgr.channels) == ["test"]
+    assert mgr.channels["test"].config.allow_from == []
 
 
 @pytest.mark.asyncio
@@ -769,6 +1744,8 @@ async def test_validate_allow_from_passes_with_asterisk():
 
     # Should not raise
     mgr._validate_allow_from()
+    assert list(mgr.channels) == ["test"]
+    assert mgr.channels["test"].config.allow_from == ["*"]
 
 
 @pytest.mark.asyncio
@@ -848,6 +1825,7 @@ async def test_stop_all_cancels_dispatcher_and_stops_channels():
 
     ch = _StartableChannel(fake_config, mgr.bus)
     mgr.channels = {"startable": ch}
+    mgr._channel_tasks = {}
 
     # Create a real cancelled task
     async def dummy_task():
@@ -896,6 +1874,8 @@ async def test_start_channel_logs_error_on_failure():
 
     # Should not raise, just log error
     await mgr._start_channel("failing", ch)
+    assert mgr.channels == {}
+    assert mgr._dispatch_task is None
 
 
 @pytest.mark.asyncio
@@ -923,10 +1903,51 @@ async def test_stop_all_handles_channel_exception():
     mgr.config = fake_config
     mgr.bus = MessageBus()
     mgr.channels = {"stopfailing": _StopFailingChannel(fake_config, mgr.bus)}
+    mgr._channel_tasks = {}
     mgr._dispatch_task = None
 
     # Should not raise even if channel.stop() raises
     await mgr.stop_all()
+    assert list(mgr.channels) == ["stopfailing"]
+    assert mgr._dispatch_task is None
+
+
+@pytest.mark.asyncio
+async def test_stop_all_handles_channel_stop_cancelled_task():
+    """stop_all should treat a channel's already-cancelled internals as stopped."""
+
+    class _StopCancelledChannel(BaseChannel):
+        name = "stopcancelled"
+        display_name = "Stop Cancelled"
+
+        async def start(self) -> None:
+            pass
+
+        async def stop(self) -> None:
+            raise asyncio.CancelledError("server task cancelled")
+
+        async def send(self, msg: OutboundMessage) -> None:
+            pass
+
+    fake_config = SimpleNamespace(
+        channels=ChannelsConfig(),
+        providers=SimpleNamespace(groq=SimpleNamespace(api_key="")),
+    )
+
+    mgr = ChannelManager.__new__(ChannelManager)
+    mgr.config = fake_config
+    mgr.bus = MessageBus()
+    next_channel = _StartableChannel(fake_config, mgr.bus)
+    mgr.channels = {
+        "stopcancelled": _StopCancelledChannel(fake_config, mgr.bus),
+        "next": next_channel,
+    }
+    mgr._channel_tasks = {}
+    mgr._dispatch_task = None
+
+    await mgr.stop_all()
+
+    assert next_channel.stopped is True
 
 
 @pytest.mark.asyncio
@@ -963,6 +1984,7 @@ async def test_start_all_creates_dispatch_task():
 
     ch = _StartableChannel(fake_config, mgr.bus)
     mgr.channels = {"startable": ch}
+    mgr._channel_tasks = {}
     mgr._dispatch_task = None
 
     # Cancel immediately after start to avoid running forever

@@ -3,7 +3,7 @@
 import mimetypes
 import platform
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping, Sequence, cast
 
 from nanobot.utils.helpers import current_time_str
 
@@ -14,6 +14,29 @@ from nanobot.utils.helpers import (
     build_image_content_blocks,
     detect_image_mime,
 )
+
+
+def session_extra(metadata: Mapping[str, Any] | None) -> dict[str, Any]:
+    """Return persisted kwargs for turn-attached capabilities."""
+    return cli_app_utils.session_extra(metadata) | mcp_tools.session_extra(metadata)
+
+
+async def connect_mcp(state: Any, tools: ToolRegistry) -> None:
+    await mcp_tools.connect_missing_servers(state, tools)
+
+
+async def close_mcp(state: Any) -> None:
+    await mcp_tools.close_mcp_servers(state)
+
+
+async def handle_runtime_control(state: Any, msg: InboundMessage, tools: ToolRegistry) -> bool:
+    for handler in (
+        image_generation_tools.handle_runtime_control,
+        mcp_tools.handle_runtime_control,
+    ):
+        if await handler(state, msg, tools):
+            return True
+    return False
 
 
 class ContextBuilder:
@@ -78,7 +101,9 @@ Skills with available="false" need dependencies installed first - you can try in
 
     def _get_identity(self, capability_mode: str = "full", allowed_tool_names: list[str] | None = None) -> str:
         """Get the core identity section."""
-        workspace_path = str(self.workspace.expanduser().resolve())
+        root = workspace or self.workspace
+        workspace_path = str(root.expanduser().resolve())
+        agent_workspace_path = str(self.workspace.expanduser().resolve())
         system = platform.system()
         runtime = f"{'macOS' if system == 'Darwin' else system} {platform.machine()}, Python {platform.python_version()}"
 
@@ -251,6 +276,17 @@ Your workspace is at: {workspace_path}
             file_path = self.workspace / filename
             if file_path.exists():
                 content = file_path.read_text(encoding="utf-8")
+                if filename == "SOUL.md" and self._is_template_content(
+                    content,
+                    "legacy/SOUL.md",
+                ):
+                    content = load_bundled_template("SOUL.md") or content
+                if not content.strip():
+                    continue
+                if filename in self._SKIPPABLE_DEFAULTS and self._is_template_content(
+                    content, filename
+                ):
+                    continue
                 parts.append(f"## {filename}\n\n{content}")
 
         return "\n\n".join(parts) if parts else ""
@@ -259,7 +295,7 @@ Your workspace is at: {workspace_path}
         self,
         history: list[dict[str, Any]],
         current_message: str,
-        skill_names: list[str] | None = None,
+        *,
         media: list[str] | None = None,
         channel: str | None = None,
         chat_id: str | None = None,
@@ -313,13 +349,36 @@ Your workspace is at: {workspace_path}
             {"role": current_role, "content": merged},
         ]
 
-    def _build_user_content(self, text: str, media: list[str] | None) -> str | list[dict[str, Any]]:
-        """Build user message content with optional base64-encoded images."""
-        if not media:
+    def build_current_message(
+        self,
+        current_message: str,
+        *,
+        media: list[str] | None = None,
+        current_role: str = "user",
+        runtime_context_blocks: Sequence[RuntimeContextBlock] | None = None,
+    ) -> dict[str, Any]:
+        """Build only the fresh turn message without merging it into history."""
+        content = self.build_user_content(current_message, image_paths=media)
+        blocks = list(runtime_context_blocks or ()) if current_role == "user" else []
+        merged, runtime_context_meta = append_runtime_context(content, blocks)
+        current: dict[str, Any] = {"role": current_role, "content": merged}
+        if current_role == "user" and runtime_context_meta is not None:
+            current["_meta"] = {
+                RUNTIME_CONTEXT_MESSAGE_META: runtime_context_meta,
+            }
+        return current
+
+    def build_user_content(
+        self,
+        text: str,
+        image_paths: list[str] | None,
+    ) -> str | list[dict[str, Any]]:
+        """Build user message content from prefiltered image paths."""
+        if not image_paths:
             return text
 
-        images = []
-        for path in media:
+        image_blocks: list[dict[str, Any]] = []
+        for path in image_paths:
             p = Path(path)
             if not p.is_file():
                 continue
@@ -330,7 +389,7 @@ Your workspace is at: {workspace_path}
                 continue
             images.extend(build_image_content_blocks(raw, mime, str(p), f"(Image file: {p})")[:1])
 
-        if not images:
+        if not image_blocks:
             return text
         return images + [{"type": "text", "text": text}]
 

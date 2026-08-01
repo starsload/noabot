@@ -3,14 +3,26 @@
 import html
 import json
 from pathlib import Path
+from typing import Any, cast, overload
 
-import pydantic
-from loguru import logger
+from pydantic import BaseModel, ValidationError
+from pydantic_settings import SettingsError
 
-from nanobot.config.schema import Config
+from nanobot.config.errors import ConfigIssue, ConfigLoadError, validation_issues
+from nanobot.config.schema import (
+    Config,
+    _resolve_tool_config_refs,  # pyright: ignore[reportPrivateUsage]
+)
+from nanobot.utils.helpers import _write_text_atomic  # pyright: ignore[reportPrivateUsage]
 
 # Global variable to store current config path (for multi-instance support)
 _current_config_path: Path | None = None
+_schema_refs_ready = False
+
+
+def _as_config_object(value: object) -> dict[str, Any] | None:
+    """Narrow an untrusted JSON configuration value to an object."""
+    return cast(dict[str, Any], value) if isinstance(value, dict) else None
 
 
 def set_config_path(path: Path) -> None:
@@ -36,6 +48,11 @@ def load_config(config_path: Path | None = None) -> Config:
     Returns:
         Loaded configuration object.
     """
+    global _schema_refs_ready
+    if not _schema_refs_ready:
+        _resolve_tool_config_refs()
+        _schema_refs_ready = True
+
     path = config_path or get_config_path()
 
     if path.exists():
@@ -63,9 +80,23 @@ def save_config(config: Config, config_path: Path | None = None) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
 
     data = config.model_dump(mode="json", by_alias=True)
+    # OAuth credentials live in dedicated token stores. Persist only the
+    # non-credential request settings consumed by these provider backends.
+    for alias, provider in (
+        ("openaiCodex", config.providers.openai_codex),
+        ("xaiGrok", config.providers.xai_grok),
+    ):
+        settings = provider.model_dump(
+            mode="json",
+            by_alias=True,
+            include={"proxy", "extra_body"},
+            exclude_none=True,
+        )
+        if settings:
+            data.setdefault("providers", {})[alias] = settings
 
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=2, ensure_ascii=False)
+    # Temp + replace so a crash mid-write cannot leave a truncated config.json.
+    _write_text_atomic(path, json.dumps(data, indent=2, ensure_ascii=False))
 
 
 def _normalize_mcp_arg(value: object) -> object:
@@ -83,7 +114,7 @@ def _normalize_mcp_arg(value: object) -> object:
     return normalized
 
 
-def _migrate_config(data: dict) -> dict:
+def _migrate_config(data: dict[str, Any]) -> dict[str, Any]:
     """Migrate old config formats to current."""
     agents = data.get("agents", {})
     defaults = agents.get("defaults", {})
@@ -137,3 +168,10 @@ def _migrate_config(data: dict) -> dict:
                 tts_cfg["provider"] = tts_provider
                 voice["tts"] = tts_cfg
     return data
+
+
+def _sentence(message: str) -> str:
+    message = message.strip()
+    if message and message[-1] not in ".!?":
+        message += "."
+    return message
