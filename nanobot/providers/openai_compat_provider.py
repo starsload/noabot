@@ -530,11 +530,27 @@ class OpenAICompatProvider(LLMProvider):
             http_client = httpx.AsyncClient(
                 limits=_local_limits,
                 timeout=timeout_s,
-                transport=httpx.AsyncHTTPTransport(proxy=None, limits=_local_limits),
+                transport=httpx.AsyncHTTPTransport(
+                    proxy=None, limits=_local_limits, local_address="0.0.0.0",
+                ),
             )
-        # else: http_client stays None → SDK creates DefaultAsyncHttpxClient
-        # which already reads proxy env vars via trust_env=True, has proper
-        # connection limits, and follows redirects.
+        else:
+            # Cloud provider. Pin the local socket to IPv4
+            # (local_address="0.0.0.0"): many regional endpoints — e.g.
+            # Aliyun MaaS (*.maas.aliyuncs.com) — expose AAAA records whose
+            # IPv6 path is unreachable on the host network, and httpx's
+            # happy-eyeballs implementation does not fall back to IPv4,
+            # surfacing as APIConnectionError ("Connection refused") that
+            # nanobot then keeps retrying as "LLM transient error". Forcing
+            # IPv4 avoids the broken AAAA path entirely. We otherwise mirror
+            # the SDK's DefaultAsyncHttpxClient: trust_env reads proxy env
+            # vars, default connection limits, and follow redirects.
+            http_client = httpx.AsyncClient(
+                timeout=timeout_s,
+                trust_env=True,
+                follow_redirects=True,
+                transport=httpx.AsyncHTTPTransport(local_address="0.0.0.0"),
+            )
         self._client = AsyncOpenAI(
             api_key=self._api_key_for_client,
             base_url=self._effective_base,
