@@ -502,6 +502,16 @@ class AgentLoop:
             config,
             provider_snapshot_loader,
         )
+        # Default session manager inherits owner_ids so the owner's group
+        # messages merge into the shared cross-channel session. Callers can
+        # still override by passing session_manager= explicitly.
+        if "session_manager" not in extra:
+            from nanobot.session.manager import SessionManager
+
+            extra["session_manager"] = SessionManager(
+                config.workspace_path,
+                owner_ids=set(config.agents.identity.owner_ids),
+            )
         return cls(
             bus=bus,
             provider=provider,
@@ -848,6 +858,20 @@ class AgentLoop:
         if self._unified_session and not msg.session_key_override:
             return UNIFIED_SESSION_KEY
         return msg.session_key
+
+    def _is_owner(self, msg: InboundMessage) -> bool | None:
+        """Whether the sender matches a configured owner id.
+
+        Returns ``None`` when no owner_ids are configured (access control
+        falls back to channel allow_from / pairing). Returns ``True``/``False``
+        based on whether the sender matches an owner_id once configured.
+        """
+        owner_ids = self.sessions.owner_ids
+        if not owner_ids:
+            return None
+        sender_id = str(msg.sender_id).strip()
+        candidates = {sender_id, f"{msg.channel}:{sender_id}"}
+        return any(c in owner_ids for c in candidates)
 
     def _remember_unified_session_route(
         self,
@@ -1881,6 +1905,7 @@ class AgentLoop:
         self._save_turn(
             session, ctx.all_messages, ctx.save_skip,
             turn_latency_ms=ctx.turn_latency_ms,
+            channel=ctx.delivery.route.channel,
         )
         ctx.delivery.record_latency(ctx.turn_latency_ms)
         if not ctx.ephemeral:
@@ -1976,9 +2001,12 @@ class AgentLoop:
         skip: int,
         *,
         turn_latency_ms: int | None = None,
+        channel: str | None = None,
     ) -> None:
         """Save new-turn messages into session, truncating large tool results."""
         from datetime import datetime
+
+        is_owner = self.sessions.is_owner_session(session.key)
 
         declared_tool_call_ids = {
             str(tc["id"])
@@ -2048,6 +2076,10 @@ class AgentLoop:
                 if isinstance(runtime_context_meta, dict):
                     entry[RUNTIME_CONTEXT_HISTORY_META] = runtime_context_meta
             entry.setdefault("timestamp", datetime.now().isoformat())
+            # Tag the origin channel on owner shared sessions so the merged
+            # history can show which channel each turn came from.
+            if is_owner and channel and "source_channel" not in entry:
+                entry["source_channel"] = channel
             session.messages.append(entry)
             if role == "assistant":
                 last_assistant_idx = len(session.messages) - 1

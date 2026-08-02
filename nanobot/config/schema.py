@@ -176,10 +176,17 @@ class AgentDefaults(Base):
         return value
 
 
+class AgentIdentityConfig(Base):
+    """Agent identity / ownership hints used for session merging and prompt context."""
+
+    owner_ids: list[str] = Field(default_factory=list)
+
+
 class AgentsConfig(Base):
     """Agent configuration."""
 
     defaults: AgentDefaults = Field(default_factory=AgentDefaults)
+    identity: AgentIdentityConfig = Field(default_factory=AgentIdentityConfig)
 
 
 class ProviderConfig(Base):

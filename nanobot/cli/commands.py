@@ -350,7 +350,10 @@ def serve(
         raise typer.Exit(1)
     sync_workspace_templates(runtime_config.workspace_path)
     bus = MessageBus()
-    session_manager = SessionManager(runtime_config.workspace_path)
+    session_manager = SessionManager(
+        runtime_config.workspace_path,
+        owner_ids=set(runtime_config.agents.identity.owner_ids),
+    )
     try:
         agent_loop = AgentLoop.from_config(
             runtime_config, bus,

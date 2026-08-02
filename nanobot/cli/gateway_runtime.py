@@ -299,7 +299,10 @@ def _run_gateway(
         except ValueError as exc:
             console.print(f"[red]Error: {exc}[/red]")
             raise typer.Exit(1) from exc
-    session_manager = SessionManager(config.workspace_path)
+    session_manager = SessionManager(
+        config.workspace_path,
+        owner_ids=set(config.agents.identity.owner_ids),
+    )
 
     # Self-heal the gateway state file with the current PID after any restart.
     from nanobot.config.loader import get_config_path

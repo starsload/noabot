@@ -227,6 +227,80 @@ class BaseChannel(ABC):
             return True
         return False
 
+    # -- Owner identity & cross-channel session merge ---------------------
+
+    def _get_owner_ids(self) -> set[str]:
+        """Owner identifiers from ``agents.identity.owner_ids`` runtime config.
+
+        Used to route the owner's group/DM messages into one shared
+        ``owner:shared`` session across channels. Returns an empty set when
+        no owner_ids are configured (owner merge disabled).
+        """
+        try:
+            from nanobot.config.loader import load_config
+
+            cfg = load_config()
+        except Exception:
+            return set()
+        identity = getattr(cfg.agents, "identity", None)
+        if identity is None:
+            return set()
+        return {str(x) for x in getattr(identity, "owner_ids", None) or []}
+
+    def _get_merge_owner_in_group(self) -> bool:
+        """Whether this channel merges the owner's group messages into the shared session."""
+        cfg = self.config
+        if isinstance(cfg, dict):
+            return bool(
+                cfg.get("merge_owner_in_group", cfg.get("mergeOwnerInGroup", False))
+            )
+        return bool(
+            getattr(cfg, "merge_owner_in_group", getattr(cfg, "mergeOwnerInGroup", False))
+        )
+
+    def _is_group_context(
+        self,
+        chat_id: str,
+        sender_id: str,
+        metadata: dict[str, Any] | None,
+    ) -> bool:
+        """True when the current context is a group conversation (not a DM)."""
+        if metadata:
+            conv_type = str(metadata.get("conversation_type", "")).lower()
+            if conv_type in {"group", "guild", "channel", "room", "thread"}:
+                return True
+            if any(metadata.get(k) for k in ("guild_id", "group_id", "room_id", "team_id")):
+                return True
+            if metadata.get("chat_type") == "group" or metadata.get("is_group") is True:
+                return True
+        # Fallback: on many platforms a DM's chat_id equals the sender id.
+        return chat_id != sender_id
+
+    def _resolve_owner_session_key(
+        self,
+        sender_id: str,
+        chat_id: str,
+        metadata: dict[str, Any] | None,
+        session_key: str | None,
+    ) -> str | None:
+        """Compute the session key, merging owner group messages when configured."""
+        if session_key is not None:
+            return session_key
+        owner_ids = self._get_owner_ids()
+        if not owner_ids:
+            return None
+        candidates = {str(sender_id), f"{self.name}:{sender_id}"}
+        if not any(c in owner_ids for c in candidates):
+            return None
+        if not self._is_group_context(chat_id, sender_id, metadata):
+            return None
+        if not self._get_merge_owner_in_group():
+            return None
+        self.logger.info(
+            "{}: merging owner {} into shared session", self.name, sender_id
+        )
+        return "owner:shared"
+
     async def _handle_message(
         self,
         sender_id: str,
@@ -276,6 +350,16 @@ class BaseChannel(ABC):
                     sender_id,
                 )
             return
+
+        # Merge the owner's group messages into the shared cross-channel
+        # session when this channel opts in via merge_owner_in_group.
+        if session_key is None:
+            session_key = self._resolve_owner_session_key(
+                sender_id=sender_id,
+                chat_id=str(chat_id),
+                metadata=metadata,
+                session_key=None,
+            )
 
         meta = metadata or {}
         if self.supports_streaming:

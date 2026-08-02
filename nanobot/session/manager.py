@@ -5,13 +5,14 @@ import errno
 import json
 import os
 import re
+import threading
 from collections import OrderedDict
 from contextlib import suppress
 from copy import deepcopy
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Callable, Protocol, TypedDict, cast
+from typing import Any, Callable, Iterable, Protocol, TypedDict, cast
 from weakref import WeakValueDictionary
 
 from loguru import logger
@@ -952,13 +953,71 @@ class JsonlSessionStore:
         return sorted(sessions, key=lambda item: item["updated_at"], reverse=True)
 
 
+class OwnerMergingSessionStore(JsonlSessionStore):
+    """JSONL store that routes owner sessions to one shared file.
+
+    When a session key (or its ``chat_id`` component) matches the configured
+    ``owner_ids`` set, every read/write is redirected to ``owner_shared.jsonl``
+    so the owner keeps a single continuous conversation across channels and
+    group chats. Non-owner sessions behave exactly like the base store.
+    """
+
+    _OWNER_SHARED_KEY = "owner:shared"
+    _OWNER_SHARED_FILENAME = "owner_shared.jsonl"
+
+    def __init__(self, workspace: Path, owner_ids: Iterable[str] | None = None) -> None:
+        super().__init__(workspace)
+        self._owner_ids: set[str] = {
+            str(item).strip() for item in (owner_ids or []) if str(item).strip()
+        }
+
+    @property
+    def owner_ids(self) -> set[str]:
+        return set(self._owner_ids)
+
+    def is_owner_session(self, key: str) -> bool:
+        """True when *key* (or its chat_id component) belongs to a configured owner."""
+        if key == self._OWNER_SHARED_KEY:
+            return True
+        if not self._owner_ids:
+            return False
+        candidates = {key}
+        if ":" in key:
+            channel, chat_id = key.split(":", 1)
+            candidates.add(chat_id)
+            candidates.add(f"{channel}:{chat_id}")
+        return any(c in self._owner_ids for c in candidates)
+
+    def resolve_key(self, key: str) -> str:
+        """Map any owner session key to the shared owner session key."""
+        return self._OWNER_SHARED_KEY if self.is_owner_session(key) else key
+
+    def get_session_path(self, key: str) -> Path:
+        if self.is_owner_session(key):
+            return self.sessions_dir / self._OWNER_SHARED_FILENAME
+        return super().get_session_path(key)
+
+
 class SessionManager:
     """Manage session identity, caching, retention, and persistence."""
 
-    def __init__(self, workspace: Path, *, store: SessionStore | None = None):
+    def __init__(
+        self,
+        workspace: Path,
+        *,
+        store: SessionStore | None = None,
+        owner_ids: Iterable[str] | None = None,
+    ):
         self.workspace = workspace
-        self._jsonl_store = JsonlSessionStore(workspace)
-        self._store: SessionStore = store if store is not None else self._jsonl_store
+        self._owner_ids: set[str] = {
+            str(item).strip() for item in (owner_ids or []) if str(item).strip()
+        }
+        if store is not None:
+            self._jsonl_store = OwnerMergingSessionStore(workspace, owner_ids=self._owner_ids)
+            self._store: SessionStore = store
+        else:
+            self._jsonl_store = OwnerMergingSessionStore(workspace, owner_ids=self._owner_ids)
+            self._store = self._jsonl_store
         self.sessions_dir = self._jsonl_store.sessions_dir
         self.legacy_sessions_dir = self._jsonl_store.legacy_sessions_dir
         self._cache: OrderedDict[str, Session] = OrderedDict()
@@ -966,23 +1025,53 @@ class SessionManager:
         self._overflow_cache: WeakValueDictionary[str, Session] = WeakValueDictionary()
         self._max_cached_sessions = SESSION_CACHE_MAX_SIZE
         self._file_cap_archiver: Callable[..., None] | None = None
+        # Serializes writes to the shared owner session file across concurrent
+        # turns (subagents, background tasks) so cross-channel appends don't race.
+        self._owner_write_lock = threading.Lock()
+
+    _OWNER_SHARED_KEY = "owner:shared"
+
+    @property
+    def owner_ids(self) -> set[str]:
+        return set(self._owner_ids)
+
+    def is_owner_session(self, key: str) -> bool:
+        """True when *key* belongs to a configured owner (routes to shared session)."""
+        if not self._owner_ids:
+            return False
+        if self._jsonl_store is not None and isinstance(
+            self._jsonl_store, OwnerMergingSessionStore
+        ):
+            return self._jsonl_store.is_owner_session(key)
+        candidates = {key}
+        if ":" in key:
+            channel, chat_id = key.split(":", 1)
+            candidates.add(chat_id)
+            candidates.add(f"{channel}:{chat_id}")
+        return any(c in self._owner_ids for c in candidates)
+
+    def _resolve_cache_key(self, key: str) -> str:
+        """Map any owner session key to the shared owner cache key."""
+        return self._OWNER_SHARED_KEY if self.is_owner_session(key) else key
 
     def _remember(self, session: Session) -> None:
         """Keep recent sessions strongly cached without duplicating live objects."""
-        self._overflow_cache.pop(session.key, None)
-        self._cache[session.key] = session
-        self._cache.move_to_end(session.key)
+        cache_key = self._resolve_cache_key(session.key)
+        self._overflow_cache.pop(cache_key, None)
+        self._cache[cache_key] = session
+        self._cache.move_to_end(cache_key)
         while len(self._cache) > self._max_cached_sessions:
             key, evicted = self._cache.popitem(last=False)
             self._overflow_cache[key] = evicted
 
     def _cached(self, key: str) -> Session | None:
-        session = self._cache.get(key)
+        cache_key = self._resolve_cache_key(key)
+        session = self._cache.get(cache_key)
         if session is not None:
-            self._cache.move_to_end(key)
+            self._cache.move_to_end(cache_key)
             return session
 
-        session = self._overflow_cache.get(key)
+        session = self._overflow_cache.get(cache_key)
         if session is not None:
             self._remember(session)
         return session
@@ -1048,17 +1137,17 @@ class SessionManager:
 
         session = self._load(key)
         if session is None:
-            session = Session(key=key)
+            session = Session(key=self._resolve_cache_key(key))
 
         self._remember(session)
         return session
 
     def _load(self, key: str) -> Session | None:
-        return self._store.load(key)
+        return self._store.load(self._resolve_cache_key(key))
 
     def _repair(self, key: str, *, path: Path | None = None) -> Session | None:
         """Attempt to recover a session from a corrupt JSONL file."""
-        return self._jsonl_store.repair(key, path=path)
+        return self._jsonl_store.repair(self._resolve_cache_key(key), path=path)
 
     @staticmethod
     def _session_payload(session: Session) -> SessionPayload:
@@ -1075,7 +1164,13 @@ class SessionManager:
                 )
             )
 
-        self._store.save(session, fsync=fsync)
+        # Serialize writes to the shared owner file so concurrent turns
+        # (subagents / background tasks) can't interleave atomic replaces.
+        if self.is_owner_session(session.key):
+            with self._owner_write_lock:
+                self._store.save(session, fsync=fsync)
+        else:
+            self._store.save(session, fsync=fsync)
         self._remember(session)
 
     def flush_all(self) -> int:
@@ -1098,8 +1193,9 @@ class SessionManager:
 
     def invalidate(self, key: str) -> None:
         """Remove a session from the in-memory cache."""
-        self._cache.pop(key, None)
-        self._overflow_cache.pop(key, None)
+        cache_key = self._resolve_cache_key(key)
+        self._cache.pop(cache_key, None)
+        self._overflow_cache.pop(cache_key, None)
 
     def delete_session(self, key: str) -> bool:
         """Delete a persisted session and invalidate its cache entry."""
