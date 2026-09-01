@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import datetime as datetime_module
 from datetime import datetime as real_datetime
 from importlib.resources import files as pkg_files
 from pathlib import Path
@@ -71,16 +72,22 @@ def test_runtime_context_includes_speaker_identity_and_owner_status(tmp_path) ->
     workspace = _make_workspace(tmp_path)
     builder = ContextBuilder(workspace)
 
-    messages = builder.build_messages(
-        history=[],
-        current_message="hello",
-        channel="qq",
-        chat_id="group123",
+    # Speaker identity reaches the model as a runtime-context provider block
+    # (nanobot.agent.loop.AgentLoop._speaker_runtime_context builds this).
+    runtime = ContextBuilder._build_runtime_context(
+        "qq",
+        "group123",
         sender_id="user1",
         sender_name="Alice",
         sender_username="alice",
         conversation_type="group",
         is_owner=False,
+    )
+    messages = builder.build_messages(
+        history=[],
+        current_message="hello",
+        channel="qq",
+        runtime_context_blocks=[RuntimeContextBlock(source="speaker", content=runtime)],
     )
 
     user_content = messages[-1]["content"]

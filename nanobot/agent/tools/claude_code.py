@@ -13,6 +13,8 @@ if TYPE_CHECKING:
 class _CCToolBase(Tool):
     """Shared context routing for Claude Code job tools."""
 
+    _plugin_discoverable = False  # Requires ClaudeCodeJobManager; registered manually
+
     def __init__(self, manager: "ClaudeCodeJobManager"):
         self._manager = manager
         self._origin_channel = "cli"

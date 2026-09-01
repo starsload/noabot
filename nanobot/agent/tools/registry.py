@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Iterable
 from typing import TYPE_CHECKING, Any, cast
 
 from nanobot.agent.tools.base import Tool, ToolResult
@@ -83,13 +84,29 @@ class ToolRegistry:
         name = schema.get("name")
         return name if isinstance(name, str) else ""
 
-    def get_definitions(self) -> list[dict[str, Any]]:
+    def get_definitions(
+        self,
+        allowed_names: Iterable[str] | None = None,
+    ) -> list[dict[str, Any]]:
         """Get tool definitions with stable ordering for cache-friendly prompts.
 
         Built-in tools are sorted first as a stable prefix, then MCP tools are
         sorted and appended.  The result is cached until the next
         register/unregister call.
+
+        When *allowed_names* is given, only definitions whose name is in that
+        set are returned — used for per-turn capability gating (chat_only /
+        automation modes). The unrestricted full list stays cached so privileged
+        turns keep the cache-friendly fast path.
         """
+        if allowed_names is not None:
+            allowed = set(allowed_names)
+            return [
+                schema
+                for schema in self.get_definitions()
+                if self._schema_name(schema) in allowed
+            ]
+
         if self._cached_definitions is not None:
             return self._cached_definitions
 

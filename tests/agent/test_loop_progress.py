@@ -274,7 +274,15 @@ class TestToolEventProgress:
         bus = MessageBus()
         provider = MagicMock()
         provider.get_default_model.return_value = "test-model"
-        loop = AgentLoop(bus=bus, provider=provider, workspace=tmp_path, model="test-model")
+        # Owner binding keeps the turn in full capability mode so the exec
+        # tool call reaches execution (noabot capability gating).
+        loop = AgentLoop(
+            bus=bus,
+            provider=provider,
+            workspace=tmp_path,
+            model="test-model",
+            owner_ids=["telegram:u1"],
+        )
 
         tool_call = ToolCallRequest(id="tc1", name="exec", arguments={"command": "ls"})
         calls = iter([
@@ -399,12 +407,15 @@ class TestToolEventProgress:
 
         provider.chat_stream_with_retry = chat_stream_with_retry
         provider.chat_with_retry = AsyncMock()
+        # Owner binding keeps the /goal turn in full capability mode so the
+        # write_file call executes (noabot capability gating).
         loop = AgentLoop(
             bus=bus,
             provider=provider,
             workspace=tmp_path,
             model="test-model",
             hook_factories=[create_file_edit_activity_hook],
+            owner_ids=["websocket:u1"],
         )
         tool = WriteFileTool(workspace=tmp_path)
         loop.tools.get_definitions = MagicMock(return_value=[

@@ -24,31 +24,8 @@ def test_load_config_keeps_max_tokens_and_ignores_legacy_memory_window(tmp_path)
     config = load_config(config_path)
 
     assert config.agents.defaults.max_tokens == 1234
-    assert config.agents.defaults.context_window_tokens == 65_536
-    assert config.agents.defaults.should_warn_deprecated_memory_window is True
+    assert config.agents.defaults.context_window_tokens == 200_000
     assert not hasattr(config.agents.defaults, "memory_window")
-
-
-def test_load_config_does_not_warn_when_context_window_tokens_is_already_present(tmp_path) -> None:
-    config_path = tmp_path / "config.json"
-    config_path.write_text(
-        json.dumps(
-            {
-                "agents": {
-                    "defaults": {
-                        "memoryWindow": 42,
-                        "contextWindowTokens": 32_768,
-                    }
-                }
-            }
-        ),
-        encoding="utf-8",
-    )
-
-    config = load_config(config_path)
-
-    assert config.agents.defaults.context_window_tokens == 32_768
-    assert config.agents.defaults.should_warn_deprecated_memory_window is False
 
 
 def test_load_config_normalizes_html_escaped_mcp_args(tmp_path) -> None:

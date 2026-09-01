@@ -45,6 +45,18 @@ dependencies = [
     "chardet>=3.0.2,<6.0.0",
     "openai>=2.8.0",
     "tiktoken>=0.12.0,<1.0.0",
+    "jinja2>=3.1.0,<4.0.0",
+    "dulwich>=0.22.0,<1.0.0",
+    "pyyaml>=6.0,<7.0.0",
+    "filelock>=3.25.2",
+    "watchfiles>=1.1.1,<2.0.0",
+    "packaging>=24.0",
+    "tzdata>=2025.2",
+    "defusedxml>=0.7.1,<1.0.0",
+    "pypdf>=5.0.0,<6.0.0",
+    "python-docx>=1.1.0,<2.0.0",
+    "openpyxl>=3.1.0,<4.0.0",
+    "python-pptx>=1.0.0,<2.0.0",
     "Pillow>=10.0.0,<13.0.0",
 ]
 
@@ -74,12 +86,36 @@ windows_automation = [
 ]
 
 matrix = [
-    "matrix-nio[e2e]>=0.25.2",
+    # Mirrors nanobot/channels/matrix/manifest.py: python-olm can't build on
+    # Windows, so E2E is non-Windows only there too.
+    "matrix-nio[e2e]>=0.25.2; sys_platform != 'win32'",
+    "matrix-nio>=0.25.2; sys_platform == 'win32'",
     "mistune>=3.0.0,<4.0.0",
     "nh3>=0.2.17,<1.0.0",
 ]
 langsmith = [
     "langsmith>=0.1.0",
+]
+api = [
+    "aiohttp>=3.9.0,<4.0.0",
+]
+documents = [
+    # Compatibility extra: document readers are bundled since v0.2.3.
+    "defusedxml>=0.7.1,<1.0.0",
+    "pypdf>=5.0.0,<6.0.0",
+    "python-docx>=1.1.0,<2.0.0",
+    "openpyxl>=3.1.0,<4.0.0",
+    "python-pptx>=1.0.0,<2.0.0",
+]
+langfuse = [
+    "langfuse>=3.0.0,<4.0.0",
+]
+pdf = [
+    # Compatibility extra: PDF reading is bundled since v0.2.3.
+    "pypdf>=5.0.0,<6.0.0",
+]
+olostep = [
+    "olostep>=0.1.0; python_version < '3.14'",
 ]
 dev = [
     "pytest>=9.0.0,<10.0.0",
@@ -87,6 +123,15 @@ dev = [
     "pytest-cov>=6.0.0,<7.0.0",
     "pytest-xdist>=3.8.0,<4.0.0",
     "ruff>=0.1.0",
+    "aiohttp>=3.9.0,<4.0.0",
+    "basedpyright>=1.39.0,<2.0.0",
+    "pymupdf>=1.25.0",
+    "pypdf>=5.0.0,<6.0.0",
+    "python-docx>=1.1.0,<2.0.0",
+    "openpyxl>=3.1.0,<4.0.0",
+    "python-pptx>=1.0.0,<2.0.0",
+    "python-socketio>=5.16.0,<6.0.0",
+    "msgpack>=1.1.0,<2.0.0",
 ]
 
 [project.scripts]

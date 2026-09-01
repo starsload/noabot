@@ -16,6 +16,8 @@ from nanobot.utils.helpers import build_image_content_blocks, detect_image_mime
 class WindowsControlTool(Tool):
     """Thin framework wrapper around the workspace windows-automation skill."""
 
+    _plugin_discoverable = False  # Requires workspace; registered manually
+
     _READ_ONLY_ACTIONS = frozenset(
         {
             "capabilities",

@@ -1,5 +1,6 @@
 """Configuration loading utilities."""
 
+import html
 import json
 import os
 import re
@@ -342,8 +343,46 @@ def _env_replace(match: re.Match[str]) -> str:
     return value
 
 
+def _normalize_mcp_arg(value: object) -> object:
+    """Normalize HTML-escaped or accidentally quoted MCP command arguments."""
+    if not isinstance(value, str):
+        return value
+
+    normalized = html.unescape(value).strip()
+    if normalized.startswith('"') and normalized.count('"') == 1:
+        normalized = normalized[1:]
+    elif normalized.endswith('"') and normalized.count('"') == 1:
+        normalized = normalized[:-1]
+    elif len(normalized) >= 2 and normalized[0] == normalized[-1] == '"':
+        normalized = normalized[1:-1]
+    return normalized
+
+
 def _migrate_config(data: dict[str, Any]) -> dict[str, Any]:
     """Migrate old config formats to current."""
+    # Rename the legacy camelCase channel key for the custom qq_personal bridge.
+    channels = data.get("channels")
+    if isinstance(channels, dict) and "qqPersonal" in channels and "qq_personal" not in channels:
+        channels["qq_personal"] = channels.pop("qqPersonal")
+
+    # Migrate legacy flat voice provider keys:
+    #   "voice": {"sttProvider": "...", "ttsProvider": "..."}
+    # -> "voice": {"stt": {"provider": "..."}, "tts": {"provider": "..."}}
+    voice = data.get("voice")
+    if isinstance(voice, dict):
+        stt_provider = voice.pop("sttProvider", voice.pop("stt_provider", None))
+        tts_provider = voice.pop("ttsProvider", voice.pop("tts_provider", None))
+        if stt_provider:
+            stt_cfg = voice.get("stt", {})
+            if isinstance(stt_cfg, dict) and "provider" not in stt_cfg:
+                stt_cfg["provider"] = stt_provider
+                voice["stt"] = stt_cfg
+        if tts_provider:
+            tts_cfg = voice.get("tts", {})
+            if isinstance(tts_cfg, dict) and "provider" not in tts_cfg:
+                tts_cfg["provider"] = tts_provider
+                voice["tts"] = tts_cfg
+
     # Move tools.exec.restrictToWorkspace → tools.restrictToWorkspace
     tools_value = data.get("tools", {})
     if not isinstance(tools_value, dict):
@@ -376,6 +415,13 @@ def _migrate_config(data: dict[str, Any]) -> dict[str, Any]:
             my_cfg["allowSet"] = tools.pop("mySet")
         else:
             tools.pop("mySet", None)
+
+    # Normalize HTML-escaped / stray-quoted MCP server args (Windows copy-paste artifacts).
+    mcp_servers = _as_config_object(tools.get("mcpServers", {}))
+    if mcp_servers is not None:
+        for server_cfg in mcp_servers.values():
+            if isinstance(server_cfg, dict) and isinstance(server_cfg.get("args"), list):
+                server_cfg["args"] = [_normalize_mcp_arg(arg) for arg in server_cfg["args"]]
 
     return data
 

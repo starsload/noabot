@@ -42,8 +42,8 @@ from nanobot.agent.tools.file_state import FileStateStore, bind_file_states, res
 from nanobot.agent.tools.message import MessageTool
 from nanobot.agent.tools.noah_local_painter import NoahLocalPainterTool
 from nanobot.agent.tools.registry import ToolRegistry
-from nanobot.agent.tools.windows_control import WindowsControlTool
 from nanobot.agent.tools.self import MyTool
+from nanobot.agent.tools.windows_control import WindowsControlTool
 from nanobot.agent.turn_delivery import (
     TurnDelivery,
     TurnDeliveryFactory,
@@ -137,6 +137,8 @@ class TurnContext:
     provider_state: ProviderConversationState | None = field(default=None, repr=False)
     request_context: RequestContext | None = None
     runtime_context_blocks: list[RuntimeContextBlock] = field(default_factory=list)
+    capability_mode: str = "full"
+    allowed_tool_names: set[str] | None = None
     attributes: dict[str, Any] = field(default_factory=dict)
 
     final_content: str | None = None
@@ -255,6 +257,24 @@ class AgentLoop:
     _PROVIDER_STATE_CHECKPOINT_VERSION_KEY = "provider_state_checkpoint_version"
     _PROVIDER_STATE_CHECKPOINT_VERSION = "v1"
 
+    # Capability gating (re-applied from dev-clean cb374132..53a4dbf1):
+    # non-owner remote turns run "chat_only" (deny-by-default, read-only web
+    # tools only); internally tagged automation gets task tools but no
+    # delegation / desktop control.
+    _CHAT_ONLY_ALLOWED_TOOLS = frozenset({"web_search", "web_fetch"})
+    _CHAT_ONLY_OPTIONAL_TOOLS = frozenset({"noah_local_painter"})
+    _AUTOMATION_KINDS = frozenset({"cron", "heartbeat"})
+    _AUTOMATION_BLOCKED_TOOLS = frozenset({
+        "spawn",
+        "windows_control",
+        "codex_delegate",
+        "codex_status",
+        "codex_resume",
+        "cc_delegate",
+        "cc_status",
+        "cc_resume",
+    })
+
     def __init__(
         self,
         bus: MessageBus,
@@ -272,6 +292,7 @@ class AgentLoop:
         cron_service: CronService | None = None,
         restrict_to_workspace: bool = False,
         session_manager: SessionManager | None = None,
+        owner_ids: Iterable[str] | None = None,
         mcp_servers: dict[str, MCPServerConfig] | None = None,
         channels_config: ChannelsConfig | None = None,
         timezone: str | None = None,
@@ -393,7 +414,10 @@ class AgentLoop:
                 logger.warning("OpenPets hook init failed: {}", exc)
 
         self.context = ContextBuilder(workspace, timezone=timezone, disabled_skills=disabled_skills)
-        self.sessions = session_manager or SessionManager(workspace)
+        self.sessions = session_manager or SessionManager(
+            workspace,
+            owner_ids=owner_ids if owner_ids is None else set(owner_ids),
+        )
         self.sessions.set_file_cap_archiver(self.context.memory.raw_archive)
         self.tools = ToolRegistry()
         self.codex_jobs = CodexJobManager(workspace=workspace, bus=bus)
@@ -421,6 +445,8 @@ class AgentLoop:
         self._mcp_stacks: dict[str, MCPConnection] = {}
         self._mcp_connecting = False
         self._runtime_context_providers: list[RuntimeContextProvider] = []
+        # Speaker identity block: attributes turns in shared/group sessions.
+        self._runtime_context_providers.append(self._speaker_runtime_context)
         self._active_tasks: dict[str, set[asyncio.Task[Any]]] = {}
         self._background_tasks: set[asyncio.Task[Any]] = set()
         self._session_locks: weakref.WeakValueDictionary[str, asyncio.Lock] = (
@@ -674,15 +700,22 @@ class AgentLoop:
         self.tools.register(CCResumeTool(manager=self.claude_code_jobs))
         registered.extend(("cc_delegate", "cc_status", "cc_resume"))
 
-        # Noah local painter tool needs workspace + bus — manual registration
-        self.tools.register(
-            NoahLocalPainterTool(workspace=self.workspace, send_callback=self.bus.publish_outbound)
-        )
-        registered.append("noah_local_painter")
+        # Noah local painter tool needs workspace + bus — manual registration,
+        # and only when its native dependencies are usable on this machine.
+        if NoahLocalPainterTool.is_available(self.workspace):
+            self.tools.register(
+                NoahLocalPainterTool(
+                    workspace=self.workspace,
+                    send_callback=self.bus.publish_outbound,
+                )
+            )
+            registered.append("noah_local_painter")
 
-        # Windows control tool needs workspace — manual registration
-        self.tools.register(WindowsControlTool(workspace=self.workspace))
-        registered.append("windows_control")
+        # Windows control tool needs workspace — manual registration, gated on
+        # platform + optional native automation deps.
+        if WindowsControlTool.is_available(self.workspace):
+            self.tools.register(WindowsControlTool(workspace=self.workspace))
+            registered.append("windows_control")
 
         logger.info("Registered {} tools: {}", len(registered), registered)
 
@@ -779,6 +812,11 @@ class AgentLoop:
             include_memory_recent_history=not ctx.ephemeral,
             session_key=ctx.session.key,
             unified_session=self._unified_session,
+            capability_mode=ctx.capability_mode,
+            skill_names=self._skill_names_for_message(ctx.msg, ctx.allowed_tool_names),
+            allowed_tool_names=(
+                sorted(ctx.allowed_tool_names) if ctx.allowed_tool_names is not None else None
+            ),
         )
 
     def _request_context_for_turn(self, ctx: TurnContext) -> RequestContext:
@@ -859,19 +897,176 @@ class AgentLoop:
             return UNIFIED_SESSION_KEY
         return msg.session_key
 
-    def _is_owner(self, msg: InboundMessage) -> bool | None:
-        """Whether the sender matches a configured owner id.
+    def _owner_ids_view(self) -> set[str]:
+        """Configured owner ids, tolerating bare test doubles."""
+        sessions = getattr(self, "sessions", None)
+        if sessions is not None:
+            return cast(set[str], sessions.owner_ids)
+        return cast(set[str], getattr(self, "owner_ids", set()))
+
+    def _owner_status_for(self, channel: str | None, sender_id: str | None) -> bool | None:
+        """Whether *sender_id* matches a configured owner id for *channel*.
 
         Returns ``None`` when no owner_ids are configured (access control
         falls back to channel allow_from / pairing). Returns ``True``/``False``
         based on whether the sender matches an owner_id once configured.
         """
-        owner_ids = self.sessions.owner_ids
+        owner_ids = self._owner_ids_view()
         if not owner_ids:
             return None
-        sender_id = str(msg.sender_id).strip()
-        candidates = {sender_id, f"{msg.channel}:{sender_id}"}
+        sender = str(sender_id or "").strip()
+        candidates = {sender, f"{channel}:{sender}"}
         return any(c in owner_ids for c in candidates)
+
+    def _is_owner(self, msg: InboundMessage) -> bool | None:
+        """Whether the message sender matches a configured owner id."""
+        return self._owner_status_for(msg.channel, str(msg.sender_id))
+
+    # Websocket (WebUI/gateway) counts as trusted-local by operator decision:
+    # the gateway WS binds to loopback, so its connections are the owner's
+    # own machines, not remote third-party speakers.
+    _TRUSTED_LOCAL_CHANNELS = frozenset({"cli", "system", "websocket"})
+
+    @staticmethod
+    def _is_trusted_local_message(msg: InboundMessage) -> bool:
+        """Return True for trusted local/internal control-plane messages."""
+        return msg.channel in AgentLoop._TRUSTED_LOCAL_CHANNELS
+
+    def _has_full_capabilities(self, msg: InboundMessage) -> bool:
+        """Return whether the message may use tools, skills, and admin commands."""
+        if self._is_trusted_local_message(msg):
+            return True
+        return self._is_owner(msg) is True
+
+    @staticmethod
+    def _owner_only_message() -> str:
+        """Return a consistent denial message for restricted actions."""
+        return "This action is only available to the configured owner or from the local CLI."
+
+    def _automation_kind(self, msg: InboundMessage) -> str | None:
+        """Return trusted internal automation kind when present."""
+        metadata = msg.metadata if isinstance(msg.metadata, dict) else {}
+        raw = str(metadata.get("_internal_automation") or "").strip().lower()
+        if raw in self._AUTOMATION_KINDS:
+            return raw
+        # Cron/heartbeat dispatches carry the durable trigger marker; treat
+        # them as the same trusted automation class as an explicit tag.
+        from nanobot.cron.session_turns import CRON_TRIGGER_META
+
+        if isinstance(metadata.get(CRON_TRIGGER_META), dict):
+            return "cron"
+        return None
+
+    def _is_internal_automation_message(self, msg: InboundMessage) -> bool:
+        """Return True for internally-tagged cron/heartbeat executions."""
+        return self._automation_kind(msg) is not None
+
+    def _capability_mode(self, msg: InboundMessage) -> str:
+        """Return the capability mode for the current message."""
+        if self._has_full_capabilities(msg):
+            return "full"
+        if self._is_internal_automation_message(msg):
+            return "automation"
+        return "chat_only"
+
+    def _allowed_tool_names_for_message(self, msg: InboundMessage) -> set[str]:
+        """Return the allowlisted tool names for this message."""
+        registered_tools = set(self.tools.tool_names)
+        if self._has_full_capabilities(msg):
+            return registered_tools
+        if self._is_internal_automation_message(msg):
+            return registered_tools.difference(self._AUTOMATION_BLOCKED_TOOLS)
+
+        allowed = set(self._CHAT_ONLY_ALLOWED_TOOLS)
+        allowed.update(registered_tools.intersection(self._CHAT_ONLY_OPTIONAL_TOOLS))
+        return registered_tools.intersection(allowed)
+
+    def _skill_names_for_message(
+        self,
+        msg: InboundMessage,
+        allowed_tool_names: set[str] | None = None,
+    ) -> list[str] | None:
+        """Return explicitly surfaced skills for the current message."""
+        if self._capability_mode(msg) != "chat_only":
+            return None
+
+        allowed = allowed_tool_names or self._allowed_tool_names_for_message(msg)
+        if "noah_local_painter" not in allowed:
+            return None
+
+        skill_path = self.workspace / "skills" / "noah-local-painter" / "SKILL.md"
+        if skill_path.exists():
+            return ["noah-local-painter"]
+        return None
+
+    def _is_owner_only_command(self, command: str) -> bool:
+        """Return whether a slash command requires full capabilities."""
+        return command in {"/restart", "/status", "/stop"}
+
+    @staticmethod
+    def _speaker_metadata_from(metadata: Mapping[str, Any] | None) -> dict[str, str | None]:
+        """Extract speaker identity fields from message metadata."""
+
+        def _meta_str(key: str) -> str | None:
+            value = metadata.get(key) if isinstance(metadata, Mapping) else None
+            text = str(value).strip() if value is not None else ""
+            return text or None
+
+        return {
+            "sender_name": _meta_str("sender_name"),
+            "sender_username": _meta_str("sender_username"),
+            # Channels disagree on the key: qq_personal/mochat use
+            # ``conversation_type``, telegram-style channels ship ``chat_type``.
+            "conversation_type": _meta_str("conversation_type") or _meta_str("chat_type"),
+        }
+
+    def _speaker_context_kwargs(self, msg: InboundMessage) -> dict[str, Any]:
+        """Speaker fields for runtime context, with direct/group inference."""
+        sender_id = str(msg.sender_id or "").strip() or None
+        fields = self._speaker_metadata_from(msg.metadata)
+        conversation_type = fields["conversation_type"]
+        if not conversation_type:
+            chat_id = str(msg.chat_id or "").strip()
+            conversation_type = "direct" if sender_id and sender_id == chat_id else None
+        return {
+            "sender_id": sender_id,
+            "sender_name": fields["sender_name"],
+            "sender_username": fields["sender_username"],
+            "conversation_type": conversation_type,
+            "is_owner": self._is_owner(msg),
+        }
+
+    async def _speaker_runtime_context(
+        self,
+        request: RequestContext,
+    ) -> RuntimeContextBlock | None:
+        """Advertise who is speaking (and whether they own the workspace).
+
+        Group/shared channels route many senders into one session; this block
+        lets the model attribute each turn to the right speaker and lets
+        persistence keep a short ``[speaker: ...]`` prefix in history.
+        """
+        sender_id = str(request.sender_id or "").strip() or None
+        is_owner = self._owner_status_for(request.channel, sender_id)
+        fields = self._speaker_metadata_from(request.metadata)
+        # Stay silent unless the channel actually identifies the speaker or the
+        # ownership question is live — plain single-sender turns need no block.
+        if (
+            not (fields["sender_name"] or fields["sender_username"] or fields["conversation_type"])
+            and is_owner is not False
+        ):
+            return None
+        if not request.channel or not request.chat_id:
+            return None
+        content = ContextBuilder._build_runtime_context(
+            request.channel,
+            request.chat_id,
+            self.context.timezone,
+            sender_id=sender_id,
+            is_owner=is_owner,
+            **fields,
+        )
+        return RuntimeContextBlock(source="speaker", content=content)
 
     def _remember_unified_session_route(
         self,
@@ -932,6 +1127,7 @@ class AgentLoop:
         tools: ToolRegistry | None = None,
         request_context: RequestContext | None = None,
         provider_state: ProviderConversationState | None = None,
+        allowed_tool_names: set[str] | None = None,
     ) -> tuple[str | None, list[str], list[dict[str, Any]], str, bool]:
         """Run the agent iteration loop.
 
@@ -1126,6 +1322,7 @@ class AgentLoop:
             result = await self.runner.run(AgentRunSpec(
                 initial_messages=initial_messages,
                 tools=effective_tools,
+                allowed_tool_names=allowed_tool_names,
                 runtime=runtime,
                 max_iterations=self.max_iterations,
                 max_tool_result_chars=self.max_tool_result_chars,
@@ -1674,6 +1871,20 @@ class AgentLoop:
             return False
         session = ctx.require_session()
         raw = ctx.msg.content.strip()
+        first_token = raw.split(maxsplit=1)[0].lower() if raw else ""
+        if self._is_owner_only_command(first_token) and not self._has_full_capabilities(
+            ctx.msg
+        ):
+            # Owner-admin commands never reach the router for guests or
+            # internal automation turns; deny before dispatch so handlers,
+            # hooks, and session state stay untouched.
+            ctx.outbound = OutboundMessage(
+                channel=ctx.msg.channel,
+                chat_id=ctx.msg.chat_id,
+                content=self._owner_only_message(),
+                metadata={"render_as": "text"},
+            )
+            return True
         _, automation_metadata = automation_history_overrides(ctx.msg.metadata)
         is_user_turn = (
             ctx.original_user_text is not None
@@ -1776,6 +1987,13 @@ class AgentLoop:
         ctx.delivery.record_runtime(runtime)
 
         ctx.request_context = self._request_context_for_turn(ctx)
+        ctx.capability_mode = self._capability_mode(ctx.msg)
+        # Full turns pass None so the runner keeps the cached, stable-ordered
+        # definition list (and any tools registered mid-turn stay visible).
+        ctx.allowed_tool_names = (
+            None if ctx.capability_mode == "full"
+            else self._allowed_tool_names_for_message(ctx.msg)
+        )
         if ctx.kind is TurnKind.USER:
             ctx.runtime_context_blocks = await self._resolve_runtime_context_for_turn(ctx)
         staged_provider_state = False
@@ -1871,6 +2089,7 @@ class AgentLoop:
             tools=ctx.tools,
             request_context=ctx.request_context,
             provider_state=ctx.provider_state,
+            allowed_tool_names=ctx.allowed_tool_names,
         )
         final_content, _, all_msgs, stop_reason, had_injections = result
         ctx.final_content = final_content
@@ -1994,6 +2213,18 @@ class AgentLoop:
 
         return filtered
 
+    @staticmethod
+    def _data_image_placeholder(block: object) -> str | None:
+        """Return the persisted placeholder text if *block* is a volatile data image."""
+        if not isinstance(block, dict) or block.get("type") != "image_url":
+            return None
+        image_url = cast(dict[str, Any], block.get("image_url") or {})
+        if not str(image_url.get("url", "")).startswith("data:image/"):
+            return None
+        internal_meta = cast(dict[str, Any], block.get("_meta") or {})
+        path = str(internal_meta.get("path", "")).strip()
+        return image_placeholder_text(path)
+
     def _save_turn(
         self,
         session: Session,
@@ -2055,6 +2286,10 @@ class AgentLoop:
                 if isinstance(content, str) and len(content) > self.max_tool_result_chars:
                     entry["content"] = truncate_text_fn(content, self.max_tool_result_chars)
                 elif isinstance(content, list):
+                    had_inline_images = any(
+                        self._data_image_placeholder(block) is not None
+                        for block in cast(list[object], content)
+                    )
                     filtered = self._sanitize_persisted_blocks(
                         cast(list[object], content),
                         should_truncate_text=True,
@@ -2065,14 +2300,60 @@ class AgentLoop:
                             {"type": "text", "text": "[tool result omitted during persistence]"}
                         ]
                     entry["content"] = filtered
+                    if had_inline_images:
+                        entry["metadata"] = {
+                            **cast(dict[str, Any], entry.get("metadata") or {}),
+                            "had_inline_images": True,
+                        }
             elif role == "user":
-                if isinstance(content, list):
+                if isinstance(content, str):
+                    speaker_metadata, body = ContextBuilder.extract_runtime_metadata(content)
+                    if speaker_metadata:
+                        # Legacy merged form: runtime block prepended to the text.
+                        entry["content"] = (
+                            ContextBuilder.build_historical_speaker_prefix(speaker_metadata) or ""
+                        ) + body
+                elif isinstance(content, list):
+                    had_inline_images = any(
+                        self._data_image_placeholder(block) is not None
+                        for block in cast(list[object], content)
+                    )
                     filtered = self._sanitize_persisted_blocks(
                         cast(list[object], content),
                     )
+                    if (
+                        filtered
+                        and isinstance(filtered[0], dict)
+                        and str(cast(dict[str, Any], filtered[0]).get("text", "")).startswith(
+                            ContextBuilder._RUNTIME_CONTEXT_TAG
+                        )
+                    ):
+                        # Legacy merged form: runtime block spliced in front of
+                        # the user blocks — strip it but keep speaker identity.
+                        runtime_block = cast(dict[str, Any], filtered[0])
+                        speaker_metadata, body = ContextBuilder.extract_runtime_metadata(
+                            str(runtime_block.get("text", "")),
+                        )
+                        speaker_prefix = (
+                            ContextBuilder.build_historical_speaker_prefix(speaker_metadata) or ""
+                        )
+                        rest = filtered[1:]
+                        if body:
+                            rest = [{"type": "text", "text": body}, *rest]
+                        elif rest and isinstance(rest[0], dict) and str(
+                            cast(dict[str, Any], rest[0]).get("type", ""),
+                        ) == "text":
+                            first = cast(dict[str, Any], rest[0])
+                            rest = [{**first, "text": speaker_prefix + str(first.get("text", ""))}, *rest[1:]]
+                        filtered = rest
                     if not filtered:
                         continue
                     entry["content"] = filtered
+                    if had_inline_images:
+                        entry["metadata"] = {
+                            **cast(dict[str, Any], entry.get("metadata") or {}),
+                            "had_inline_images": True,
+                        }
                 if isinstance(runtime_context_meta, dict):
                     entry[RUNTIME_CONTEXT_HISTORY_META] = runtime_context_meta
             entry.setdefault("timestamp", datetime.now().isoformat())

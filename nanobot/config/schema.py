@@ -415,6 +415,81 @@ class ToolsConfig(Base):
     ssrf_whitelist: list[str] = Field(default_factory=list)  # CIDR ranges to exempt from SSRF blocking (e.g. ["100.64.0.0/10"] for Tailscale)
 
 
+class VoiceSTTConfig(Base):
+    """Speech-to-text configuration."""
+
+    provider: str = "groq"
+    language: str = "zh"
+
+
+class VoiceTTSConfig(Base):
+    """Text-to-speech configuration."""
+
+    provider: str = "edge_tts"
+    voice: str = "zh-CN-XiaoxiaoNeural"
+    rate: str = "+0%"
+    volume: str = "+0%"
+    pitch: str = "+0Hz"
+
+
+class VoiceCaptureConfig(Base):
+    """Audio capture command configuration."""
+
+    backend: Literal["command", "sounddevice"] = "command"
+    command_template: list[str] = Field(default_factory=list)
+    format: str = "wav"
+    duration_s: float = Field(default=5.0, ge=0.1, le=600.0)
+    sample_rate_hz: int = Field(default=16_000, ge=8_000, le=192_000)
+    channels: int = Field(default=1, ge=1, le=8)
+
+
+class VoicePlaybackConfig(Base):
+    """Audio playback command configuration."""
+
+    backend: Literal["command", "sounddevice"] = "command"
+    command_template: list[str] = Field(
+        default_factory=lambda: [
+            "ffplay",
+            "-nodisp",
+            "-autoexit",
+            "-loglevel",
+            "quiet",
+            "{file}",
+        ]
+    )
+
+
+class VoiceConfig(Base):
+    """Voice I/O configuration for desktop pet mode."""
+
+    enabled: bool = False
+    barge_in: bool = True
+    input_device: str = ""
+    output_device: str = ""
+    stt: VoiceSTTConfig = Field(default_factory=VoiceSTTConfig)
+    tts: VoiceTTSConfig = Field(default_factory=VoiceTTSConfig)
+    capture: VoiceCaptureConfig = Field(default_factory=VoiceCaptureConfig)
+    playback: VoicePlaybackConfig = Field(default_factory=VoicePlaybackConfig)
+
+
+class AvatarConfig(Base):
+    """Avatar runtime configuration."""
+
+    enabled: bool = False
+    runtime: Literal["vtube_studio", "none"] = "vtube_studio"
+    host: str = "127.0.0.1"
+    port: int = Field(default=8001, ge=1, le=65535)
+    model_preset: str = "default"
+    plugin_name: str = "nanobot-desktop-avatar"
+    plugin_developer: str = "nanobot"
+    token_path: str = "./token.txt"
+    speaking_parameter: str = "MouthOpen"
+    speaking_value_on: float = 1.0
+    speaking_value_off: float = 0.0
+    expression_hotkeys: dict[str, str] = Field(default_factory=dict)
+    motion_hotkeys: dict[str, str] = Field(default_factory=dict)
+
+
 class OpenPetsConfig(Base):
     """OpenPets desktop pet integration."""
 
@@ -434,6 +509,8 @@ class Config(BaseSettings):
     api: ApiConfig = Field(default_factory=ApiConfig)
     gateway: GatewayConfig = Field(default_factory=GatewayConfig)
     tools: ToolsConfig = Field(default_factory=ToolsConfig)
+    voice: VoiceConfig = Field(default_factory=VoiceConfig)
+    avatar: AvatarConfig = Field(default_factory=AvatarConfig)
     openpets: OpenPetsConfig = Field(default_factory=OpenPetsConfig)
     model_presets: dict[str, ModelPresetConfig] = Field(
         default_factory=dict,

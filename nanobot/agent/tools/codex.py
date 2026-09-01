@@ -13,6 +13,8 @@ if TYPE_CHECKING:
 class _CodexToolBase(Tool):
     """Shared context routing for Codex job tools."""
 
+    _plugin_discoverable = False  # Requires CodexJobManager; registered manually
+
     def __init__(self, manager: "CodexJobManager"):
         self._manager = manager
         self._origin_channel = "cli"

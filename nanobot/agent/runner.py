@@ -115,6 +115,9 @@ class AgentRunSpec:
     goal_continue_message: GoalContinueMessage | None = None
     finalize_on_max_iterations: bool = True
     provider_state: ProviderConversationState | None = None
+    # Per-turn capability gate: when set, only these tool names are offered to
+    # the model, and calls to anything else are refused before execution.
+    allowed_tool_names: set[str] | None = None
 
 
 @dataclass(slots=True)
@@ -919,7 +922,7 @@ class AgentRunner:
         kwargs = self._build_request_kwargs(
             spec,
             messages,
-            tools=spec.tools.get_definitions(),
+            tools=self._turn_tool_definitions(spec),
         )
         wants_streaming = hook.wants_streaming()
         progress_callback = spec.progress_callback
@@ -1300,7 +1303,7 @@ class AgentRunner:
         response: LLMResponse,
     ) -> dict[str, int]:
         try:
-            tools = spec.tools.get_definitions()
+            tools = self._turn_tool_definitions(spec)
         except Exception:
             tools = None
         prompt_tokens, _ = estimate_prompt_tokens_chain(
@@ -1407,6 +1410,13 @@ class AgentRunner:
                 fatal_error = error
         return results, events, fatal_error
 
+    @staticmethod
+    def _turn_tool_definitions(spec: AgentRunSpec) -> list[dict[str, Any]]:
+        """Tool definitions offered this turn, honoring the capability gate."""
+        if spec.allowed_tool_names is None:
+            return spec.tools.get_definitions()
+        return spec.tools.get_definitions(allowed_names=spec.allowed_tool_names)
+
     async def _run_tool(
         self,
         spec: AgentRunSpec,
@@ -1419,6 +1429,24 @@ class AgentRunner:
         hook = hook or AgentHook()
         context = context or AgentHookContext(iteration=0, messages=[])
         hint = "\n\n[Analyze the error above and try a different approach.]"
+        if (
+            spec.allowed_tool_names is not None
+            and tool_call.name not in spec.allowed_tool_names
+        ):
+            # Capability gate: refuse even if the model attempts the call.
+            logger.warning(
+                "Blocked unauthorized tool call in restricted session: {}",
+                tool_call.name,
+            )
+            blocked = (
+                "Error: tool use is disabled in this conversation. "
+                "Only the configured owner or local CLI can use tools."
+            )
+            return blocked, {
+                "name": tool_call.name,
+                "status": "error",
+                "detail": "blocked by capability mode",
+            }, None
         lookup_error = repeated_external_lookup_error(
             tool_call.name,
             tool_call.arguments,

@@ -294,7 +294,16 @@ async def test_non_goal_direct_turn_cannot_reuse_prior_goal_command(tmp_path):
         ),
         LLMResponse(content="handled as a one-time task", tool_calls=[], usage={}),
     ])
-    loop = AgentLoop(bus=MessageBus(), provider=provider, workspace=tmp_path, model="test-model")
+    # Owner binding keeps this api-channel turn in full capability mode so
+    # the create_goal refusal comes from the goal gate, not capability
+    # filtering (noabot capability gating).
+    loop = AgentLoop(
+        bus=MessageBus(),
+        provider=provider,
+        workspace=tmp_path,
+        model="test-model",
+        owner_ids=["api:user"],
+    )
     loop.consolidator.maybe_consolidate_by_tokens = AsyncMock(return_value=None)
     session = loop.sessions.get_or_create("api:default")
     session.add_message("user", "/goal old completed request")

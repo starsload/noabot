@@ -1,4 +1,4 @@
-﻿"""Dedicated tool for the workspace noah-local-painter integration."""
+"""Dedicated tool for the workspace noah-local-painter integration."""
 
 from __future__ import annotations
 
@@ -14,6 +14,7 @@ from nanobot.bus.events import OutboundMessage
 
 
 class NoahLocalPainterTool(Tool):
+    _plugin_discoverable = False  # Requires workspace + bus callback; registered manually
     """Safe wrapper around the workspace noah-local-painter helper."""
 
     _DEFAULT_PRESET = "presets/noah_halfbody.json"

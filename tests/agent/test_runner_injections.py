@@ -619,7 +619,11 @@ async def test_pending_injection_resolves_its_own_runtime_context(tmp_path):
     assert "telegram | group-1 | user-c | message-3" in str(model_messages)
     assert "Carol | topic-7" in str(model_messages)
     assert injected["_meta"][RUNTIME_CONTEXT_MESSAGE_META]["sources"] == [
+        # Each mid-turn injection resolves [speaker, identity]: the loop-level
+        # speaker block (different senders) plus the turn identity provider.
+        "speaker",
         "identity",
+        "speaker",
         "identity",
     ]
 

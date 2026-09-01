@@ -270,6 +270,22 @@ async def test_local_cli_keeps_tools_without_owner_binding(tmp_path: Path) -> No
 
 
 @pytest.mark.asyncio
+async def test_webui_websocket_keeps_tools_without_owner_binding(tmp_path: Path) -> None:
+    loop = _make_loop(tmp_path)
+    loop.provider.chat_with_retry = AsyncMock(return_value=LLMResponse(content="hello", tool_calls=[]))
+
+    response = await loop._process_message(
+        InboundMessage(channel="websocket", sender_id="client-abc", chat_id="web1", content="hi"),
+    )
+
+    assert response is not None
+    tool_names = _tool_names_from_last_call(loop)
+    assert "read_file" in tool_names
+    assert "write_file" in tool_names
+    assert "exec" in tool_names
+
+
+@pytest.mark.asyncio
 async def test_non_owner_tool_call_is_blocked_even_if_model_attempts_it(tmp_path: Path) -> None:
     loop = _make_loop(tmp_path, owner_ids=["telegram:owner"])
     protected_file = tmp_path / "USER.md"
