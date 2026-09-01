@@ -680,6 +680,9 @@ def test_agent_loop_shutdown_closes_exec_sessions(tmp_path, monkeypatch):
         loop._background_tasks = set()
         loop._exec_session_manager = manager
         loop.subagents = SimpleNamespace(close=AsyncMock())
+        # noabot: shutdown also drains the codex/claude-code job managers.
+        loop.codex_jobs = SimpleNamespace(close=AsyncMock())
+        loop.claude_code_jobs = SimpleNamespace(close=AsyncMock())
 
         await loop.close_mcp()
         await loop.close_mcp()
@@ -701,6 +704,9 @@ def test_agent_loop_shutdown_attempts_all_cleanup_after_errors(monkeypatch):
         loop._exec_session_manager = SimpleNamespace(
             close_all=AsyncMock(side_effect=OSError("exec cleanup failed")),
         )
+        # noabot: shutdown also drains the codex/claude-code job managers.
+        loop.codex_jobs = SimpleNamespace(close=AsyncMock())
+        loop.claude_code_jobs = SimpleNamespace(close=AsyncMock())
         close_mcp = AsyncMock()
         monkeypatch.setattr(agent_context, "close_mcp", close_mcp)
 
@@ -852,6 +858,9 @@ def test_agent_loop_shutdown_preserves_single_cleanup_error(monkeypatch):
             close=AsyncMock(side_effect=RuntimeError("subagent cleanup failed")),
         )
         loop._exec_session_manager = SimpleNamespace(close_all=AsyncMock())
+        # noabot: shutdown also drains the codex/claude-code job managers.
+        loop.codex_jobs = SimpleNamespace(close=AsyncMock())
+        loop.claude_code_jobs = SimpleNamespace(close=AsyncMock())
         close_mcp = AsyncMock()
         monkeypatch.setattr(agent_context, "close_mcp", close_mcp)
 

@@ -1,4 +1,6 @@
+import ipaddress
 import shlex
+import socket
 import subprocess
 import sys
 from typing import Any
@@ -248,15 +250,39 @@ def test_exec_extract_absolute_paths_ignores_urls() -> None:
     assert paths == ["/dev/null"]
 
 
+def _resolves_to_public_address(host: str) -> bool:
+    """True when DNS for *host* returns only public addresses.
+
+    The URL safety guard resolves hostnames, so a local hosts-file or DNS
+    override pointing these well-known domains at loopback/private space is
+    correctly treated as an internal URL — the test premise assumes normal
+    public DNS.
+    """
+    try:
+        infos = socket.getaddrinfo(host, None)
+    except OSError:
+        return False
+    return not any(
+        ipaddress.ip_address(info[4][0]).is_private
+        or ipaddress.ip_address(info[4][0]).is_loopback
+        for info in infos
+    )
+
+
 @pytest.mark.parametrize(
-    "command",
+    "command,host",
     [
-        'curl -s -o /dev/null -w "%{http_code}" https://www.google.com',
-        'wget -q -O - http://example.com 2>&1 | head -c 100',
-        'python3 -c "import urllib.request; print(urllib.request.urlopen(\'http://example.com\').read()[:100])"',
+        ('curl -s -o /dev/null -w "%{http_code}" https://www.google.com', "www.google.com"),
+        ('wget -q -O - http://example.com 2>&1 | head -c 100', "example.com"),
+        (
+            'python3 -c "import urllib.request; print(urllib.request.urlopen(\'http://example.com\').read()[:100])"',
+            "example.com",
+        ),
     ],
 )
-def test_exec_guard_allows_public_urls(tmp_path, command: str) -> None:
+def test_exec_guard_allows_public_urls(tmp_path, command: str, host: str) -> None:
+    if not _resolves_to_public_address(host):
+        pytest.skip(f"{host} resolves to a private/loopback address on this machine")
     tool = ExecTool(restrict_to_workspace=True)
     error = tool._guard_command(command, str(tmp_path))
     assert error is None

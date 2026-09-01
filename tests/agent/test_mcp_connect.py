@@ -1,3 +1,13 @@
+"""MCP connect-retry semantics for AgentLoop (re-applied on upstream architecture).
+
+The dev-clean-era loop-local helpers (`_mcp_connected`,
+`_should_propagate_cancelled_error`, `_clear_current_task_cancellation`)
+were superseded upstream: retry state now lives in
+`nanobot.agent.tools.mcp.connect_missing_servers` (per-state `_mcp_stacks`)
+and cancellation discrimination uses `nanobot.utils.cancellation.
+task_is_cancelling`.  These tests pin that current behavior.
+"""
+
 from __future__ import annotations
 
 import asyncio
@@ -5,7 +15,6 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from nanobot.agent import loop as loop_module
 from nanobot.agent.loop import AgentLoop
 from nanobot.bus.queue import MessageBus
 from nanobot.config.schema import MCPServerConfig
@@ -23,66 +32,104 @@ def _make_loop(tmp_path) -> AgentLoop:
     )
 
 
-@pytest.mark.asyncio
-async def test_connect_mcp_retries_when_all_servers_are_cancelled(
-    tmp_path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    loop = _make_loop(tmp_path)
+@pytest.fixture
+def mcp_warnings(monkeypatch: pytest.MonkeyPatch) -> list[str]:
+    import nanobot.agent.tools.mcp as mcp_mod
+
     warnings: list[str] = []
 
-    async def fake_connect_mcp_servers(_mcp_servers, _registry, _stack) -> tuple[int, int]:
-        return 0, 1
-
     def _warning(message: str, *args: object) -> None:
-        warnings.append(message.format(*args))
+        warnings.append(str(message).format(*args))
 
-    monkeypatch.setattr("nanobot.agent.tools.mcp.connect_mcp_servers", fake_connect_mcp_servers)
-    monkeypatch.setattr("nanobot.agent.loop.logger.warning", _warning)
+    monkeypatch.setattr(mcp_mod.logger, "warning", _warning)
+    return warnings
+
+
+@pytest.mark.asyncio
+async def test_connect_mcp_retries_when_nothing_connected(
+    tmp_path, monkeypatch: pytest.MonkeyPatch, mcp_warnings: list[str]
+) -> None:
+    loop = _make_loop(tmp_path)
+    attempts: list[tuple[str, ...]] = []
+
+    async def fake_connect_missing(missing_servers, _registry):
+        attempts.append(tuple(missing_servers))
+        return {}
+
+    monkeypatch.setattr("nanobot.agent.tools.mcp.connect_mcp_servers", fake_connect_missing)
 
     await loop._connect_mcp()
 
-    assert loop._mcp_connected is False
-    assert loop._mcp_stack is None
+    assert loop._mcp_stacks == {}
     assert loop._mcp_connecting is False
-    assert warnings
-    assert "will retry next message" in warnings[-1]
+    assert mcp_warnings
+    assert "will retry next message" in mcp_warnings[-1]
+
+    # A later message re-attempts the still-missing server.
+    await loop._connect_mcp()
+    assert attempts == [("demo",), ("demo",)]
 
 
 @pytest.mark.asyncio
-async def test_loop_cancel_scope_error_is_not_treated_as_external_cancellation(
-    monkeypatch: pytest.MonkeyPatch,
+async def test_cancelled_mcp_connect_without_external_cancel_is_retried(
+    tmp_path, monkeypatch: pytest.MonkeyPatch, mcp_warnings: list[str]
 ) -> None:
-    class _FakeTask:
-        def cancelling(self) -> int:
-            return 1
+    loop = _make_loop(tmp_path)
 
-    monkeypatch.setattr(loop_module.asyncio, "current_task", lambda: _FakeTask())
+    async def fake_connect_missing(_missing_servers, _registry):
+        raise asyncio.CancelledError()
 
-    assert (
-        loop_module._should_propagate_cancelled_error(
-            asyncio.CancelledError("Cancelled via cancel scope test")
-        )
-        is False
+    monkeypatch.setattr("nanobot.agent.tools.mcp.connect_mcp_servers", fake_connect_missing)
+
+    await loop._connect_mcp()
+
+    assert loop._mcp_stacks == {}
+    assert loop._mcp_connecting is False
+    assert mcp_warnings
+    assert "will retry next message" in mcp_warnings[-1]
+
+
+@pytest.mark.asyncio
+async def test_external_task_cancellation_propagates_out_of_mcp_connect(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    loop = _make_loop(tmp_path)
+
+    async def fake_connect_missing(_missing_servers, _registry):
+        raise asyncio.CancelledError()
+
+    monkeypatch.setattr("nanobot.agent.tools.mcp.connect_mcp_servers", fake_connect_missing)
+    monkeypatch.setattr("nanobot.agent.tools.mcp.task_is_cancelling", lambda: True)
+
+    with pytest.raises(asyncio.CancelledError):
+        await loop._connect_mcp()
+
+    assert loop._mcp_stacks == {}
+    assert loop._mcp_connecting is False
+
+
+@pytest.mark.asyncio
+async def test_connect_mcp_records_successful_connections_on_state(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    loop = _make_loop(tmp_path)
+    connection = MagicMock()
+
+    async def fake_connect_missing(_missing_servers, _registry):
+        return {"demo": connection}
+
+    async def no_reconnect_handlers(state, registry, connected):
+        return None
+
+    monkeypatch.setattr("nanobot.agent.tools.mcp.connect_mcp_servers", fake_connect_missing)
+    monkeypatch.setattr(
+        "nanobot.agent.tools.mcp._attach_reconnect_handlers", no_reconnect_handlers
     )
-    assert loop_module._should_propagate_cancelled_error(asyncio.CancelledError()) is True
 
+    await loop._connect_mcp()
 
-def test_loop_clear_current_task_cancellation_uncancels_until_clear(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    class _FakeTask:
-        def __init__(self) -> None:
-            self._count = 2
-
-        def cancelling(self) -> int:
-            return self._count
-
-        def uncancel(self) -> None:
-            self._count -= 1
-
-    task = _FakeTask()
-    monkeypatch.setattr(loop_module.asyncio, "current_task", lambda: task)
-
-    loop_module._clear_current_task_cancellation()
-
-    assert task.cancelling() == 0
+    assert loop._mcp_stacks == {"demo": connection}
+    assert loop._mcp_connecting is False
+    # Nothing missing now: subsequent messages do not re-connect.
+    await loop._connect_mcp()
+    assert loop._mcp_stacks == {"demo": connection}
