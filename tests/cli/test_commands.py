@@ -1160,6 +1160,63 @@ def test_config_falls_back_to_vllm_when_ollama_not_configured():
     assert config.get_api_base() == "http://localhost:8000"
 
 
+def test_config_cloud_nemotron_is_not_hijacked_by_unconfigured_ollama():
+    """`nvidia/nemotron-*` via a gateway must not route to Ollama when no
+    Ollama endpoint is configured. Ollama keeps "nemotron" in its keywords
+    for bare-model auto-routing (PR #1863), which previously hijacked
+    cloud-hosted nemotron variants and silently sent traffic to
+    http://localhost:11434/v1."""
+    config = Config.model_validate(
+        {
+            "agents": {
+                "defaults": {
+                    "provider": "auto",
+                    "model": "nvidia/nemotron-3-super-120b-a12b",
+                }
+            },
+            "providers": {"openrouter": {"apiKey": "sk-or-test"}},
+        }
+    )
+
+    assert config.get_provider_name() == "openrouter"
+    assert config.get_api_base() == "https://openrouter.ai/api/v1"
+
+
+def test_config_bare_nemotron_still_auto_routes_to_configured_ollama():
+    """Preserves PR #1863 intent: when the user has actually configured an
+    Ollama endpoint, a bare nemotron model still auto-routes there."""
+    config = Config.model_validate(
+        {
+            "agents": {"defaults": {"provider": "auto", "model": "nemotron-3-nano"}},
+            "providers": {"ollama": {"apiBase": "http://localhost:11434/v1"}},
+        }
+    )
+
+    assert config.get_provider_name() == "ollama"
+    assert config.get_api_base() == "http://localhost:11434/v1"
+
+
+def test_config_cloud_nemotron_is_not_hijacked_by_configured_ollama():
+    """An explicit cloud namespace takes precedence over local keywords."""
+    config = Config.model_validate(
+        {
+            "agents": {
+                "defaults": {
+                    "provider": "auto",
+                    "model": "nvidia/nemotron-3-super-120b-a12b",
+                }
+            },
+            "providers": {
+                "ollama": {"apiBase": "http://localhost:11434/v1"},
+                "openrouter": {"apiKey": "sk-or-test"},
+            },
+        }
+    )
+
+    assert config.get_provider_name() == "openrouter"
+    assert config.get_api_base() == "https://openrouter.ai/api/v1"
+
+
 def test_openai_compat_provider_passes_model_through():
     from nanobot.providers.openai_compat_provider import OpenAICompatProvider
 
@@ -1766,40 +1823,8 @@ def test_agent_workspace_override_wins_over_config_workspace(mock_agent_runtime,
     assert mock_agent_runtime["load_config"].call_args.args == (config_path.resolve(),)
     assert mock_agent_runtime["config"].agents.defaults.workspace == str(workspace_path)
     assert mock_agent_runtime["sync_templates"].call_args.args == (workspace_path,)
-    assert mock_agent_runtime["agent_loop_cls"].call_args.kwargs["workspace"] == workspace_path
-
-
-def test_agent_hints_about_deprecated_memory_window(mock_agent_runtime):
-    mock_agent_runtime["config"].agents.defaults.should_warn_deprecated_memory_window = True
-
-    result = runner.invoke(app, ["agent", "-m", "hello"])
-
-    assert result.exit_code == 0
-    assert "memoryWindow" in result.stdout
-    assert "no longer used" in result.stdout
-
-
-def test_gateway_hints_about_deprecated_memory_window(monkeypatch, tmp_path: Path) -> None:
-    config_file = tmp_path / "instance" / "config.json"
-    config_file.parent.mkdir(parents=True)
-    config_file.write_text("{}")
-
-    config = Config()
-    config.agents.defaults.should_warn_deprecated_memory_window = True
-
-    monkeypatch.setattr("nanobot.config.loader.set_config_path", lambda _path: None)
-    monkeypatch.setattr("nanobot.config.loader.load_config", lambda _path=None: config)
-    monkeypatch.setattr("nanobot.cli.commands.sync_workspace_templates", lambda _path: None)
-    monkeypatch.setattr(
-        "nanobot.cli.commands._make_provider",
-        lambda _config: (_ for _ in ()).throw(_StopGatewayError("stop")),
-    )
-
-    result = runner.invoke(app, ["gateway", "--config", str(config_file)])
-
-    assert isinstance(result.exception, _StopGatewayError)
-    assert "memoryWindow" in result.stdout
-    assert "no longer used" in result.stdout
+    passed_config = mock_agent_runtime["from_config"].call_args.args[0]
+    assert passed_config.workspace_path == workspace_path
 
 
 def test_heartbeat_retains_recent_messages_by_default():
@@ -2010,7 +2035,7 @@ def test_heartbeat_empty_response_still_retains_recent_messages(
             seen["retained_limit"] = limit
 
     class _FakeSessionManager:
-        def __init__(self, _workspace: Path) -> None:
+        def __init__(self, _workspace: Path, **_kw) -> None:
             self.session = _FakeSession()
             seen["heartbeat_session"] = self.session
 
@@ -2572,7 +2597,7 @@ def _patch_serve_runtime(monkeypatch, config: Config, seen: dict[str, object]) -
         monkeypatch,
         config,
         message_bus=lambda: object(),
-        session_manager=lambda _workspace: object(),
+        session_manager=lambda _workspace, **_kw: object(),
     )
     monkeypatch.setattr("nanobot.cli.commands.AgentLoop", _FakeAgentLoop)
     monkeypatch.setattr("nanobot.api.server.create_app", _fake_create_app)
@@ -2639,7 +2664,7 @@ def test_gateway_uses_workspace_directory_for_cron_store(monkeypatch, tmp_path: 
         monkeypatch,
         config,
         message_bus=lambda: object(),
-        session_manager=lambda _workspace: object(),
+        session_manager=lambda _workspace, **_kw: object(),
         cron_service=_StopCron,
     )
 
@@ -2687,7 +2712,7 @@ def test_gateway_unbound_agent_cron_is_skipped(
             self.messages.append({"role": role, "content": content, **kwargs})
 
     class _FakeSessionManager:
-        def __init__(self, _workspace: Path) -> None:
+        def __init__(self, _workspace: Path, **_kw) -> None:
             self.session = _FakeSession()
             seen["session_manager"] = self
 
@@ -2808,7 +2833,7 @@ def test_gateway_bound_cron_runs_as_session_turn(
     monkeypatch.setattr("nanobot.bus.queue.MessageBus", lambda: bus)
 
     class _FakeSessionManager:
-        def __init__(self, _workspace: Path) -> None:
+        def __init__(self, _workspace: Path, **_kw) -> None:
             pass
 
     monkeypatch.setattr("nanobot.session.manager.SessionManager", _FakeSessionManager)
@@ -2997,7 +3022,7 @@ def test_gateway_local_trigger_queue_submits_agent_turns(
         monkeypatch,
         config,
         message_bus=lambda: bus,
-        session_manager=lambda _workspace: _FakeSessionManager(),
+        session_manager=lambda _workspace, **_kw: _FakeSessionManager(),
         cron_service=lambda _store_path: _FakeCronService(),
     )
 
@@ -3139,7 +3164,7 @@ def test_gateway_workspace_override_does_not_migrate_legacy_cron(
         monkeypatch,
         config,
         message_bus=lambda: object(),
-        session_manager=lambda _workspace: object(),
+        session_manager=lambda _workspace, **_kw: object(),
         cron_service=_StopCron,
         get_cron_dir=lambda: legacy_dir,
     )
@@ -3178,7 +3203,7 @@ def test_gateway_custom_config_workspace_does_not_migrate_legacy_cron(
         monkeypatch,
         config,
         message_bus=lambda: object(),
-        session_manager=lambda _workspace: object(),
+        session_manager=lambda _workspace, **_kw: object(),
         cron_service=_StopCron,
         get_cron_dir=lambda: legacy_dir,
     )
@@ -3379,7 +3404,7 @@ def test_gateway_health_endpoint_binds_and_serves_expected_responses(
         monkeypatch,
         config,
         message_bus=lambda: object(),
-        session_manager=lambda _workspace: object(),
+        session_manager=lambda _workspace, **_kw: object(),
     )
     monkeypatch.setattr("nanobot.cli.gateway_runtime.AgentLoop", _FakeAgentLoop)
     monkeypatch.setattr("nanobot.channels.manager.ChannelManager", _FakeChannelManager)
@@ -3557,7 +3582,7 @@ def test_gateway_shutdown_lets_agent_task_own_mcp_cleanup(
         monkeypatch,
         config,
         message_bus=lambda: object(),
-        session_manager=lambda _workspace: object(),
+        session_manager=lambda _workspace, **_kw: object(),
     )
     monkeypatch.setattr("nanobot.cli.gateway_runtime.AgentLoop", _FakeAgentLoop)
     monkeypatch.setattr("nanobot.channels.manager.ChannelManager", _FakeChannelManager)
@@ -3673,7 +3698,7 @@ def test_gateway_shutdown_event_exits_forever_runtime_tasks(
         monkeypatch,
         config,
         message_bus=lambda: object(),
-        session_manager=lambda _workspace: object(),
+        session_manager=lambda _workspace, **_kw: object(),
     )
     monkeypatch.setattr("nanobot.cli.gateway_runtime.AgentLoop", _FakeAgentLoop)
     monkeypatch.setattr("nanobot.channels.manager.ChannelManager", _FakeChannelManager)

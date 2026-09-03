@@ -8,6 +8,7 @@ from nanobot.agent.tools.context import RequestContext, request_context
 from nanobot.agent.tools.cron import CronTool
 from nanobot.cron.service import CronService
 from nanobot.cron.types import CronJob, CronJobState, CronPayload, CronSchedule
+from nanobot.session.keys import UNIFIED_SESSION_KEY
 
 
 def _make_tool(tmp_path) -> CronTool:
@@ -451,15 +452,26 @@ def test_list_excludes_disabled_jobs(tmp_path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_cron_context_can_still_add_job(tmp_path) -> None:
+async def test_cron_context_blocks_nested_add_until_reset(tmp_path) -> None:
+    # Upstream's current contract: add is refused while a cron job callback is
+    # running (prevents runaway self-scheduling), and the request-scoped
+    # ContextVar restores normal behavior once the token is reset.
     tool = _make_tool(tmp_path)
-    tool.set_context("telegram", "chat-1")
+    request = RequestContext(
+        channel="telegram", chat_id="chat-1", session_key=UNIFIED_SESSION_KEY
+    )
     token = tool.set_cron_context(True)
     try:
-        result = await tool.execute(action="add", message="follow-up", every_seconds=60)
+        with request_context(request):
+            result = await tool.execute(action="add", message="follow-up", every_seconds=60)
     finally:
         tool.reset_cron_context(token)
 
+    assert "cannot schedule new jobs" in result
+    assert tool._cron.list_jobs() == []
+
+    with request_context(request):
+        result = await tool.execute(action="add", message="follow-up", every_seconds=60)
     assert result.startswith("Created job")
     jobs = tool._cron.list_jobs()
     assert len(jobs) == 1

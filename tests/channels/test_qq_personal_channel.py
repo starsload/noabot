@@ -5,7 +5,7 @@ import pytest
 
 from nanobot.bus.events import OutboundMessage
 from nanobot.bus.queue import MessageBus
-from nanobot.channels.qq_personal import QQPersonalChannel, QQPersonalConfig
+from nanobot.channels.qq_personal.runtime import QQPersonalChannel, QQPersonalConfig
 
 
 class _FakeResponse:
@@ -95,6 +95,9 @@ async def test_private_message_still_respects_allow_from(tmp_path) -> None:
         QQPersonalConfig(media_dir=str(tmp_path), allow_from=["another-user"]),
         MessageBus(),
     )
+    # Rejected DMs now enter BaseChannel's pairing flow, which replies via
+    # send(); route that through the fake HTTP client instead of the wire.
+    channel._http = _FakeHttp()
 
     raw = json.dumps(
         {
@@ -111,6 +114,8 @@ async def test_private_message_still_respects_allow_from(tmp_path) -> None:
     await channel._handle_ws_message(raw)
 
     assert channel.bus.inbound_size == 0
+    assert len(channel._http.post_calls) == 1
+    assert channel._http.post_calls[0]["url"].endswith("/send_private_msg")
 
 
 @pytest.mark.asyncio

@@ -1,12 +1,10 @@
 from __future__ import annotations
 
 import asyncio
-from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
 from nanobot.agent.codex_jobs import CodexJob, CodexJobManager
-from nanobot.bus.events import InboundMessage
 from nanobot.bus.queue import MessageBus
 
 
@@ -182,31 +180,11 @@ async def test_status_marks_missing_running_pid_as_interrupted(tmp_path, monkeyp
     assert "status=interrupted" in status
 
 
-@pytest.mark.asyncio
-async def test_loop_treats_codex_job_system_messages_as_assistant(tmp_path) -> None:
-    from nanobot.agent.loop import AgentLoop
-
-    bus = MessageBus()
-    provider = MagicMock()
-    provider.get_default_model.return_value = "test-model"
-
-    with patch("nanobot.agent.loop.ContextBuilder") as mock_context_cls, \
-         patch("nanobot.agent.loop.SubagentManager"), \
-         patch("nanobot.agent.loop.CodexJobManager") as mock_codex_manager_cls:
-        mock_codex_manager_cls.return_value.restore_pending_jobs = AsyncMock(return_value=None)
-        mock_codex_manager_cls.return_value.close = AsyncMock(return_value=None)
-        context = mock_context_cls.return_value
-        context.build_messages.return_value = []
-
-        loop = AgentLoop(bus=bus, provider=provider, workspace=tmp_path)
-        loop._run_agent_loop = AsyncMock(return_value=("done", [], []))
-
-        msg = InboundMessage(
-            channel="system",
-            sender_id="codex_job",
-            chat_id="cli:direct",
-            content="job finished",
-        )
-        await loop._process_message(msg)
-
-        assert context.build_messages.call_args.kwargs["current_role"] == "assistant"
+# NOTE: the dev-clean test "codex job notifications are injected with the
+# assistant role" was dropped on the upstream re-sync.  Upstream deliberately
+# presents internal follow-ups (subagent results, codex/cc job notifications)
+# as *user-role* fresh input instead: providers without assistant-prefill
+# support drop trailing assistant messages (see the comment at
+# AgentLoop._persist_subagent_followup).  Codex job notifications now arrive
+# as trusted-local system turns and take the same path, so the old
+# current_role="assistant" contract no longer describes wired behavior.

@@ -16,10 +16,13 @@ async def test_openai_compat_provider_defers_sdk_client_until_first_use() -> Non
 
     kwargs = mock_async_openai.call_args.kwargs
     _assert_openai_compat_timeout(kwargs["timeout"])
-    # Cloud endpoints pass http_client=None so the SDK creates its own
-    # DefaultAsyncHttpxClient, which already handles proxy env vars,
-    # connection limits, and redirects correctly.
-    assert kwargs["http_client"] is None
+    # noabot: cloud endpoints build an explicit IPv4-pinned httpx client
+    # (local_address="0.0.0.0") instead of letting the SDK create its own
+    # DefaultAsyncHttpxClient, because happy-eyeballs does not fall back to
+    # IPv4 when a provider's AAAA record is unreachable on the host network.
+    http_client = kwargs["http_client"]
+    assert type(http_client).__name__ == "AsyncClient"
+    assert http_client._transport._pool._local_address == "0.0.0.0"
 
 
 async def test_openai_compat_provider_sets_timeout_on_local_http_client() -> None:

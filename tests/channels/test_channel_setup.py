@@ -24,6 +24,7 @@ EXPECTED_CHANNELS = {
     "msteams",
     "napcat",
     "qq",
+    "qq_personal",  # noabot: OneBot 11 WS-bridge personal-account channel
     "signal",
     "slack",
     "telegram",

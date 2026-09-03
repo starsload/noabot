@@ -18,7 +18,7 @@ import aiohttp
 from loguru import logger
 from pydantic import ConfigDict, Field
 
-from nanobot.bus.events import InboundMessage, OutboundMessage
+from nanobot.bus.events import OutboundMessage
 from nanobot.bus.queue import MessageBus
 from nanobot.channels.base import BaseChannel
 from nanobot.config.paths import get_media_dir
@@ -80,6 +80,9 @@ class QQPersonalConfig(Base):
     download_chunk_size: int = 1024 * 256
     download_max_bytes: int = 1024 * 1024 * 200
     merge_owner_in_group: bool = False  # merge owner's group messages into shared session
+
+
+_GROUP_AUTH_PREFIX = "group:"
 
 
 class QQPersonalChannel(BaseChannel):
@@ -310,6 +313,9 @@ class QQPersonalChannel(BaseChannel):
         # Defer to BaseChannel._handle_message: it enforces allow_from /
         # pairing permission and merges the owner's group messages into the
         # shared cross-channel session when merge_owner_in_group is set.
+        # Group access is scoped to the group entity (OneBot ``group_id``)
+        # under the ``group_policy`` gate already applied above, mirroring
+        # upstream's ``authorization_id`` contract; allow_from scopes DMs.
         await self._handle_message(
             sender_id=user_id,
             chat_id=chat_id,
@@ -325,7 +331,26 @@ class QQPersonalChannel(BaseChannel):
                 "attachments": attachments,
             },
             is_dm=message_type == "private",
+            authorization_id=_GROUP_AUTH_PREFIX + chat_id if message_type == "group" else None,
         )
+
+    def is_allowed(self, sender_id: str) -> bool:
+        """Permission check with group-entity authorization.
+
+        A ``group:<id>`` subject is authorized by ``group_policy``: ``open``
+        admits any group, ``allowlist`` admits ``group_allow_from`` members,
+        and ``mention`` relies on the at-bot gate already enforced in
+        ``_should_respond_in_group`` before dispatch. Bare sender ids keep
+        upstream semantics (star > allowlist > pairing > deny).
+        """
+        subject = str(sender_id)
+        if subject.startswith(_GROUP_AUTH_PREFIX):
+            group_id = subject[len(_GROUP_AUTH_PREFIX):]
+            policy = self.config.group_policy
+            if policy == "allowlist":
+                return group_id in {str(item) for item in self.config.group_allow_from}
+            return policy in {"open", "mention"}
+        return super().is_allowed(subject)
 
     def _should_respond_in_group(self, data: dict[str, Any]) -> bool:
         policy = self.config.group_policy

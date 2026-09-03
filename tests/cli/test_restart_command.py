@@ -27,9 +27,13 @@ def _make_loop():
     workspace.__truediv__ = MagicMock(return_value=MagicMock())
 
     with patch("nanobot.agent.loop.ContextBuilder"), \
-         patch("nanobot.agent.loop.SessionManager"), \
+         patch("nanobot.agent.loop.SessionManager") as mock_sessions, \
          patch("nanobot.agent.loop.SubagentManager") as mock_sub_mgr:
         mock_sub_mgr.return_value.close = AsyncMock()
+        # noabot: /restart,/status,/stop are owner-only; bind the test sender.
+        # The owner view reads through the session manager, so the double
+        # needs a real owner_ids set.
+        mock_sessions.return_value.owner_ids = {"telegram:u1"}
         loop = AgentLoop(bus=bus, provider=provider, workspace=workspace)
     return loop, bus
 
