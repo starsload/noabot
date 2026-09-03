@@ -168,3 +168,191 @@ async def test_handle_message_rejects_when_authorization_id_is_not_allowed() -> 
 
     assert bus.inbound_size == 0
 
+
+# -- noabot: owner identity & cross-channel session merge -----------------
+
+
+def _stub_owner_ids(monkeypatch: pytest.MonkeyPatch, owner_ids: list[str] | None) -> None:
+    """Canned owner list for BaseChannel._get_owner_ids' lazy config load.
+
+    ``None`` makes the runtime config carry no identity section at all.
+    """
+    from nanobot.config import loader
+
+    identity = None if owner_ids is None else SimpleNamespace(owner_ids=owner_ids)
+    cfg = SimpleNamespace(agents=SimpleNamespace(identity=identity))
+    monkeypatch.setattr(loader, "load_config", lambda *a, **k: cfg)
+
+
+_GROUP_META = {"chat_type": "group", "is_group": True}
+
+
+@pytest.mark.asyncio
+async def test_owner_group_message_merges_into_shared_session(monkeypatch) -> None:
+    _stub_owner_ids(monkeypatch, ["owner1"])
+    bus = MessageBus()
+    channel = _DummyChannel({"allowFrom": ["*"], "mergeOwnerInGroup": True}, bus)
+
+    await channel._handle_message(
+        sender_id="owner1", chat_id="g1", content="hi", metadata=dict(_GROUP_META)
+    )
+
+    msg = await bus.consume_inbound()
+    assert msg.session_key_override == "owner:shared"
+    assert msg.sender_id == "owner1"
+
+
+@pytest.mark.asyncio
+async def test_owner_merge_is_cross_channel(monkeypatch) -> None:
+    """The same owner id reaching two different channels lands on one key."""
+
+    class _OtherChannel(_DummyChannel):
+        name = "other"
+
+    _stub_owner_ids(monkeypatch, ["owner1"])
+    bus = MessageBus()
+    telegram_like = _DummyChannel({"allowFrom": ["*"], "merge_owner_in_group": True}, bus)
+    other_like = _OtherChannel({"allowFrom": ["*"], "merge_owner_in_group": True}, bus)
+
+    await telegram_like._handle_message(
+        sender_id="owner1", chat_id="g1", content="a", metadata=dict(_GROUP_META)
+    )
+    await other_like._handle_message(
+        sender_id="owner1", chat_id="g2", content="b", metadata=dict(_GROUP_META)
+    )
+
+    first = await bus.consume_inbound()
+    second = await bus.consume_inbound()
+    assert first.session_key_override == "owner:shared"
+    assert second.session_key_override == "owner:shared"
+
+
+@pytest.mark.asyncio
+async def test_owner_group_message_not_merged_without_channel_opt_in(monkeypatch) -> None:
+    _stub_owner_ids(monkeypatch, ["owner1"])
+    bus = MessageBus()
+    channel = _DummyChannel({"allowFrom": ["*"], "merge_owner_in_group": False}, bus)
+
+    await channel._handle_message(
+        sender_id="owner1", chat_id="g1", content="hi", metadata=dict(_GROUP_META)
+    )
+
+    msg = await bus.consume_inbound()
+    assert msg.session_key_override is None
+
+
+@pytest.mark.asyncio
+async def test_non_owner_group_message_is_not_merged(monkeypatch) -> None:
+    _stub_owner_ids(monkeypatch, ["owner1"])
+    bus = MessageBus()
+    channel = _DummyChannel({"allowFrom": ["*"], "merge_owner_in_group": True}, bus)
+
+    await channel._handle_message(
+        sender_id="member", chat_id="g1", content="hi", metadata=dict(_GROUP_META)
+    )
+
+    msg = await bus.consume_inbound()
+    assert msg.session_key_override is None
+
+
+@pytest.mark.asyncio
+async def test_owner_dm_does_not_merge_into_shared_session(monkeypatch) -> None:
+    """DMs keep their per-channel session; only group context merges."""
+    _stub_owner_ids(monkeypatch, ["owner1"])
+    bus = MessageBus()
+    channel = _DummyChannel({"allowFrom": ["*"], "merge_owner_in_group": True}, bus)
+
+    await channel._handle_message(sender_id="owner1", chat_id="owner1", content="hi", is_dm=True)
+
+    msg = await bus.consume_inbound()
+    assert msg.session_key_override is None
+
+
+@pytest.mark.asyncio
+async def test_channel_prefixed_owner_id_matches(monkeypatch) -> None:
+    _stub_owner_ids(monkeypatch, ["dummy:owner1"])
+    bus = MessageBus()
+    channel = _DummyChannel({"allowFrom": ["*"], "merge_owner_in_group": True}, bus)
+
+    await channel._handle_message(
+        sender_id="owner1", chat_id="g1", content="hi", metadata=dict(_GROUP_META)
+    )
+
+    msg = await bus.consume_inbound()
+    assert msg.session_key_override == "owner:shared"
+
+
+@pytest.mark.asyncio
+async def test_explicit_session_key_wins_over_owner_merge(monkeypatch) -> None:
+    _stub_owner_ids(monkeypatch, ["owner1"])
+    bus = MessageBus()
+    channel = _DummyChannel({"allowFrom": ["*"], "merge_owner_in_group": True}, bus)
+
+    await channel._handle_message(
+        sender_id="owner1",
+        chat_id="g1",
+        content="hi",
+        metadata=dict(_GROUP_META),
+        session_key="custom:key",
+    )
+
+    msg = await bus.consume_inbound()
+    assert msg.session_key_override == "custom:key"
+
+
+@pytest.mark.asyncio
+async def test_owner_merge_disabled_when_runtime_config_unreadable(monkeypatch) -> None:
+    from nanobot.config import loader
+
+    def _boom(*_a, **_k):
+        raise RuntimeError("config unavailable")
+
+    monkeypatch.setattr(loader, "load_config", _boom)
+    bus = MessageBus()
+    channel = _DummyChannel({"allowFrom": ["*"], "merge_owner_in_group": True}, bus)
+
+    await channel._handle_message(
+        sender_id="owner1", chat_id="g1", content="hi", metadata=dict(_GROUP_META)
+    )
+
+    msg = await bus.consume_inbound()
+    assert msg.session_key_override is None
+
+
+@pytest.mark.asyncio
+async def test_owner_merge_disabled_when_identity_section_missing(monkeypatch) -> None:
+    _stub_owner_ids(monkeypatch, None)
+    bus = MessageBus()
+    channel = _DummyChannel({"allowFrom": ["*"], "merge_owner_in_group": True}, bus)
+
+    await channel._handle_message(
+        sender_id="owner1", chat_id="g1", content="hi", metadata=dict(_GROUP_META)
+    )
+
+    msg = await bus.consume_inbound()
+    assert msg.session_key_override is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "metadata",
+    [
+        None,  # fallback: chat_id != sender_id implies group
+        {"conversation_type": "guild"},
+        {"group_id": "g1"},
+        {"is_group": True},
+    ],
+    ids=["chat-id-fallback", "conversation-type", "group-id", "is-group"],
+)
+async def test_group_context_detected_across_metadata_shapes(monkeypatch, metadata) -> None:
+    _stub_owner_ids(monkeypatch, ["owner1"])
+    bus = MessageBus()
+    channel = _DummyChannel({"allowFrom": ["*"], "merge_owner_in_group": True}, bus)
+
+    await channel._handle_message(
+        sender_id="owner1", chat_id="g1", content="hi", metadata=metadata
+    )
+
+    msg = await bus.consume_inbound()
+    assert msg.session_key_override == "owner:shared"
+
