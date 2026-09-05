@@ -68,6 +68,10 @@ def create_gateway_app(
             ),
             level="DEBUG",
             colorize=None,
+            # noabot: see the main sink in cli/commands.py — never render
+            # variable values into tracebacks (token/API-key leakage).
+            backtrace=True,
+            diagnose=False,
             filter=lambda record: record["extra"].setdefault("channel", "-") or True,
         )
 

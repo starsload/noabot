@@ -36,6 +36,12 @@ _log_handler_id = logger.add(
     ),
     level="INFO",
     colorize=None,
+    # noabot: loguru's diagnose=True interpolates every frame's variable
+    # values into exception tracebacks — channel start failures dump the
+    # live config object, leaking bot tokens/API keys into the log. Keep
+    # the extended backtrace, drop the value expansion.
+    backtrace=True,
+    diagnose=False,
     filter=lambda record: record["extra"].setdefault("channel", "-") or True,
 )
 
