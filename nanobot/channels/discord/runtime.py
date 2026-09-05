@@ -440,8 +440,11 @@ class DiscordChannel(BaseChannel):
                 proxy=self.config.proxy,
                 proxy_auth=proxy_auth,
             )
-        except Exception:
-            self.logger.exception("Failed to initialize client")
+        except Exception as exc:
+            # noabot: one-line failure log; the traceback is unreachable-network
+            # noise on hosts without Discord egress, so park it at DEBUG.
+            self.logger.error("Failed to initialize client: {}", exc)
+            self.logger.opt(exception=True).debug("Discord client init traceback")
             self._client = None
             self._running = False
             return
@@ -453,8 +456,10 @@ class DiscordChannel(BaseChannel):
             await self._client.start(self.config.token)
         except asyncio.CancelledError:
             raise
-        except Exception:
-            self.logger.exception("client startup failed")
+        except Exception as exc:
+            # noabot: see the init path above — one line at ERROR, stack at DEBUG.
+            self.logger.error("Discord client startup failed: {}", exc)
+            self.logger.opt(exception=True).debug("Discord client startup traceback")
         finally:
             self._running = False
             await self._reset_runtime_state(close_client=True)
