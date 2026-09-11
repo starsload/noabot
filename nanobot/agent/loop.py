@@ -1787,6 +1787,28 @@ class AgentLoop:
         )
         return result
 
+    # noabot: providers surface failures as raw payloads ("Error: data: {json}")
+    # that used to be forwarded verbatim into the chat. Outbound copies get a
+    # user-facing line; session persistence keeps its own placeholder and the
+    # raw error stays in the gateway log (see the stop_reason=="error" logger).
+    _MODEL_ERROR_FRIENDLY_GENERIC = (
+        "⚠️ 这轮模型没有给出回复(提供方返回了错误)。原始错误已记入 gateway 日志,"
+        "消息已保留在会话里——可以换个说法或拆短再试。"
+    )
+    _MODEL_ERROR_FRIENDLY_INSPECTION = (
+        "⚠️ 这轮输入触发了模型提供方的内容审查(data_inspection_failed),整条请求被拒。"
+        "你的消息我收到了,可以拆短或换个说法再发。原始错误已记入 gateway 日志。"
+    )
+
+    @classmethod
+    def _friendly_error_content(cls, raw: str) -> str:
+        """Map a provider error payload to user-facing chat text."""
+        if not raw or not raw.startswith(("Error:", "Error calling")):
+            return raw
+        if "data_inspection_failed" in raw:
+            return cls._MODEL_ERROR_FRIENDLY_INSPECTION
+        return cls._MODEL_ERROR_FRIENDLY_GENERIC
+
     def _assemble_outbound(
         self,
         msg: InboundMessage,
@@ -1802,6 +1824,9 @@ class AgentLoop:
         if (mt := self.tools.get("message")) and isinstance(mt, MessageTool) and mt._sent_in_turn:
             if not had_injections or stop_reason == "empty_final_response":
                 return None
+
+        if stop_reason == "error":
+            final_content = self._friendly_error_content(final_content)
 
         preview = final_content[:120] + "..." if len(final_content) > 120 else final_content
         logger.info("Response to {}:{}: {}", msg.channel, msg.sender_id, preview)
