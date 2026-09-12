@@ -664,6 +664,9 @@ class OpenAICompatProvider(LLMProvider):
     def _sanitize_messages(self, messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
         """Strip non-standard keys, normalize tool_call IDs."""
         sanitized = LLMProvider._sanitize_request_messages(messages, _ALLOWED_MSG_KEYS)
+        # noabot: egress trim of stale bulk tool payloads before moderation
+        # (see LLMProvider.trim_stale_tool_results).
+        sanitized = LLMProvider.trim_stale_tool_results(sanitized)
         id_map: dict[str, str] = {}
         pending_tool_ids: dict[str, deque[str]] = {}
         force_string_content = bool(self._spec and self._spec.name == "deepseek")

@@ -492,6 +492,45 @@ class LLMProvider(ABC):
                 ordered_unique.append(idx)
         return ordered_unique
 
+    # noabot: DashScope-style input moderation scans the ENTIRE assembled
+    # request, and months of scraped web pages / ops dumps accumulated in
+    # replay history eventually trip it — blocking every turn of the session
+    # (live incident 2026-09-12; validated fix reproduced against the poisoned
+    # backup window). Trim at egress instead of persisting edits: stale bulk
+    # payloads never reach the provider; the session file keeps everything,
+    # the most recent results stay intact, and short errors stay informative.
+    _WEB_TOOL_NAMES = frozenset({"web_search", "web_fetch"})
+    _TOOL_TRIM_KEEP_RECENT = 8
+    _TOOL_TRIM_STALE_CHARS = 400
+    _TOOL_TRIM_PLACEHOLDER = "[stale tool result trimmed for provider moderation]"
+
+    @classmethod
+    def trim_stale_tool_results(
+        cls, messages: list[dict[str, Any]]
+    ) -> list[dict[str, Any]]:
+        """Placeholder stale tool results outside the recent-keep window.
+
+        Web scrape results are trimmed unconditionally; any other tool result
+        only when it is bulk text (> _TOOL_TRIM_STALE_CHARS), so small errors
+        and normal command output keep their meaning in history.
+        """
+        tool_positions = [
+            i for i, m in enumerate(messages) if m.get("role") == "tool"
+        ]
+        stale = tool_positions[: -cls._TOOL_TRIM_KEEP_RECENT]
+        trimmed: list[dict[str, Any]] | None = None
+        for i in stale:
+            m = messages[i]
+            content = m.get("content")
+            if not isinstance(content, str):
+                continue
+            name = str(m.get("name") or "")
+            if name in cls._WEB_TOOL_NAMES or len(content) > cls._TOOL_TRIM_STALE_CHARS:
+                if trimmed is None:
+                    trimmed = list(messages)
+                trimmed[i] = {**m, "content": cls._TOOL_TRIM_PLACEHOLDER}
+        return messages if trimmed is None else trimmed
+
     @staticmethod
     def _sanitize_request_messages(
         messages: list[dict[str, Any]],
