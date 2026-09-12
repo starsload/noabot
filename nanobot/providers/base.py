@@ -323,6 +323,12 @@ class LLMProvider(ABC):
         "temporarily unavailable",
         "速率限制",
         "访问量过大",
+        # noabot: DashScope/Aliyun MaaS moderation refusal. Live probes showed
+        # the verdict is partly stochastic (identical content passes on some
+        # requests), so a genuine retry is worth the 3-attempt budget; truly
+        # rejected content just exhausts retries and surfaces the loop's
+        # friendly moderation message.
+        "data_inspection_failed",
     )
     _RETRYABLE_STATUS_CODES = frozenset({408, 409, 429})
     _TRANSIENT_ERROR_KINDS = frozenset({"timeout", "connection"})
@@ -532,9 +538,20 @@ class LLMProvider(ABC):
         err = (content or "").lower()
         return any(marker in err for marker in cls._TRANSIENT_ERROR_MARKERS)
 
+    # noabot: moderation codes whose verdict is provider-side and partly
+    # stochastic — worth a retry regardless of transport retry hints.
+    _MODERATION_RETRY_CODES = frozenset({"data_inspection_failed"})
+
+    @classmethod
+    def is_moderation_retry_response(cls, response: LLMResponse) -> bool:
+        """Provider moderation codes that are stochastic and worth retry/failover."""
+        return (response.error_code or "").strip().lower() in cls._MODERATION_RETRY_CODES
+
     @classmethod
     def is_transient_response(cls, response: LLMResponse) -> bool:
         """Prefer structured error metadata, fallback to text markers for legacy providers."""
+        if cls.is_moderation_retry_response(response):
+            return True
         if response.error_should_retry is not None:
             return bool(response.error_should_retry)
 
@@ -588,6 +605,11 @@ class LLMProvider(ABC):
             data = cast(dict[str, Any], payload)
         elif isinstance(payload, str):
             text = payload.strip()
+            # noabot: SSE error frames ("data: {json}") surface as raw response
+            # text on some gateways; peel the frame prefix so structured
+            # error type/code extraction still works for retry/fallback policy.
+            while text.startswith("data:"):
+                text = text[len("data:"):].lstrip()
             if text:
                 try:
                     parsed = json.loads(text)

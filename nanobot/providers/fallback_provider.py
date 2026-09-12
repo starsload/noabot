@@ -457,6 +457,12 @@ class FallbackProvider(LLMProvider):
             for token in _AUTHENTICATION_ERROR_TOKENS
         ):
             return True
+        # noabot: moderation refusals (e.g. Aliyun MaaS data_inspection_failed)
+        # are the provider's verdict on transport-visible text, not a policy
+        # claim about the conversation; the retry layer already burned its
+        # budget by the time we get here, so failing over is the recovery.
+        if LLMProvider.is_moderation_retry_response(response):
+            return True
         if kind in _NON_FALLBACK_ERROR_KINDS:
             return False
         if any(
