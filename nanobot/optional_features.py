@@ -258,7 +258,8 @@ def install_extra(
 def read_config_data(path: Path) -> dict[str, Any]:
     if not path.exists():
         return {}
-    with open(path, encoding="utf-8") as f:
+    # noabot: tolerate the Windows-editor BOM on config.json (see config.loader)
+    with open(path, encoding="utf-8-sig") as f:
         return cast(dict[str, Any], json.load(f))
 
 

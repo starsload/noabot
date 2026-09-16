@@ -223,7 +223,8 @@ def _onboard_plugins(config_path: Path) -> None:
     if not plugins:
         return
 
-    with open(config_path, encoding="utf-8") as f:
+    # noabot: tolerate the Windows-editor BOM on config.json (see config.loader)
+    with open(config_path, encoding="utf-8-sig") as f:
         data = json.load(f)
 
     channels = data.setdefault("channels", {})

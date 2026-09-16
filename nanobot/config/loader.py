@@ -80,7 +80,11 @@ def load_config(config_path: Path | None = None) -> Config:
         return config
 
     try:
-        with path.open(encoding="utf-8") as handle:
+        # noabot: utf-8-sig also accepts plain UTF-8, but Windows tools
+        # (PowerShell Set-Content, some editors) keep re-adding a BOM to this
+        # file and json then rejects the whole config (bit twice: 2026-08-31,
+        # 2026-09-16). Read through it instead of telling the user to re-save.
+        with path.open(encoding="utf-8-sig") as handle:
             data = json.load(handle)
     except json.JSONDecodeError as exc:
         raise ConfigLoadError(
