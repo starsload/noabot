@@ -49,8 +49,10 @@ async def test_generate_can_deliver_images_to_current_chat(tmp_path: Path) -> No
     async def _send(msg: OutboundMessage) -> None:
         sent.append(msg)
 
+    from nanobot.agent.tools.context import RequestContext
+
     tool = NoahLocalPainterTool(workspace=tmp_path, send_callback=_send)
-    tool.set_context("telegram", "room1")
+    tool.set_context(RequestContext(channel="telegram", chat_id="room1"))
 
     raw = await tool.execute(
         action="generate",

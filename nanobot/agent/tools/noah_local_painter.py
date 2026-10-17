@@ -7,7 +7,10 @@ import importlib.util
 import json
 import sys
 from pathlib import Path
-from typing import Any, Awaitable, Callable
+from typing import TYPE_CHECKING, Any, Awaitable, Callable
+
+if TYPE_CHECKING:
+    from nanobot.agent.tools.context import RequestContext
 
 from nanobot.agent.tools.base import Tool
 from nanobot.bus.events import OutboundMessage
@@ -43,11 +46,13 @@ class NoahLocalPainterTool(Tool):
     def _module_path(workspace: Path) -> Path:
         return workspace / "libs" / "noah_local_painter" / "__init__.py"
 
-    def set_context(self, channel: str, chat_id: str, message_id: str | None = None) -> None:
+    def set_context(self, ctx: "RequestContext") -> None:
         """Set the current chat target for optional image delivery."""
-        self._default_channel = channel
-        self._default_chat_id = chat_id
-        self._default_message_id = message_id
+        # noabot: upstream ContextAware protocol passes one RequestContext;
+        # registry.prepare_call would TypeError on the legacy signature.
+        self._default_channel = ctx.channel or "cli"
+        self._default_chat_id = ctx.chat_id or "direct"
+        self._default_message_id = ctx.message_id
 
     def set_send_callback(self, callback: Callable[[OutboundMessage], Awaitable[None]]) -> None:
         """Set outbound sender callback."""

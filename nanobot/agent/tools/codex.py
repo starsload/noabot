@@ -8,6 +8,7 @@ from nanobot.agent.tools.base import Tool
 
 if TYPE_CHECKING:
     from nanobot.agent.codex_jobs import CodexJobManager
+    from nanobot.agent.tools.context import RequestContext
 
 
 class _CodexToolBase(Tool):
@@ -21,10 +22,13 @@ class _CodexToolBase(Tool):
         self._origin_chat_id = "direct"
         self._session_key = "cli:direct"
 
-    def set_context(self, channel: str, chat_id: str) -> None:
-        self._origin_channel = channel
-        self._origin_chat_id = chat_id
-        self._session_key = f"{channel}:{chat_id}"
+    def set_context(self, ctx: "RequestContext") -> None:
+        # noabot: upstream ContextAware protocol passes one RequestContext;
+        # registry.prepare_call would TypeError on the old (channel, chat_id)
+        # signature.
+        self._origin_channel = ctx.channel or "cli"
+        self._origin_chat_id = ctx.chat_id or "direct"
+        self._session_key = ctx.session_key or f"{self._origin_channel}:{self._origin_chat_id}"
 
 
 class CodexDelegateTool(_CodexToolBase):
